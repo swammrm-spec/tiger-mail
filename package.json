@@ -1,0 +1,40 @@
+{
+  "name": "emailarray-outlook-ui",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently \"npm:dev:server\" \"npm:dev:client\"",
+    "dev:client": "vite",
+    "dev:server": "nodemon --ignore runtime/** server/index.js",
+    "build": "vite build",
+    "preview": "vite preview",
+    "start": "node server/index.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.2",
+    "better-sqlite3": "^12.11.1",
+    "cors": "^2.8.5",
+    "dayjs": "^1.11.13",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "lucide-react": "^0.525.0",
+    "mailparser": "^3.7.5",
+    "multer": "^2.0.2",
+    "node-imap": "^0.9.6",
+    "nodemailer": "^6.10.1",
+    "pg": "^8.16.3",
+    "pg-mem": "^3.0.5",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "smtp-server": "^3.19.1",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.4.1",
+    "concurrently": "^9.1.2",
+    "nodemon": "^3.1.9",
+    "vite": "^6.3.5"
+  }
+}

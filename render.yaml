@@ -1,0 +1,34 @@
+services:
+  - type: web
+    name: tiger-mail
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: node server/index.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: tiger-mail-db
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: SMTP_RELAY_PORT
+        value: 3025
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: 587
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+
+databases:
+  - name: tiger-mail-db
+    plan: free
+    databaseName: tiger_mail

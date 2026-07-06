@@ -232,9 +232,9 @@ export default function MailComposeView({
               <input value={form.subject} onChange={(e) => setForm({ ...form, subject: e.target.value })} placeholder="Subject" required />
             </div>
             <span style={{ fontSize: 10, color: "#888", marginTop: 2 }}>
-              {form.email_key_id && form.project_id
-                ? `Will be sent as: [${emailKeys.find(k => k.id === Number(form.email_key_id))?.key_code || ""}] [${projects.find(p => p.id === Number(form.project_id))?.project_code || ""}] ${form.subject}`
-                : "Select Key + Project to auto-format subject"}
+              {form.email_key_id && form.subject
+                ? `Will be sent as: ${emailKeys.find(k => k.id === Number(form.email_key_id))?.key_code || ""}:${String(new Date().getFullYear()).slice(-2)}/${form.subject}`
+                : "Select Key to auto-format subject"}
             </span>
           </div>
         </div>

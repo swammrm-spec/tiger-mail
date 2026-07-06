@@ -2497,11 +2497,11 @@ function App() {
     if (activeAccount?.signature_text && resolvedForm.body && !resolvedForm.body.includes(activeAccount.signature_text)) {
       resolvedForm.body = resolvedForm.body + "\n\n" + activeAccount.signature_text;
     }
-    if (resolvedForm.email_key_id && resolvedForm.project_id && resolvedForm.subject) {
+    if (resolvedForm.email_key_id && resolvedForm.subject) {
       const selectedKey = emailKeys.find(k => k.id === Number(resolvedForm.email_key_id));
-      const selectedProject = projects.find(p => p.id === Number(resolvedForm.project_id));
-      if (selectedKey && selectedProject) {
-        resolvedForm.subject = `[${selectedKey.key_code}] [${selectedProject.project_code}] ${resolvedForm.subject}`;
+      if (selectedKey) {
+        const yy = String(new Date().getFullYear()).slice(-2);
+        resolvedForm.subject = `${selectedKey.key_code}:${yy}/${resolvedForm.subject}`;
       }
     }
     setForm(resolvedForm);

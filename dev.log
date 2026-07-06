@@ -1,0 +1,27 @@
+
+> emailarray-outlook-ui@1.0.0 dev
+> concurrently "npm:dev:server" "npm:dev:client"
+
+[dev:server] 
+[dev:server] > emailarray-outlook-ui@1.0.0 dev:server
+[dev:server] > nodemon --ignore runtime/** server/index.js
+[dev:server] 
+[dev:client] 
+[dev:client] > emailarray-outlook-ui@1.0.0 dev:client
+[dev:client] > vite
+[dev:client] 
+[dev:server] [33m[nodemon] 3.1.14[39m
+[dev:server] [33m[nodemon] to restart at any time, enter `rs`[39m
+[dev:server] [33m[nodemon] watching path(s): *.*[39m
+[dev:server] [33m[nodemon] watching extensions: js,mjs,cjs,json[39m
+[dev:server] [32m[nodemon] starting `node server/index.js`[39m
+[dev:client] 
+[dev:client]   [32m[1mVITE[22m v6.4.3[39m  [2mready in [0m[1m327[22m[2m[0m ms[22m
+[dev:client] 
+[dev:client]   [32m➜[39m  [1mLocal[22m:   [36mhttp://localhost:[1m5173[22m/[39m
+[dev:client] [2m  [32m➜[39m  [1mNetwork[22m[2m: use [22m[1m--host[22m[2m to expose[22m
+[dev:server] API server running at http://localhost:3001
+[dev:client] npm run dev:client exited with code 4294967295
+[dev:server] [31m[nodemon] app crashed - waiting for file changes before starting...[39m
+
+D:\Emailarray\Outlook>

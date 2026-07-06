@@ -1,0 +1,2 @@
+API server running at http://0.0.0.0:3001
+SMTP relay listening on 0.0.0.0:3025 - configure this as your SMTP server in Group-Office

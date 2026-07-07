@@ -36,6 +36,7 @@ import {
   parseSubjectForMetadata,
   generateHiddenFooter,
   extractEmailMetadata,
+  extractHiddenRef,
   createTask
 } from "./database.js";
 

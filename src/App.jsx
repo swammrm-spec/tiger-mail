@@ -2008,6 +2008,47 @@ function App() {
   }, [currentView]);
   useEffect(() => { if (currentView === "settings" && token) loadMailServiceStatus(); }, [currentView, token]);
   useEffect(() => { if (currentView === "settings" && token && (currentUser || lastKnownUser)) loadDeviceCacheInfo(currentUser || lastKnownUser); }, [currentView, token, currentUser, lastKnownUser, data.emails.length, data.attachments.length, data.folders.length]);
+
+  // Auto-refresh emails every 60 seconds + browser notification for new emails
+  useEffect(() => {
+    if (!token) return;
+    let prevEmailCount = data.emails.length;
+    let prevEmailIds = new Set(data.emails.map(e => e.id));
+
+    const interval = setInterval(async () => {
+      try {
+        const prevCount = prevEmailCount;
+        const prevIds = prevEmailIds;
+        await loadBootstrap(token);
+
+        const currentEmails = data.emails;
+        const newEmails = currentEmails.filter(e => !prevIds.has(e.id));
+
+        if (newEmails.length > 0 && prevCount > 0) {
+          const newUnread = newEmails.filter(e => !e.is_read);
+
+          if (Notification.permission === "granted") {
+            newUnread.forEach(email => {
+              new Notification("New Email", {
+                body: `${email.sender_name || email.sender_email}\n${email.subject}`,
+                icon: "/logo.gif",
+                tag: `email-${email.id}`
+              });
+            });
+          }
+
+          if (newUnread.length > 0) {
+            setSuccessMessage(`${newUnread.length} new email(s) received`);
+          }
+        }
+
+        prevEmailCount = currentEmails.length;
+        prevEmailIds = new Set(currentEmails.map(e => e.id));
+      } catch (e) { /* silent */ }
+    }, 60000);
+
+    return () => clearInterval(interval);
+  }, [token]);
   useEffect(() => { if (!canAccessAdmin && currentView === "admin") setCurrentView("mail"); }, [canAccessAdmin, currentView]);
   useEffect(() => { setSelectedEmailIds([]); }, [selectedFolder]);
   useEffect(() => { localStorage.setItem(savedFiltersStorageKey, JSON.stringify(savedFilters)); }, [savedFilters]);
@@ -2457,6 +2498,9 @@ function App() {
         role: session.user?.role || ""
       });
       setCurrentUser(session.user); setToken(session.token); setCurrentView("mail");
+      if (Notification && Notification.permission === "default") {
+        Notification.requestPermission();
+      }
       const imp = session.impersonated_by || null;
       setImpersonatedBy(imp);
       if (imp) localStorage.setItem("emailarray_impersonated_by", JSON.stringify(imp));
@@ -3720,6 +3764,9 @@ function App() {
                   }, "");
                   localStorage.setItem("emailarray_token", session.token);
                   setCurrentUser(session.user); setToken(session.token);
+                  if (Notification && Notification.permission === "default") {
+                    Notification.requestPermission();
+                  }
                   setImpersonatedBy(session.impersonated_by || null);
                   setCurrentView("mail"); setSelectedEmailId(null);
                   setSuccessMessage(`Switched to ${session.user?.name || targetEmail}`);

@@ -46,7 +46,7 @@ const nextCycleByUser = new Map();
 let schedulerHandle = null;
 const cycleInFlightByUser = new Map();
 let globalCycleInFlight = null;
-const backgroundFetchIntervalMinutes = Math.max(0.25, Number(process.env.BACKGROUND_MAIL_FETCH_MINUTES || 0.5));
+const backgroundFetchIntervalMinutes = Math.max(0.5, Number(process.env.BACKGROUND_MAIL_FETCH_MINUTES || 1));
 
 // #region debug-point send-receive-auth:reporter
 function reportSendReceiveAuthDebug(location, msg, data = {}, runId = "pre-fix", hypothesisId = "") {

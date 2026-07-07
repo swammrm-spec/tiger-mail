@@ -900,6 +900,7 @@ async function runSingleCycle(userId, config) {
       "H4"
     );
     // #endregion
+    console.log(`[MAIL] Cycle started for user ${userId} (${config.email_address})`);
     const queueResult = await processOutboxQueue(config, userId);
     const receiveResult = await receiveEmailsOnce(config, userId);
     const result = {
@@ -907,6 +908,7 @@ async function runSingleCycle(userId, config) {
       sent: queueResult.sent,
       queued: queueResult.queued
     };
+    console.log(`[MAIL] Cycle completed for user ${userId}: received=${result.received}, skipped=${result.skipped}, sent=${result.sent}, queued=${result.queued}, deleted=${result.deleted}`);
     const nextCycleAt = new Date(Date.now() + backgroundFetchIntervalMinutes * 60 * 1000).toISOString();
 
     nextCycleByUser.set(userId, nextCycleAt ? new Date(nextCycleAt).getTime() : null);
@@ -1248,6 +1250,7 @@ function startScheduler() {
       const dueAt = nextCycleByUser.get(userId) || 0;
       if (dueAt <= tickNow) {
         runCycle(userId).catch((error) => {
+          console.error(`[MAIL] Sync cycle error for user ${userId}:`, error.message);
           setUserState(userId, { lastError: error.message }, config);
           serviceState = { ...serviceState, lastError: error.message };
         });
@@ -1256,7 +1259,9 @@ function startScheduler() {
   }, 15 * 1000);
 
   for (const [userId] of activeConfigs.entries()) {
-    runCycle(userId).catch(() => {});
+    runCycle(userId).catch((error) => {
+      console.error(`[MAIL] Initial sync cycle failed for user ${userId}:`, error.message);
+    });
   }
 
   refreshServiceSummary();

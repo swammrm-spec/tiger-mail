@@ -1652,9 +1652,19 @@ app.post("/api/settings/apply", authenticateRequest, async (req, res) => {
 
 app.post("/api/settings/run-cycle", authenticateRequest, async (req, res) => {
   try {
+    // #region debug-point mail-sync-missing:api-run-cycle-entry
+    fetch("http://127.0.0.1:7777/event",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionId:"mail-sync-missing",runId:"pre-fix",hypothesisId:"H2",location:"server/index.js:/api/settings/run-cycle:entry",msg:"[DEBUG] api run-cycle entered",data:{userId:Number(req.user?.id||0),userEmail:String(req.user?.email||""),role:String(req.user?.role||"")},ts:Date.now()})}).catch(()=>{});
+    // #endregion
     const result = await runCycle(req.user.id);
-    return res.json({ result, status: getMailServiceStatus(req.user.id) });
+    const status = getMailServiceStatus(req.user.id);
+    // #region debug-point mail-sync-missing:api-run-cycle-success
+    fetch("http://127.0.0.1:7777/event",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionId:"mail-sync-missing",runId:"pre-fix",hypothesisId:"H1",location:"server/index.js:/api/settings/run-cycle:success",msg:"[DEBUG] api run-cycle completed",data:{userId:Number(req.user?.id||0),userEmail:String(req.user?.email||""),sent:Number(result?.sent||0),received:Number(result?.received||0),skipped:Number(result?.skipped||0),queued:Number(result?.queued||0),lastError:String(status?.lastError||""),lastRunSummary:String(status?.lastRunSummary||"")},ts:Date.now()})}).catch(()=>{});
+    // #endregion
+    return res.json({ result, status });
   } catch (error) {
+    // #region debug-point mail-sync-missing:api-run-cycle-error
+    fetch("http://127.0.0.1:7777/event",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionId:"mail-sync-missing",runId:"pre-fix",hypothesisId:"H4",location:"server/index.js:/api/settings/run-cycle:error",msg:"[DEBUG] api run-cycle failed",data:{userId:Number(req.user?.id||0),userEmail:String(req.user?.email||""),message:String(error?.message||error)},ts:Date.now()})}).catch(()=>{});
+    // #endregion
     return res.status(400).json({ error: error.message || "Unable to run send/receive cycle." });
   }
 });
@@ -1786,7 +1796,9 @@ async function startServer() {
   // #endregion
   try {
     const configuredSettings = await listConfiguredMailSettings();
-    await applyAllMailSettings(configuredSettings);
+    console.log(`[MAIL] Found ${configuredSettings.length} configured mail settings, applying...`);
+    const mailStatus = await applyAllMailSettings(configuredSettings);
+    console.log(`[MAIL] Scheduler status: configured=${mailStatus.configured}, accounts=${mailStatus.configuredAccounts}, running=${mailStatus.schedulerRunning}`);
     // #region debug-point startup-localhost-refused
     reportStartupDebug("startServer.afterApplyMailSettings", {
       hasSettings: Boolean(settings),

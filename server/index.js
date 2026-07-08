@@ -58,7 +58,11 @@ import {
   listEmployeesWithMailSettings,
   createSerialFromSubjectKey,
   saveAiAnalysis,
+  saveAiBrainAnalysis,
+  saveAiBrainSummaryToEmail,
   getAiAnalysisByEmailId,
+  getAiBrainAnalysisByEmailId,
+  createTrackingTasksFromBrainAnalysis,
   getActiveProjects,
   scheduleEmail,
   cancelScheduleEmail,
@@ -127,7 +131,7 @@ import {
   parseTelegramApprovalUpdate,
   answerTelegramCallback
 } from "./telegramApprovalBot.js";
-import { analyzeInboundTaskExtractionWithLlm } from "./aiAnalysisService.js";
+import { analyzeInboundTaskExtractionWithLlm, analyzeEmailBrain } from "./aiAnalysisService.js";
 import { SMTPServer } from "smtp-server";
 import { simpleParser } from "mailparser";
 
@@ -1192,6 +1196,72 @@ app.get("/api/ai/projects", authenticateRequest, async (req, res) => {
   try {
     const projects = await getActiveProjects();
     return res.json({ projects });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/ai/brain-analyze", authenticateRequest, async (req, res) => {
+  try {
+    const { email_id } = req.body;
+    if (!email_id) return res.status(400).json({ error: "email_id required" });
+
+    const existing = await getAiBrainAnalysisByEmailId(email_id);
+    if (existing) return res.json({ analysis: existing, cached: true });
+
+    const email = await getEmailById(email_id);
+    if (!email) return res.status(404).json({ error: "Email not found" });
+
+    const body = (email.body || "").replace(/<[^>]+>/g, " ").trim().substring(0, 4000);
+    const attachments = await getEmailAttachments(email_id);
+    const attachmentNames = attachments.map(a => a.file_name || a.originalname || "file");
+
+    let activeProjects = [];
+    try { activeProjects = await getActiveProjects(); } catch {}
+
+    const brainContext = {
+      subject: email.subject || "",
+      body,
+      senderEmail: email.sender_email || "",
+      senderName: email.sender_name || "",
+      recipientEmail: email.recipient_email || "",
+      recipientName: email.recipient_name || "",
+      ccList: email.cc_list || "",
+      receivedAt: email.received_at || email.sent_at || "",
+      attachments: attachmentNames,
+      emailKeys: [],
+      activeProjects
+    };
+
+    const brainAnalysis = await analyzeEmailBrain(brainContext);
+    const saved = await saveAiBrainAnalysis(email_id, brainAnalysis, req.user.id);
+    await saveAiBrainSummaryToEmail(email_id, brainAnalysis.summary, brainAnalysis.transaction_type, brainAnalysis.urgency_level);
+
+    let createdTasks = [];
+    if (brainAnalysis.action_items && brainAnalysis.action_items.length > 0) {
+      createdTasks = await createTrackingTasksFromBrainAnalysis(email_id, brainAnalysis.action_items, req.user.id);
+    }
+
+    return res.json({
+      analysis: saved,
+      brain: brainAnalysis,
+      tasks_created: createdTasks.length,
+      cached: false
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/ai/brain/:emailId", authenticateRequest, async (req, res) => {
+  try {
+    const emailId = Number(req.params.emailId);
+    if (!emailId) return res.status(400).json({ error: "Invalid email ID" });
+
+    const analysis = await getAiBrainAnalysisByEmailId(emailId);
+    if (!analysis) return res.status(404).json({ error: "No brain analysis found" });
+
+    return res.json({ analysis });
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }

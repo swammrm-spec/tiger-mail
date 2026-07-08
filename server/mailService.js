@@ -12,6 +12,8 @@ import {
   createSerialFromSubjectKey,
   analyzeIncomingEmail,
   getUserByEmail,
+  getUserById,
+  getAppSettings,
   getMailSettingsForUser,
   getEmailById,
   getEmailByExternalMessageId,
@@ -41,15 +43,20 @@ import {
   createTask,
   getAiAnalysisByEmailId,
   saveAiAnalysis,
+  saveAiBrainAnalysis,
+  saveAiBrainSummaryToEmail,
+  createTrackingTasksFromBrainAnalysis,
   updateTask
 } from "./database.js";
-import { analyzeInboundTaskExtractionWithLlm } from "./aiAnalysisService.js";
+import { analyzeInboundTaskExtractionWithLlm, analyzeEmailBrain } from "./aiAnalysisService.js";
 
 const activeConfigs = new Map();
 const smtpTransporters = new Map();
 const userServiceState = new Map();
 const nextCycleByUser = new Map();
 const aiBackfillJobs = new Map();
+const imapWatchersByUser = new Map();
+const imapWatcherReconnectTimers = new Map();
 let schedulerHandle = null;
 const cycleInFlightByUser = new Map();
 let globalCycleInFlight = null;
@@ -75,6 +82,10 @@ let serviceState = {
   nextCycleAt: null,
   lastReceiveAt: null,
   lastReceiveCount: 0,
+  imapBridgeRunning: false,
+  lastBridgeReceiveAt: null,
+  lastBridgeReceiveCount: 0,
+  lastBridgeError: null,
   lastSendAt: null,
   lastSendCount: 0,
   lastQueueCount: 0,
@@ -165,6 +176,10 @@ function getDefaultUserState(config = null) {
     nextCycleAt: null,
     lastReceiveAt: null,
     lastReceiveCount: 0,
+    imapBridgeRunning: false,
+    lastBridgeReceiveAt: null,
+    lastBridgeReceiveCount: 0,
+    lastBridgeError: null,
     lastSendAt: null,
     lastSendCount: 0,
     lastQueueCount: 0,
@@ -665,6 +680,308 @@ function fetchImapMessages(client, sequenceNumbers = []) {
   });
 }
 
+function isImapBridgeEligible(config) {
+  return Boolean(
+    isImapAccount(config)
+    && String(config?.incoming_server || "").trim()
+    && String(config?.username || "").trim()
+    && String(config?.password || "").trim()
+  );
+}
+
+function clearImapWatcherReconnect(userId) {
+  const existingTimer = imapWatcherReconnectTimers.get(Number(userId || 0));
+  if (existingTimer) {
+    clearTimeout(existingTimer);
+    imapWatcherReconnectTimers.delete(Number(userId || 0));
+  }
+}
+
+async function importImapMessagesForFolder(client, box, messages = [], folderPlan, ownerUserId = null) {
+  let received = 0;
+  let skipped = 0;
+  for (const message of messages) {
+    const uid = Number(message.attributes?.uid || 0);
+    const uidValidity = Number(box?.uidvalidity || 0);
+    const ownerScope = Number(ownerUserId || 0);
+    const externalId = `imap:${ownerScope}:${folderPlan.folderKind}:${uidValidity}:${uid}`;
+    const existingEmail = await getEmailByExternalMessageId(externalId);
+    if (existingEmail) {
+      skipped += 1;
+      continue;
+    }
+
+    const parsed = await simpleParser(message.rawEmail);
+    const attachments = await saveParsedAttachments(parsed);
+    const sentAt = folderPlan.folderKind === "sent"
+      ? parsed.date?.toISOString?.() || new Date().toISOString()
+      : null;
+    await archiveIncomingParsedEmail({
+      parsed,
+      attachments,
+      externalId,
+      ownerUserId,
+      provider: "imap",
+      sourceFolder: folderPlan.sourceFolder,
+      targetFolderName: normalizeTargetFolderName(folderPlan.folderKind),
+      messageStatus: folderPlan.folderKind === "sent" ? "Sent" : "Received",
+      isRead: folderPlan.folderKind === "sent" ? true : Boolean(message.attributes?.flags?.includes("\\Seen")),
+      sentAt,
+      forceOwnerUser: folderPlan.folderKind === "sent"
+    });
+    received += 1;
+  }
+  return { received, skipped };
+}
+
+async function primeImapWatcherState(watcher) {
+  const allUids = await searchImap(watcher.client, ["ALL"]);
+  watcher.lastSeenUid = allUids.length
+    ? Math.max(...allUids.map((uid) => Number(uid || 0)).filter((uid) => Number.isFinite(uid)))
+    : 0;
+}
+
+async function processImapWatcherNewMail(watcher) {
+  if (!watcher || watcher.isClosing) {
+    return;
+  }
+  if (watcher.processing) {
+    watcher.pending = true;
+    return;
+  }
+
+  watcher.processing = true;
+  watcher.pending = false;
+  try {
+    if (!watcher.box) {
+      watcher.box = await openImapBox(watcher.client, watcher.folderPlan.sourceFolder, true);
+    }
+    const allUids = await searchImap(watcher.client, ["ALL"]);
+    const freshUids = allUids
+      .map((uid) => Number(uid || 0))
+      .filter((uid) => Number.isFinite(uid) && uid > watcher.lastSeenUid)
+      .sort((left, right) => left - right);
+
+    if (!freshUids.length) {
+      return;
+    }
+
+    const messages = await fetchImapMessages(watcher.client, freshUids);
+    const result = await importImapMessagesForFolder(
+      watcher.client,
+      watcher.box,
+      messages,
+      watcher.folderPlan,
+      watcher.userId
+    );
+    watcher.lastSeenUid = Math.max(watcher.lastSeenUid, ...freshUids);
+
+    const bridgeStamp = new Date().toISOString();
+    setUserState(
+      watcher.userId,
+      {
+        imapBridgeRunning: true,
+        lastBridgeReceiveAt: bridgeStamp,
+        lastBridgeReceiveCount: result.received,
+        lastBridgeError: null
+      },
+      watcher.config
+    );
+    serviceState = {
+      ...serviceState,
+      imapBridgeRunning: imapWatchersByUser.size > 0,
+      lastBridgeReceiveAt: bridgeStamp,
+      lastBridgeReceiveCount: result.received,
+      lastBridgeError: null
+    };
+  } catch (error) {
+    setUserState(
+      watcher.userId,
+      {
+        imapBridgeRunning: false,
+        lastBridgeError: error.message || "IMAP bridge processing failed."
+      },
+      watcher.config
+    );
+    serviceState = {
+      ...serviceState,
+      imapBridgeRunning: imapWatchersByUser.size > 0,
+      lastBridgeError: error.message || "IMAP bridge processing failed."
+    };
+    throw error;
+  } finally {
+    watcher.processing = false;
+    if (watcher.pending && !watcher.isClosing) {
+      setTimeout(() => {
+        processImapWatcherNewMail(watcher).catch((error) => {
+          console.error(`[MAIL] IMAP bridge follow-up failed for user ${watcher.userId}:`, error.message);
+        });
+      }, 0);
+    }
+  }
+}
+
+function stopImapWatcher(userId, options = {}) {
+  const numericUserId = Number(userId || 0);
+  const watcher = imapWatchersByUser.get(numericUserId);
+  clearImapWatcherReconnect(numericUserId);
+  if (watcher) {
+    watcher.isClosing = true;
+    try {
+      watcher.client.removeAllListeners();
+      watcher.client.end();
+    } catch {}
+    imapWatchersByUser.delete(numericUserId);
+  }
+
+  if (options.keepState !== true) {
+    const config = activeConfigs.get(numericUserId) || null;
+    setUserState(
+      numericUserId,
+      {
+        imapBridgeRunning: false
+      },
+      config
+    );
+  }
+  serviceState = {
+    ...serviceState,
+    imapBridgeRunning: imapWatchersByUser.size > 0
+  };
+}
+
+function scheduleImapWatcherReconnect(userId, config, delayMs = 15000) {
+  const numericUserId = Number(userId || 0);
+  clearImapWatcherReconnect(numericUserId);
+  const latestConfig = activeConfigs.get(numericUserId) || config;
+  if (!schedulerHandle || !isImapBridgeEligible(latestConfig) || !activeConfigs.has(numericUserId)) {
+    return;
+  }
+
+  const reconnectDelay = Math.min(60000, Math.max(5000, Number(delayMs || 15000)));
+  imapWatcherReconnectTimers.set(
+    numericUserId,
+    setTimeout(() => {
+      imapWatcherReconnectTimers.delete(numericUserId);
+      const reconnectConfig = activeConfigs.get(numericUserId) || latestConfig;
+      startImapWatcher(numericUserId, reconnectConfig).catch((error) => {
+        console.error(`[MAIL] IMAP bridge reconnect failed for user ${numericUserId}:`, error.message);
+      });
+    }, reconnectDelay)
+  );
+}
+
+async function startImapWatcher(userId, config) {
+  const numericUserId = Number(userId || 0);
+  if (!numericUserId || !isImapBridgeEligible(config)) {
+    stopImapWatcher(numericUserId);
+    return;
+  }
+
+  stopImapWatcher(numericUserId, { keepState: true });
+  const client = createImapClient(config);
+  const watcher = {
+    userId: numericUserId,
+    config,
+    client,
+    folderPlan: {
+      sourceFolder: getConfiguredInboxFolder(config),
+      folderKind: "inbox"
+    },
+    box: null,
+    lastSeenUid: 0,
+    processing: false,
+    pending: false,
+    isClosing: false
+  };
+  imapWatchersByUser.set(numericUserId, watcher);
+  clearImapWatcherReconnect(numericUserId);
+
+  const markWatcherError = (message) => {
+    setUserState(
+      numericUserId,
+      {
+        imapBridgeRunning: false,
+        lastBridgeError: message
+      },
+      config
+    );
+    serviceState = {
+      ...serviceState,
+      imapBridgeRunning: imapWatchersByUser.size > 0,
+      lastBridgeError: message
+    };
+  };
+
+  const reconnect = (errorMessage) => {
+    if (watcher.isClosing) {
+      return;
+    }
+    imapWatchersByUser.delete(numericUserId);
+    markWatcherError(errorMessage);
+    scheduleImapWatcherReconnect(numericUserId, config);
+  };
+
+  client.once("ready", () => {
+    openImapBox(client, watcher.folderPlan.sourceFolder, true)
+      .then(async (box) => {
+        watcher.box = box;
+        await primeImapWatcherState(watcher);
+        setUserState(
+          numericUserId,
+          {
+            imapBridgeRunning: true,
+            lastBridgeError: null
+          },
+          config
+        );
+        serviceState = {
+          ...serviceState,
+          imapBridgeRunning: imapWatchersByUser.size > 0,
+          lastBridgeError: null
+        };
+      })
+      .catch((error) => {
+        reconnect(error.message || "IMAP bridge failed to open Inbox.");
+      });
+  });
+
+  client.on("mail", () => {
+    processImapWatcherNewMail(watcher).catch((error) => {
+      reconnect(error.message || "IMAP bridge failed while importing new mail.");
+    });
+  });
+
+  client.once("error", (error) => {
+    reconnect(error.message || "IMAP bridge connection error.");
+  });
+  client.once("end", () => {
+    reconnect("IMAP bridge connection ended.");
+  });
+  client.once("close", () => {
+    reconnect("IMAP bridge connection closed.");
+  });
+
+  try {
+    await connectImap(client);
+  } catch (error) {
+    reconnect(error.message || "IMAP bridge could not connect.");
+    throw error;
+  }
+}
+
+function startImapWatchersForActiveConfigs() {
+  for (const [userId, config] of activeConfigs.entries()) {
+    if (isImapBridgeEligible(config)) {
+      startImapWatcher(userId, config).catch((error) => {
+        console.error(`[MAIL] IMAP bridge failed to start for user ${userId}:`, error.message);
+      });
+    } else {
+      stopImapWatcher(userId);
+    }
+  }
+}
+
 function isGraphAccount(config) {
   return String(config?.account_type || "").trim().toUpperCase() === "GRAPH";
 }
@@ -826,12 +1143,17 @@ function stopScheduler() {
     clearInterval(schedulerHandle);
     schedulerHandle = null;
   }
+  for (const userId of [...imapWatchersByUser.keys()]) {
+    stopImapWatcher(userId);
+  }
   serviceState.schedulerRunning = false;
+  serviceState.imapBridgeRunning = false;
   serviceState.nextCycleAt = null;
   for (const [userId, userState] of userServiceState.entries()) {
     userServiceState.set(userId, {
       ...userState,
       schedulerRunning: false,
+      imapBridgeRunning: false,
       nextCycleAt: null
     });
   }
@@ -1235,6 +1557,8 @@ function startScheduler() {
       }
     }
   }, 15 * 1000);
+
+  startImapWatchersForActiveConfigs();
 
   for (const [userId] of activeConfigs.entries()) {
     runCycle(userId).catch((error) => {
@@ -1841,6 +2165,220 @@ async function resolveSuggestedTaskAssignee({ task = {}, extraction = {}, projec
   return resolveProjectTaskAssignee(projectId, fallbackUserId);
 }
 
+function getTaskWorkflowSlaHours(category = "GENERAL", riskLevel = "low") {
+  const normalizedCategory = String(category || "GENERAL").trim().toUpperCase();
+  const normalizedRisk = String(riskLevel || "low").trim().toLowerCase();
+  if (normalizedCategory === "CUSTOMS") return 24;
+  if (normalizedCategory === "PAYMENT") return 48;
+  if (normalizedCategory === "TENDER") return 72;
+  if (normalizedRisk === "critical" || normalizedRisk === "high") return 24;
+  if (normalizedRisk === "medium") return 72;
+  return 120;
+}
+
+function toIsoStringIfValid(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+function buildFallbackWorkflowDueDate({ task = {}, extraction = {}, archivedEmail = {}, parsed = null } = {}) {
+  const explicitDueDate = toIsoStringIfValid(task?.due_date);
+  if (explicitDueDate) {
+    return explicitDueDate;
+  }
+
+  const baseDate = toIsoStringIfValid(archivedEmail?.received_at)
+    || toIsoStringIfValid(parsed?.date)
+    || new Date().toISOString();
+  const slaHours = getTaskWorkflowSlaHours(
+    task?.category || extraction?.email_category || "GENERAL",
+    extraction?.risk_level || archivedEmail?.risk_level || "low"
+  );
+  const dueDate = new Date(baseDate);
+  dueDate.setHours(dueDate.getHours() + slaHours);
+  return dueDate.toISOString();
+}
+
+function buildWorkflowNotificationSubject(companyName, count, category) {
+  const label = category && category !== "GENERAL" ? ` ${category}` : "";
+  return `[Task Orchestrator]${label} ${count} task(s) assigned`;
+}
+
+async function resolveTaskWorkflowNotifierConfig(preferredUserId = null) {
+  const appSettings = await getAppSettings().catch(() => null);
+  if (appSettings?.outgoing_server && appSettings?.email_address) {
+    return appSettings;
+  }
+  const fallbackUserId = Number(preferredUserId || 0);
+  if (fallbackUserId) {
+    return activeConfigs.get(fallbackUserId) || await ensureActiveConfig(fallbackUserId).catch(() => null);
+  }
+  return null;
+}
+
+async function ensureWorkflowReminder(emailId, title, remindAt) {
+  const remindAtIso = toIsoStringIfValid(remindAt);
+  if (!emailId || !title || !remindAtIso) {
+    return;
+  }
+  const exists = await query(
+    `SELECT id FROM reminders WHERE email_id = $1 AND title = $2 AND remind_at = $3 LIMIT 1`,
+    [emailId, title, remindAtIso]
+  );
+  if (exists.rows[0]?.id) {
+    return;
+  }
+  await query(
+    `INSERT INTO reminders (email_id, title, remind_at, status) VALUES ($1, $2, $3, $4)`,
+    [emailId, title, remindAtIso, "Scheduled"]
+  );
+}
+
+async function scheduleTaskWorkflowReminders({ taskRecord, archivedEmail }) {
+  const dueDateIso = toIsoStringIfValid(taskRecord?.due_date);
+  if (!taskRecord?.id || !archivedEmail?.id || !dueDateIso) {
+    return;
+  }
+
+  const dueDate = new Date(dueDateIso);
+  const checkpoints = [
+    { suffix: "24h", hoursBefore: 24 },
+    { suffix: "2h", hoursBefore: 2 }
+  ];
+
+  for (const checkpoint of checkpoints) {
+    const remindAt = new Date(dueDate);
+    remindAt.setHours(remindAt.getHours() - checkpoint.hoursBefore);
+    if (remindAt.getTime() <= Date.now()) {
+      continue;
+    }
+    await ensureWorkflowReminder(
+      archivedEmail.id,
+      `Task Reminder ${checkpoint.suffix}: ${taskRecord.title}`,
+      remindAt.toISOString()
+    );
+  }
+}
+
+async function sendTaskWorkflowEmailNotification({ assignedUser, archivedEmail, tasks = [], preferredUserId = null, category = "GENERAL" } = {}) {
+  if (!assignedUser?.email || !tasks.length) {
+    return { sent: false, reason: "Missing assigned user email or tasks." };
+  }
+  const config = await resolveTaskWorkflowNotifierConfig(preferredUserId);
+  if (!config?.outgoing_server || !config?.email_address) {
+    return { sent: false, reason: "No SMTP configuration available for workflow notifications." };
+  }
+
+  const transporter = getSmtpTransporter(config);
+  const companyName = config.company_name || "Tiger.mail";
+  const subject = buildWorkflowNotificationSubject(companyName, tasks.length, category);
+  const rowsHtml = tasks.map((task) => {
+    return `<div style="padding:10px 0;border-bottom:1px solid #eee;">
+      <div style="font-weight:600;">${task.title}</div>
+      <div style="font-size:12px;color:#666;">${task.project_code ? `[${task.project_code}] ` : ""}${String(task.task_type || "general").toUpperCase()} | Priority: ${task.priority || "medium"} | Due: ${task.due_date ? new Date(task.due_date).toLocaleString() : "Auto SLA"}</div>
+      <div style="font-size:12px;color:#444;margin-top:4px;">${task.description || ""}</div>
+    </div>`;
+  }).join("");
+
+  await transporter.sendMail({
+    from: `"${config.display_name || companyName}" <${config.email_address}>`,
+    to: assignedUser.email,
+    subject,
+    html: `<div style="font-family:Arial,sans-serif;max-width:680px;margin:0 auto;">
+      <h2 style="margin-bottom:8px;">Task Orchestrator Assignment</h2>
+      <p>Hello <strong>${assignedUser.name || assignedUser.email}</strong>,</p>
+      <p>New workflow task(s) were created automatically from email <strong>${archivedEmail?.serial || archivedEmail?.subject || archivedEmail?.id}</strong>.</p>
+      ${rowsHtml}
+    </div>`,
+    text: [
+      `Task Orchestrator Assignment`,
+      `Email: ${archivedEmail?.serial || archivedEmail?.subject || archivedEmail?.id || "-"}`,
+      ...tasks.map((task) => `- ${task.title} | ${String(task.task_type || "general").toUpperCase()} | Due: ${task.due_date || "Auto SLA"}`)
+    ].join("\n")
+  });
+
+  return { sent: true };
+}
+
+async function sendTaskWorkflowTelegramNotification({ assignedUser, archivedEmail, tasks = [] } = {}) {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = assignedUser?.telegram_notifications_enabled ? String(assignedUser?.telegram_chat_id || "") : "";
+  if (!botToken || !chatId || !tasks.length) {
+    return { sent: false, reason: "Telegram workflow notification is not configured." };
+  }
+
+  const text = [
+    `Tiger.mail Task Orchestrator`,
+    ``,
+    `Assigned to: ${assignedUser?.name || assignedUser?.email || "-"}`,
+    `Email: ${archivedEmail?.serial || archivedEmail?.subject || archivedEmail?.id || "-"}`,
+    ...tasks.map((task) => `- ${task.title}\n  Type: ${String(task.task_type || "general").toUpperCase()} | Due: ${task.due_date ? new Date(task.due_date).toLocaleString() : "Auto SLA"}`)
+  ].join("\n");
+
+  const response = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text
+    })
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || payload?.ok === false) {
+    return { sent: false, reason: payload?.description || "Telegram API rejected the workflow notification." };
+  }
+  return { sent: true, message_id: payload?.result?.message_id || null, chat_id: chatId };
+}
+
+async function runTaskWorkflowNotifications({ taskRecords = [], archivedEmail, preferredUserId = null, category = "GENERAL" } = {}) {
+  const grouped = new Map();
+  for (const taskRecord of taskRecords) {
+    const assignedTo = Number(taskRecord?.assigned_to || 0);
+    if (!assignedTo) {
+      continue;
+    }
+    if (!grouped.has(assignedTo)) {
+      grouped.set(assignedTo, []);
+    }
+    grouped.get(assignedTo).push(taskRecord);
+  }
+
+  for (const [assignedUserId, tasks] of grouped.entries()) {
+    const assignedUser = await getUserById(assignedUserId).catch(() => null);
+    if (!assignedUser) {
+      continue;
+    }
+    const emailResult = await sendTaskWorkflowEmailNotification({
+      assignedUser,
+      archivedEmail,
+      tasks,
+      preferredUserId,
+      category
+    }).catch((error) => ({ sent: false, reason: error.message || "Workflow email notification failed." }));
+    const telegramResult = await sendTaskWorkflowTelegramNotification({
+      assignedUser,
+      archivedEmail,
+      tasks
+    }).catch((error) => ({ sent: false, reason: error.message || "Workflow Telegram notification failed." }));
+
+    await logEmailTrail(
+      archivedEmail?.id || null,
+      preferredUserId || assignedUserId,
+      "Task Workflow Notification",
+      JSON.stringify({
+        assigned_to: assignedUser.email || "",
+        task_count: tasks.length,
+        email_sent: Boolean(emailResult?.sent),
+        email_reason: emailResult?.reason || "",
+        telegram_sent: Boolean(telegramResult?.sent),
+        telegram_reason: telegramResult?.reason || "",
+        telegram_chat_id: telegramResult?.chat_id || ""
+      })
+    );
+  }
+}
+
 async function createInboundAutoTasks({
   archivedEmail,
   parsed,
@@ -1848,10 +2386,11 @@ async function createInboundAutoTasks({
   projectId,
   effectiveEmployeeId,
   senderEmail,
-  allowGenericProjectFallback = true
+  allowGenericProjectFallback = true,
+  notifyWorkflow = false
 }) {
   if (!archivedEmail?.id) {
-    return { created: 0, updated: 0, skipped: 0 };
+    return { created: 0, updated: 0, skipped: 0, tasks: [] };
   }
 
   const taskPriority = normalizeTaskPriority(extraction?.priority);
@@ -1859,6 +2398,7 @@ async function createInboundAutoTasks({
   let created = 0;
   let updated = 0;
   let skipped = 0;
+  const touchedTasks = [];
 
   async function upsertGeneratedTask(taskPayload) {
     const existingTask = await query(
@@ -1867,7 +2407,7 @@ async function createInboundAutoTasks({
     );
 
     if (existingTask.rows[0]?.id) {
-      await updateTask(existingTask.rows[0].id, {
+      const updatedTask = await updateTask(existingTask.rows[0].id, {
         title: taskPayload.title,
         description: taskPayload.description,
         assigned_to: taskPayload.assigned_to,
@@ -1876,17 +2416,24 @@ async function createInboundAutoTasks({
         status: taskPayload.status
       });
       updated += 1;
-      return;
+      if (updatedTask) {
+        touchedTasks.push({ ...updatedTask, _workflow_action: "updated" });
+      }
+      return updatedTask;
     }
 
-    await createTask(taskPayload);
+    const createdTask = await createTask(taskPayload);
     created += 1;
+    if (createdTask) {
+      touchedTasks.push({ ...createdTask, _workflow_action: "created" });
+    }
+    return createdTask;
   }
 
   if (!extractedTasks.length) {
     if (!projectId || !allowGenericProjectFallback) {
       skipped += 1;
-      return { created, updated, skipped };
+      return { created, updated, skipped, tasks: touchedTasks };
     }
 
     const assignedTo = await resolveProjectTaskAssignee(projectId, effectiveEmployeeId);
@@ -1900,9 +2447,27 @@ async function createInboundAutoTasks({
       task_type: "email_review",
       status: "pending",
       priority: taskPriority,
-      due_date: null
+      due_date: buildFallbackWorkflowDueDate({
+        extraction,
+        archivedEmail,
+        parsed,
+        task: {
+          category: extraction?.email_category || "GENERAL"
+        }
+      })
     });
-    return { created, updated, skipped };
+    if (notifyWorkflow && touchedTasks.length) {
+      for (const taskRecord of touchedTasks.filter((task) => task._workflow_action === "created" || task._workflow_action === "updated")) {
+        await scheduleTaskWorkflowReminders({ taskRecord, archivedEmail });
+      }
+      await runTaskWorkflowNotifications({
+        taskRecords: touchedTasks.filter((task) => task._workflow_action === "created"),
+        archivedEmail,
+        preferredUserId: effectiveEmployeeId,
+        category: extraction?.email_category || "GENERAL"
+      });
+    }
+    return { created, updated, skipped, tasks: touchedTasks };
   }
 
   for (const task of extractedTasks) {
@@ -1921,15 +2486,45 @@ async function createInboundAutoTasks({
       assigned_to: assignedTo,
       created_by: effectiveEmployeeId,
       title: `[${task.category || extraction.email_category || "FOLLOW-UP"}] ${parsed.subject || "New email"}`,
-      description: `${task.task_description || `Follow up on inbound email from ${senderEmail || "unknown"}.`}${checklistText}`,
+      description: `${task.task_description || `Follow up on inbound email from ${senderEmail || "unknown"}.`}${checklistText}\n\nWorkflow:\n- Category: ${task.category || extraction.email_category || "GENERAL"}\n- Routing: ${assignedTo || "unassigned"}\n- Source serial: ${archivedEmail.serial || "-"}`,
       task_type: task.task_type || "general",
       status: "pending",
       priority: normalizeTaskPriority(task.priority || extraction.priority),
-      due_date: task.due_date || null
+      due_date: buildFallbackWorkflowDueDate({
+        task,
+        extraction,
+        archivedEmail,
+        parsed
+      })
     });
   }
 
-  return { created, updated, skipped };
+  if (notifyWorkflow && touchedTasks.length) {
+    for (const taskRecord of touchedTasks.filter((task) => task._workflow_action === "created" || task._workflow_action === "updated")) {
+      await scheduleTaskWorkflowReminders({ taskRecord, archivedEmail });
+    }
+    await runTaskWorkflowNotifications({
+      taskRecords: touchedTasks.filter((task) => task._workflow_action === "created"),
+      archivedEmail,
+      preferredUserId: effectiveEmployeeId,
+      category: extraction?.email_category || "GENERAL"
+    });
+  }
+
+  await logEmailTrail(
+    archivedEmail.id,
+    effectiveEmployeeId || null,
+    "Task Orchestrator",
+    JSON.stringify({
+      category: extraction?.email_category || "GENERAL",
+      created,
+      updated,
+      skipped,
+      task_ids: touchedTasks.map((task) => task.id || null).filter(Boolean)
+    })
+  );
+
+  return { created, updated, skipped, tasks: touchedTasks };
 }
 
 async function buildInboundExtractionForStoredEmail(email) {
@@ -2121,7 +2716,8 @@ async function runAiBackfillReanalysis({
         projectId,
         effectiveEmployeeId: email.employee_id || null,
         senderEmail: email.sender_email || "",
-        allowGenericProjectFallback: false
+        allowGenericProjectFallback: false,
+        notifyWorkflow: false
       });
 
       summary.processed += 1;
@@ -2678,6 +3274,7 @@ async function archiveIncomingParsedEmail({
     })
   );
 
+  let orchestratorTaskSummary = null;
   try {
     const candidateAssignees = await listInboundTaskCandidateAssignees(projectId, effectiveEmployeeId);
     const fallbackExtraction = buildInboundAiExtraction({
@@ -2702,16 +3299,45 @@ async function archiveIncomingParsedEmail({
     };
     const extraction = await analyzeInboundTaskExtractionWithLlm(extractionContext, fallbackExtraction);
     await saveAiAnalysis(archivedEmail.id, extraction, effectiveEmployeeId || null);
-    await createInboundAutoTasks({
+    orchestratorTaskSummary = await createInboundAutoTasks({
       archivedEmail,
       parsed,
       extraction,
       projectId,
       effectiveEmployeeId,
-      senderEmail: sender.address || ""
+      senderEmail: sender.address || "",
+      notifyWorkflow: true
     });
   } catch (taskError) {
     // Auto AI extraction should never block the main archive pipeline.
+  }
+
+  try {
+    const brainContext = {
+      subject: parsed.subject || "Imported email",
+      body: textBody || parsed.textAsHtml || parsed.html || "",
+      senderEmail: sender.address || "",
+      senderName: sender.name || "",
+      recipientEmail: toLine,
+      recipientName: parsed.to?.value?.[0]?.name || "",
+      ccList: ccLine,
+      receivedAt: receivedAt,
+      attachments: attachments.map(a => a.originalname || a.file_name || "attachment"),
+      emailKeys: projectMatch.key_code ? [projectMatch.key_code] : [],
+      activeProjects: projectMatch.project_code ? [projectMatch.project_code] : []
+    };
+    const brainAnalysis = await analyzeEmailBrain(brainContext);
+    await saveAiBrainAnalysis(archivedEmail.id, brainAnalysis, effectiveEmployeeId || null);
+    await saveAiBrainSummaryToEmail(archivedEmail.id, brainAnalysis.summary, brainAnalysis.transaction_type, brainAnalysis.urgency_level);
+    if (
+      brainAnalysis.action_items
+      && brainAnalysis.action_items.length > 0
+      && !((orchestratorTaskSummary?.created || 0) + (orchestratorTaskSummary?.updated || 0))
+    ) {
+      await createTrackingTasksFromBrainAnalysis(archivedEmail.id, brainAnalysis.action_items, effectiveEmployeeId || null);
+    }
+  } catch (brainError) {
+    console.error("[AI-BRAIN] Brain analysis failed for email:", archivedEmail?.id, brainError?.message);
   }
 
   return archivedEmail;
@@ -3063,38 +3689,9 @@ async function receiveImapEmailsOnce(config, ownerUserId = null) {
 
       const sequenceNumbers = await searchImap(client, ["ALL"]);
       const messages = await fetchImapMessages(client, sequenceNumbers);
-
-      for (const message of messages) {
-        const uid = Number(message.attributes?.uid || 0);
-        const uidValidity = Number(box?.uidvalidity || 0);
-        const ownerScope = Number(ownerUserId || config?.user_id || 0);
-        const externalId = `imap:${ownerScope}:${folderPlan.folderKind}:${uidValidity}:${uid}`;
-        const existingEmail = await getEmailByExternalMessageId(externalId);
-        if (existingEmail) {
-          skipped += 1;
-          continue;
-        }
-
-        const parsed = await simpleParser(message.rawEmail);
-        const attachments = await saveParsedAttachments(parsed);
-        const sentAt = folderPlan.folderKind === "sent"
-          ? parsed.date?.toISOString?.() || new Date().toISOString()
-          : null;
-        await archiveIncomingParsedEmail({
-          parsed,
-          attachments,
-          externalId,
-          ownerUserId,
-          provider: "imap",
-          sourceFolder: folderPlan.sourceFolder,
-          targetFolderName: normalizeTargetFolderName(folderPlan.folderKind),
-          messageStatus: folderPlan.folderKind === "sent" ? "Sent" : "Received",
-          isRead: folderPlan.folderKind === "sent" ? true : Boolean(message.attributes?.flags?.includes("\\Seen")),
-          sentAt,
-          forceOwnerUser: folderPlan.folderKind === "sent"
-        });
-        received += 1;
-      }
+      const result = await importImapMessagesForFolder(client, box, messages, folderPlan, ownerUserId || config?.user_id || null);
+      received += result.received;
+      skipped += result.skipped;
     }
 
     await closeImap(client);

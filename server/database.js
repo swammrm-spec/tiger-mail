@@ -5652,6 +5652,109 @@ async function saveAiAnalysis(emailId, analysisData, userId) {
   return result.rows[0];
 }
 
+async function saveAiBrainAnalysis(emailId, brainData, userId) {
+  try {
+    await query(`ALTER TABLE ai_analysis ADD COLUMN IF NOT EXISTS transaction_type TEXT DEFAULT 'general'`);
+    await query(`ALTER TABLE ai_analysis ADD COLUMN IF NOT EXISTS has_deadline BOOLEAN DEFAULT FALSE`);
+    await query(`ALTER TABLE ai_analysis ADD COLUMN IF NOT EXISTS deadline_date DATE`);
+    await query(`ALTER TABLE ai_analysis ADD COLUMN IF NOT EXISTS needs_response BOOLEAN DEFAULT FALSE`);
+    await query(`ALTER TABLE ai_analysis ADD COLUMN IF NOT EXISTS urgency_level TEXT DEFAULT 'low'`);
+    await query(`ALTER TABLE ai_analysis ADD COLUMN IF NOT EXISTS action_items JSONB DEFAULT '[]'`);
+    await query(`ALTER TABLE ai_analysis ADD COLUMN IF NOT EXISTS key_entities JSONB DEFAULT '{}'`);
+    await query(`ALTER TABLE ai_analysis ADD COLUMN IF NOT EXISTS response_suggestion TEXT DEFAULT ''`);
+  } catch (e) { /* columns may already exist */ }
+
+  await query(`DELETE FROM ai_analysis WHERE email_id = $1`, [emailId]);
+
+  const result = await query(
+    `INSERT INTO ai_analysis (
+      email_id, sender_email, receiver_email, project_id, email_category, summary, ai_tasks,
+      priority, raw_response, analyzed_by, transaction_type, has_deadline, deadline_date,
+      needs_response, urgency_level, action_items, key_entities, response_suggestion
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+    RETURNING *`,
+    [
+      emailId, brainData.sender_email || "", brainData.receiver_email || "", null,
+      brainData.transaction_type || "general", brainData.summary || "",
+      JSON.stringify(brainData.ai_tasks || []),
+      brainData.urgency_level === "critical" ? "High" : brainData.urgency_level === "high" ? "High" : "Medium",
+      JSON.stringify(brainData), userId,
+      brainData.transaction_type || "general", brainData.has_deadline || false,
+      brainData.deadline_date || null, brainData.needs_response || false,
+      brainData.urgency_level || "low", JSON.stringify(brainData.action_items || []),
+      JSON.stringify(brainData.key_entities || {}), brainData.response_suggestion || ""
+    ]
+  );
+  return result.rows[0];
+}
+
+async function saveAiBrainSummaryToEmail(emailId, summary, transactionType, urgencyLevel) {
+  try {
+    await query(`ALTER TABLE emails ADD COLUMN IF NOT EXISTS ai_summary TEXT`);
+    await query(`ALTER TABLE emails ADD COLUMN IF NOT EXISTS transaction_type TEXT`);
+    await query(`ALTER TABLE emails ADD COLUMN IF NOT EXISTS urgency_level TEXT`);
+  } catch (e) { /* columns may already exist */ }
+
+  await query(
+    `UPDATE emails SET ai_summary = $1, transaction_type = $2, urgency_level = $3 WHERE id = $4`,
+    [summary, transactionType, urgencyLevel, emailId]
+  );
+}
+
+async function createTrackingTasksFromBrainAnalysis(emailId, actionItems, userId) {
+  if (!Array.isArray(actionItems) || actionItems.length === 0) return [];
+
+  const createdTasks = [];
+  for (const item of actionItems) {
+    if (!item.description) continue;
+    try {
+      const taskResult = await query(
+        `INSERT INTO tasks (
+          title, description, status, priority, due_date, assigned_to, created_by, email_id, source
+        ) VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, 'ai_brain')
+        RETURNING *`,
+        [
+          item.description.slice(0, 200),
+          item.description,
+          (item.priority || "medium").toLowerCase(),
+          item.due_date || null,
+          item.assignee_email_id || null,
+          userId || null,
+          emailId
+        ]
+      );
+      const task = taskResult.rows[0];
+
+      await query(
+        `INSERT INTO tracking_tasks (
+          existing_task_id, email_id, assigned_to, task_type, priority, due_date, status
+        ) VALUES ($1, $2, $3, 'ai_extracted', $4, $5, 'PENDING')
+        ON CONFLICT (existing_task_id) DO NOTHING`,
+        [
+          task.id, emailId, item.assignee_email_id || null,
+          (item.priority || "medium").toLowerCase(), item.due_date || null
+        ]
+      );
+      createdTasks.push(task);
+    } catch (e) {
+      console.error("[AI-BRAIN] Failed to create tracking task:", e.message);
+    }
+  }
+  return createdTasks;
+}
+
+async function getAiBrainAnalysisByEmailId(emailId) {
+  try {
+    const result = await query(
+      `SELECT * FROM ai_analysis WHERE email_id = $1 AND (transaction_type IS NOT NULL OR urgency_level IS NOT NULL)`,
+      [emailId]
+    );
+    return result.rows[0] || null;
+  } catch {
+    return null;
+  }
+}
+
 async function getAiAnalysisByEmailId(emailId) {
   const result = await query(`SELECT * FROM ai_analysis WHERE email_id = $1`, [emailId]);
   return result.rows[0] || null;
@@ -5966,6 +6069,10 @@ export {
   upsertRecentContact,
   getRecentContacts,
   saveAiAnalysis,
+  saveAiBrainAnalysis,
+  saveAiBrainSummaryToEmail,
+  createTrackingTasksFromBrainAnalysis,
+  getAiBrainAnalysisByEmailId,
   getAiAnalysisByEmailId,
   getAiAnalysisByUserId,
   getActiveProjects,

@@ -781,6 +781,9 @@ function App() {
   const [isLoading, setIsLoading] = useState(Boolean(token));
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isSendingEmail, setIsSendingEmail] = useState(false);
+  const [isGeneratingReplyDraft, setIsGeneratingReplyDraft] = useState(false);
+  const [isCheckingResponsePolicyGuard, setIsCheckingResponsePolicyGuard] = useState(false);
+  const [responsePolicyGuard, setResponsePolicyGuard] = useState(null);
   const [isSavingSettings, setIsSavingSettings] = useState(false);
   const [isTestingSettings, setIsTestingSettings] = useState(false);
   const [isApplyingSettings, setIsApplyingSettings] = useState(false);
@@ -812,7 +815,9 @@ function App() {
   const [form, setForm] = useState({
     sender_name: "M. Safadi", sender_email: defaultAdminEmail,
     recipient_name: "", recipient_email: "", cc_list: "", bcc_list: "", subject: "", body: "",
-    subject_key: "", approval_source_email_id: "", manager_comments: "", ai_recommendations: "",
+    subject_key: "", approval_source_email_id: "", reply_source_email_id: "", reply_mode: "",
+    manager_comments: "", ai_recommendations: "", draft_context_project_code: "",
+    draft_context_project_name: "", draft_context_history_count: "", draft_context_references: "",
     folder_name: "Inbox", priority: "Normal", sensitivity: "Normal",
     read_receipt: false, delivery_receipt: false, recommendation: "", reminder_title: "", remind_at: ""
   });
@@ -954,8 +959,14 @@ function App() {
       email_key_id: "",
       project_id: "",
       approval_source_email_id: "",
+      reply_source_email_id: "",
+      reply_mode: "",
       manager_comments: "",
       ai_recommendations: "",
+      draft_context_project_code: "",
+      draft_context_project_name: "",
+      draft_context_history_count: "",
+      draft_context_references: "",
       priority: settingsForm.priority || "Normal",
       sensitivity: settingsForm.sensitivity || "Normal",
       read_receipt: Boolean(settingsForm.read_receipt),
@@ -1012,6 +1023,7 @@ function App() {
     setActiveRibbonTab("home");
     const defaults = overrides || {};
     setForm(createDefaultComposeForm(defaults));
+    setResponsePolicyGuard(null);
     setFiles([]);
     loadRecentContacts();
     if (!canArchive) { setSuccessMessage("You can open the compose window, but your current permissions do not allow sending or archiving."); setError(""); return; }
@@ -1056,10 +1068,159 @@ function App() {
       `Subject: ${selectedEmail.subject || ""}`, "", selectedEmail.body || selectedEmail.preview || ""
     ].filter(Boolean).join("\n");
     const replyAllCc = [selectedEmail.cc_list, selectedEmail.recipient_email].filter(Boolean).join(", ").split(",").map(v => v.trim()).filter((v, i, a) => v && v !== currentUser?.email && a.indexOf(v) === i).join(", ");
-    if (mode === "reply") { openComposeView({ recipient_name: selectedEmail.sender_name || "", recipient_email: selectedEmail.sender_email || "", subject, body: quotedBody, folder_name: "Drafts", priority: selectedEmail.priority || "Normal" }); setSuccessMessage("Reply opened successfully."); setError(""); return; }
-    if (mode === "replyAll") { openComposeView({ recipient_name: selectedEmail.sender_name || "", recipient_email: selectedEmail.sender_email || "", cc_list: replyAllCc, subject, body: quotedBody, folder_name: "Drafts", priority: selectedEmail.priority || "Normal" }); setSuccessMessage("Reply All opened with recipients filled."); setError(""); return; }
+    if (mode === "reply") { openComposeView({ recipient_name: selectedEmail.sender_name || "", recipient_email: selectedEmail.sender_email || "", subject, body: quotedBody, folder_name: "Drafts", priority: selectedEmail.priority || "Normal", project_id: selectedEmail.project_id || "", reply_source_email_id: selectedEmail.id, reply_mode: mode, draft_context_project_code: "", draft_context_project_name: "", draft_context_history_count: "", draft_context_references: "", ai_recommendations: "" }); setSuccessMessage("Reply opened successfully."); setError(""); return; }
+    if (mode === "replyAll") { openComposeView({ recipient_name: selectedEmail.sender_name || "", recipient_email: selectedEmail.sender_email || "", cc_list: replyAllCc, subject, body: quotedBody, folder_name: "Drafts", priority: selectedEmail.priority || "Normal", project_id: selectedEmail.project_id || "", reply_source_email_id: selectedEmail.id, reply_mode: mode, draft_context_project_code: "", draft_context_project_name: "", draft_context_history_count: "", draft_context_references: "", ai_recommendations: "" }); setSuccessMessage("Reply All opened with recipients filled."); setError(""); return; }
     openComposeView({ subject, body: quotedBody, folder_name: "Drafts", priority: selectedEmail.priority || "Normal" });
     setSuccessMessage("Forward opened with original message content."); setError("");
+  }
+
+  function mergeSuggestedReplyBody(currentBody, suggestedReplyBody) {
+    const nextReply = String(suggestedReplyBody || "").trim();
+    if (!nextReply) {
+      return currentBody;
+    }
+    const currentText = String(currentBody || "");
+    const marker = "----- Original Message -----";
+    const markerIndex = currentText.indexOf(marker);
+    if (markerIndex === -1) {
+      return nextReply;
+    }
+    const quotedBlock = currentText.slice(markerIndex).trim();
+    return `${nextReply}\n\n${quotedBlock}`.trim();
+  }
+
+  function isResponsePolicyGuardStaleForDraft(draftSubject, draftBody) {
+    if (!responsePolicyGuard) return true;
+    return String(responsePolicyGuard.checked_subject || "") !== String(draftSubject || "")
+      || String(responsePolicyGuard.checked_body || "") !== String(draftBody || "");
+  }
+
+  async function runResponsePolicyGuard({
+    subjectOverride = null,
+    bodyOverride = null,
+    projectIdOverride = null,
+    silent = false
+  } = {}) {
+    const replySourceId = Number(form.reply_source_email_id || 0);
+    if (!replySourceId) {
+      return null;
+    }
+    const draftSubject = String(subjectOverride ?? form.subject ?? "").trim();
+    const draftBody = String(bodyOverride ?? form.body ?? "");
+    setIsCheckingResponsePolicyGuard(true);
+    if (!silent) {
+      setError("");
+      setSuccessMessage("");
+    }
+    try {
+      const response = await apiFetch("/api/ai/reply-policy-guard", {
+        method: "POST",
+        body: {
+          email_id: replySourceId,
+          subject: draftSubject,
+          draft_body: draftBody,
+          project_id: projectIdOverride ?? form.project_id ?? ""
+        }
+      });
+      const context = response.context || {};
+      const guard = {
+        ...(response.guard || {}),
+        context,
+        checked_subject: draftSubject,
+        checked_body: draftBody
+      };
+      setResponsePolicyGuard(guard);
+      setForm((prev) => ({
+        ...prev,
+        project_id: prev.project_id || context.project_id || "",
+        draft_context_project_code: context.project_code || prev.draft_context_project_code || "",
+        draft_context_project_name: context.project_name || prev.draft_context_project_name || "",
+        draft_context_history_count: String(context.history_count || prev.draft_context_history_count || 0),
+        draft_context_references: Array.isArray(context.references) ? context.references.join("\n") : (prev.draft_context_references || "")
+      }));
+      if (!silent) {
+        setSuccessMessage(
+          Array.isArray(guard.issues) && guard.issues.length
+            ? `Policy Guard detected ${guard.issues.length} issue(s) to review.`
+            : "Policy Guard did not detect contradictions in the current draft."
+        );
+      }
+      return guard;
+    } catch (e) {
+      if (!silent) {
+        setError(e.message);
+      }
+      throw e;
+    } finally {
+      setIsCheckingResponsePolicyGuard(false);
+    }
+  }
+
+  async function handleGenerateReplyDraft() {
+    const replySourceId = Number(form.reply_source_email_id || 0);
+    if (!replySourceId) {
+      setError("Reply source email is missing.");
+      return;
+    }
+    setIsGeneratingReplyDraft(true);
+    setError("");
+    setSuccessMessage("");
+    try {
+      const response = await apiFetch("/api/ai/reply-draft", {
+        method: "POST",
+        body: {
+          email_id: replySourceId,
+          subject: form.subject || "",
+          draft_body: form.body || "",
+          mode: form.reply_mode || "reply",
+          project_id: form.project_id || ""
+        }
+      });
+      const draft = response.draft || {};
+      const context = response.context || {};
+      const nextSubject = draft.subject || form.subject;
+      const nextBody = mergeSuggestedReplyBody(form.body, draft.reply_body || "");
+      const nextProjectId = form.project_id || context.project_id || "";
+      const guidance = [
+        context.project_code ? `Project context: ${context.project_code}${context.project_name ? ` - ${context.project_name}` : ""}` : "",
+        Number(context.history_count || 0) ? `Historical emails used: ${Number(context.history_count)}` : "Historical emails used: 0",
+        ...(draft.guidance || [])
+      ].filter(Boolean);
+      setForm((prev) => ({
+        ...prev,
+        subject: nextSubject,
+        body: nextBody,
+        ai_recommendations: guidance.join("\n"),
+        project_id: nextProjectId,
+        draft_context_project_code: context.project_code || "",
+        draft_context_project_name: context.project_name || "",
+        draft_context_history_count: String(context.history_count || 0),
+        draft_context_references: Array.isArray(context.references) ? context.references.join("\n") : ""
+      }));
+      await runResponsePolicyGuard({
+        subjectOverride: nextSubject,
+        bodyOverride: nextBody,
+        projectIdOverride: nextProjectId,
+        silent: true
+      }).catch(() => null);
+      setSuccessMessage(
+        Number(context.history_count || 0)
+          ? `AI reply draft generated using ${Number(context.history_count)} historical project email(s).`
+          : "AI reply draft generated from the current email context."
+      );
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setIsGeneratingReplyDraft(false);
+    }
+  }
+
+  async function handleRunResponsePolicyGuard() {
+    try {
+      await runResponsePolicyGuard();
+    } catch {
+      // Error state is handled inside runResponsePolicyGuard.
+    }
   }
 
   function handleDownloadAllAttachments() {
@@ -2856,6 +3017,10 @@ function App() {
     const sourceId = Number(form.approval_source_email_id || 0);
     return data.emails.find(e => e.id === sourceId) || null;
   }, [data.emails, form.approval_source_email_id]);
+  const composeReplySourceEmail = useMemo(() => {
+    const replySourceId = Number(form.reply_source_email_id || 0);
+    return data.emails.find(e => e.id === replySourceId) || null;
+  }, [data.emails, form.reply_source_email_id]);
   const displayedApprovalHistory = useMemo(() => {
     if (composeSourceEmail?.id && approvalHistoryEmailId === composeSourceEmail.id) {
       return approvalHistory;
@@ -2875,6 +3040,16 @@ function App() {
   const composeAiRecommendations = useMemo(
     () => String(form.ai_recommendations || "").split("\n").map(v => v.trim()).filter(Boolean),
     [form.ai_recommendations]
+  );
+  const draftAssistantMeta = useMemo(() => ({
+    projectCode: String(form.draft_context_project_code || "").trim(),
+    projectName: String(form.draft_context_project_name || "").trim(),
+    historyCount: Number(form.draft_context_history_count || 0),
+    references: String(form.draft_context_references || "").split("\n").map(v => v.trim()).filter(Boolean)
+  }), [form.draft_context_history_count, form.draft_context_project_code, form.draft_context_project_name, form.draft_context_references]);
+  const isResponsePolicyGuardStale = useMemo(
+    () => isResponsePolicyGuardStaleForDraft(form.subject, form.body),
+    [responsePolicyGuard, form.subject, form.body]
   );
   const approvalDrawerEmail = useMemo(() => {
     if (!approvalDrawerEmailId) return null;
@@ -3117,6 +3292,36 @@ function App() {
       if (selectedKey) {
         const yy = String(new Date().getFullYear()).slice(-2);
         resolvedForm.subject = `${selectedKey.key_code}:${yy}/${resolvedForm.subject}`;
+      }
+    }
+    const replySourceId = Number(resolvedForm.reply_source_email_id || 0);
+    if (replySourceId) {
+      let guardToUse = responsePolicyGuard;
+      if (isResponsePolicyGuardStaleForDraft(resolvedForm.subject, resolvedForm.body)) {
+        try {
+          guardToUse = await runResponsePolicyGuard({
+            subjectOverride: resolvedForm.subject,
+            bodyOverride: resolvedForm.body,
+            projectIdOverride: resolvedForm.project_id || "",
+            silent: true
+          });
+        } catch (guardError) {
+          setError(guardError.message);
+          setIsSendingEmail(false);
+          return;
+        }
+      }
+      const hasSevereRisk = ["high", "critical"].includes(String(guardToUse?.severity || "").toLowerCase())
+        || String(guardToUse?.verdict || "").toLowerCase() === "blocked";
+      if (hasSevereRisk) {
+        const proceed = window.confirm(
+          `${guardToUse?.summary || "Policy Guard detected significant risks in this reply."}\n\nDo you want to send anyway?`
+        );
+        if (!proceed) {
+          setError("Send cancelled until the Response Policy Guard warnings are reviewed.");
+          setIsSendingEmail(false);
+          return;
+        }
       }
     }
     setForm(resolvedForm);
@@ -4172,7 +4377,15 @@ function App() {
           requiresManagerApproval={requiresManagerApproval}
           currentUser={currentUser}
           composeSourceEmail={composeSourceEmail}
+          composeReplySourceEmail={composeReplySourceEmail}
           composeAiRecommendations={composeAiRecommendations}
+          isGeneratingReplyDraft={isGeneratingReplyDraft}
+          handleGenerateReplyDraft={handleGenerateReplyDraft}
+          draftAssistantMeta={draftAssistantMeta}
+          responsePolicyGuard={responsePolicyGuard}
+          isCheckingResponsePolicyGuard={isCheckingResponsePolicyGuard}
+          isResponsePolicyGuardStale={isResponsePolicyGuardStale}
+          handleRunResponsePolicyGuard={handleRunResponsePolicyGuard}
           handleSubmit={handleSubmit}
           showFrom={showFrom}
           renderChipEmailInput={renderChipEmailInput}
@@ -4240,6 +4453,18 @@ function App() {
               currentUser={currentUser}
               onSelectEvent={() => openCalendarView()}
               onSelectEmail={() => { setCurrentView("approvals"); loadPendingApprovals(); }}
+              onNavigate={(url) => {
+                if (url.startsWith("/email/")) {
+                  const eid = parseInt(url.split("/email/")[1]);
+                  if (eid) { setSelectedEmailId(eid); setCurrentView("mail"); }
+                } else if (url.startsWith("/tasks/")) {
+                  setCurrentView("tasks");
+                } else if (url.startsWith("/projects")) {
+                  setCurrentView("projects");
+                } else {
+                  setCurrentView("mail");
+                }
+              }}
             />
           </Suspense>
           <button className="o365-app-btn" title="Settings" onClick={() => { setCurrentView("settings"); setSettingsTab("account"); }}><Settings size={20} /></button>

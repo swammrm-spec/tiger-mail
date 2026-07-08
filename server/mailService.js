@@ -2431,8 +2431,21 @@ async function createInboundAutoTasks({
   }
 
   if (!extractedTasks.length) {
-    if (!projectId || !allowGenericProjectFallback) {
+    if (!allowGenericProjectFallback) {
       skipped += 1;
+      await logEmailTrail(
+        archivedEmail.id,
+        effectiveEmployeeId || null,
+        "Task Orchestrator",
+        JSON.stringify({
+          category: extraction?.email_category || "GENERAL",
+          created,
+          updated,
+          skipped,
+          reason: "generic_fallback_disabled",
+          task_ids: []
+        })
+      );
       return { created, updated, skipped, tasks: touchedTasks };
     }
 
@@ -2467,6 +2480,20 @@ async function createInboundAutoTasks({
         category: extraction?.email_category || "GENERAL"
       });
     }
+    await logEmailTrail(
+      archivedEmail.id,
+      effectiveEmployeeId || null,
+      "Task Orchestrator",
+      JSON.stringify({
+        category: extraction?.email_category || "GENERAL",
+        created,
+        updated,
+        skipped,
+        fallback_mode: "generic_email_review",
+        project_id: projectId || null,
+        task_ids: touchedTasks.map((task) => task.id || null).filter(Boolean)
+      })
+    );
     return { created, updated, skipped, tasks: touchedTasks };
   }
 

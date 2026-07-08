@@ -94,6 +94,8 @@ import {
   updateProject,
   deleteProject,
   getEmailsByProject,
+  getProjectEmailHistoryForDrafting,
+  getContractMemoryForProject,
   parseSubjectForMetadata,
   generateHiddenFooter,
   extractHiddenRef,
@@ -115,6 +117,7 @@ import {
   getThreadAnalytics
 } from "./database.js";
 import {
+  canAccessAdmin,
   loginWithPassword,
   authenticateRequest,
   requireArchivePermission,
@@ -131,7 +134,20 @@ import {
   parseTelegramApprovalUpdate,
   answerTelegramCallback
 } from "./telegramApprovalBot.js";
-import { analyzeInboundTaskExtractionWithLlm, analyzeEmailBrain } from "./aiAnalysisService.js";
+import { analyzeInboundTaskExtractionWithLlm, analyzeEmailBrain, generateReplyDraftWithHistory, generateResponsePolicyGuard } from "./aiAnalysisService.js";
+import {
+  ensureNotificationsTable,
+  getNotifications,
+  getUnreadNotificationCount,
+  markNotificationRead,
+  markAllNotificationsRead,
+  deleteNotification,
+  markEmailNeedsReply,
+  markEmailReplied,
+  runProactiveAlertCycle,
+  startProactiveAlertEngine,
+  stopProactiveAlertEngine
+} from "./proactiveAlertService.js";
 import { SMTPServer } from "smtp-server";
 import { simpleParser } from "mailparser";
 
@@ -813,7 +829,7 @@ app.get("/api/tasks", authenticateRequest, async (req, res) => {
     if (req.query.status) filters.status = req.query.status;
     if (req.query.project_id) filters.project_id = req.query.project_id;
     if (req.query.assigned_to) filters.assigned_to = req.query.assigned_to;
-    if (req.user?.role !== "admin") filters.assigned_to = req.user?.id;
+    if (!canAccessAdmin(req.user)) filters.assigned_to = req.user?.id;
     const tasks = await getTasks(filters);
     return res.json({ tasks });
   } catch (error) {
@@ -1192,6 +1208,171 @@ app.post("/api/ai/analyze", authenticateRequest, async (req, res) => {
   }
 });
 
+app.post("/api/ai/reply-draft", authenticateRequest, async (req, res) => {
+  try {
+    const emailId = Number(req.body?.email_id || 0);
+    if (!emailId) {
+      return res.status(400).json({ error: "email_id required" });
+    }
+
+    const sourceEmail = await getEmailById(emailId);
+    if (!sourceEmail) {
+      return res.status(404).json({ error: "Email not found" });
+    }
+
+    const isAdminOverride = Number(req.user?.id || 0) === 1;
+    if (!isAdminOverride && Number(sourceEmail.employee_id || 0) !== Number(req.user?.id || 0)) {
+      return res.status(403).json({ error: "You do not have access to this email drafting context." });
+    }
+
+    const requestedSubject = String(req.body?.subject || "").trim();
+    const draftBody = String(req.body?.draft_body || "");
+    const existingDraftBody = draftBody.split("----- Original Message -----")[0].trim();
+    const projectId = Number(sourceEmail.project_id || req.body?.project_id || 0) || null;
+    const project = projectId ? await getProjectById(projectId).catch(() => null) : null;
+    const employeeScopeId = isAdminOverride ? Number(sourceEmail.employee_id || 0) || null : Number(req.user.id || 0);
+    const historyEmails = projectId
+      ? await getProjectEmailHistoryForDrafting({
+        projectId,
+        employeeId: employeeScopeId,
+        excludeEmailId: sourceEmail.id,
+        limit: 10
+      })
+      : [];
+    const contractMemoryEntries = projectId
+      ? await getContractMemoryForProject({
+        projectId,
+        employeeId: employeeScopeId,
+        limit: 12
+      })
+      : [];
+
+    const draft = await generateReplyDraftWithHistory({
+      sourceEmail,
+      historyEmails,
+      contractMemoryEntries,
+      project,
+      requestedSubject,
+      existingDraftBody,
+      replyMode: String(req.body?.mode || "reply").trim() || "reply"
+    });
+
+    await logEmailTrail(
+      sourceEmail.id,
+      req.user?.id || null,
+      "Drafting Assistant",
+      JSON.stringify({
+        project_id: projectId,
+        project_code: project?.project_code || "",
+        history_count: historyEmails.length,
+        contract_memory_count: contractMemoryEntries.length,
+        contract_memory_references: contractMemoryEntries.map((item) => item.reference_key || item.title || "").filter(Boolean).slice(0, 8),
+        references: historyEmails.map((item) => item.serial_number || item.subject || "").filter(Boolean).slice(0, 8),
+        provider: draft?.provider || "rules"
+      })
+    );
+
+    return res.json({
+      draft,
+      context: {
+        project_id: projectId,
+        project_code: project?.project_code || "",
+        project_name: project?.project_name || "",
+        history_count: historyEmails.length,
+        contract_memory_count: contractMemoryEntries.length,
+        contract_memory_references: contractMemoryEntries.map((item) => item.reference_key || item.title || "").filter(Boolean).slice(0, 8),
+        references: historyEmails.map((item) => item.serial_number || item.subject || "").filter(Boolean).slice(0, 8)
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/ai/reply-policy-guard", authenticateRequest, async (req, res) => {
+  try {
+    const emailId = Number(req.body?.email_id || 0);
+    if (!emailId) {
+      return res.status(400).json({ error: "email_id required" });
+    }
+
+    const sourceEmail = await getEmailById(emailId);
+    if (!sourceEmail) {
+      return res.status(404).json({ error: "Email not found" });
+    }
+
+    const isAdminOverride = Number(req.user?.id || 0) === 1;
+    if (!isAdminOverride && Number(sourceEmail.employee_id || 0) !== Number(req.user?.id || 0)) {
+      return res.status(403).json({ error: "You do not have access to this email drafting context." });
+    }
+
+    const draftSubject = String(req.body?.subject || "").trim();
+    const draftBody = String(req.body?.draft_body || "").trim();
+    if (!draftSubject && !draftBody) {
+      return res.status(400).json({ error: "Draft subject or body is required." });
+    }
+
+    const projectId = Number(sourceEmail.project_id || req.body?.project_id || 0) || null;
+    const project = projectId ? await getProjectById(projectId).catch(() => null) : null;
+    const employeeScopeId = isAdminOverride ? Number(sourceEmail.employee_id || 0) || null : Number(req.user.id || 0);
+    const historyEmails = projectId
+      ? await getProjectEmailHistoryForDrafting({
+        projectId,
+        employeeId: employeeScopeId,
+        excludeEmailId: sourceEmail.id,
+        limit: 10
+      })
+      : [];
+    const contractMemoryEntries = projectId
+      ? await getContractMemoryForProject({
+        projectId,
+        employeeId: employeeScopeId,
+        limit: 12
+      })
+      : [];
+
+    const guard = await generateResponsePolicyGuard({
+      sourceEmail,
+      historyEmails,
+      contractMemoryEntries,
+      project,
+      draftSubject,
+      draftBody
+    });
+
+    await logEmailTrail(
+      sourceEmail.id,
+      req.user?.id || null,
+      "Response Policy Guard",
+      JSON.stringify({
+        project_id: projectId,
+        project_code: project?.project_code || "",
+        history_count: historyEmails.length,
+        contract_memory_count: contractMemoryEntries.length,
+        severity: guard?.severity || "low",
+        verdict: guard?.verdict || "clear",
+        issue_count: Array.isArray(guard?.issues) ? guard.issues.length : 0,
+        provider: guard?.provider || "rules"
+      })
+    );
+
+    return res.json({
+      guard,
+      context: {
+        project_id: projectId,
+        project_code: project?.project_code || "",
+        project_name: project?.project_name || "",
+        history_count: historyEmails.length,
+        contract_memory_count: contractMemoryEntries.length,
+        contract_memory_references: contractMemoryEntries.map((item) => item.reference_key || item.title || "").filter(Boolean).slice(0, 8),
+        references: historyEmails.map((item) => item.serial_number || item.subject || "").filter(Boolean).slice(0, 8)
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
 app.get("/api/ai/projects", authenticateRequest, async (req, res) => {
   try {
     const projects = await getActiveProjects();
@@ -1276,6 +1457,88 @@ app.get("/api/admin/employees", authenticateRequest, requireAdminAccess, async (
     return res.status(400).json({ error: error.message });
   }
 });
+
+// #region Proactive Alert - Notification Endpoints
+app.get("/api/notifications", authenticateRequest, async (req, res) => {
+  try {
+    const { limit, unreadOnly, category } = req.query;
+    const notifications = await getNotifications(req.user.id, {
+      limit: limit ? parseInt(limit) : 50,
+      unreadOnly: unreadOnly === "true",
+      category: category || undefined
+    });
+    const unreadCount = await getUnreadNotificationCount(req.user.id);
+    return res.json({ notifications, unreadCount });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/notifications/count", authenticateRequest, async (req, res) => {
+  try {
+    const count = await getUnreadNotificationCount(req.user.id);
+    return res.json({ count });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+app.put("/api/notifications/:id/read", authenticateRequest, async (req, res) => {
+  try {
+    await markNotificationRead(Number(req.params.id), req.user.id);
+    return res.json({ success: true });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+app.put("/api/notifications/read-all", authenticateRequest, async (req, res) => {
+  try {
+    await markAllNotificationsRead(req.user.id);
+    return res.json({ success: true });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete("/api/notifications/:id", authenticateRequest, async (req, res) => {
+  try {
+    await deleteNotification(Number(req.params.id), req.user.id);
+    return res.json({ success: true });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/notifications/needs-reply", authenticateRequest, requireAdminAccess, async (req, res) => {
+  try {
+    const { emailId, replyDeadline } = req.body;
+    await markEmailNeedsReply(emailId, replyDeadline);
+    return res.json({ success: true });
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/notifications/replied", authenticateRequest, async (req, res) => {
+  try {
+    const { emailId } = req.body;
+    await markEmailReplied(emailId);
+    return res.json({ success: true });
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/notifications/run-cycle", authenticateRequest, requireAdminAccess, async (req, res) => {
+  try {
+    const result = await runProactiveAlertCycle();
+    return res.json({ success: true, result });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+// #endregion
 
 app.post("/api/admin/employees", authenticateRequest, requireAdminAccess, async (req, res) => {
   try {
@@ -1966,6 +2229,11 @@ async function startServer() {
   }
   startApprovalReminderScheduler();
   startTaskAlertEngine();
+  try {
+    await ensureNotificationsTable();
+    console.log("[ProactiveAlert] Notifications table ensured");
+  } catch (e) { console.error("[ProactiveAlert] Table creation failed:", e.message); }
+  startProactiveAlertEngine();
   const server = app.listen(port, "0.0.0.0", () => {
     // #region debug-point startup-localhost-refused
     reportStartupDebug("startServer.listenSuccess", { port });

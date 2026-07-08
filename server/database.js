@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import bcrypt from "bcryptjs";
+import * as XLSX from "xlsx";
 import { Pool } from "pg";
 import { newDb } from "pg-mem";
 import { analyzeDraftWithLlm } from "./aiAnalysisService.js";
@@ -77,7 +78,8 @@ const persistedTableQueries = {
   email_trail: "SELECT * FROM email_trail ORDER BY id ASC",
   approval_logs: "SELECT * FROM approval_logs ORDER BY id ASC",
   approval_action_tokens: "SELECT * FROM approval_action_tokens ORDER BY id ASC",
-  recent_contacts: "SELECT * FROM recent_contacts ORDER BY id ASC"
+  recent_contacts: "SELECT * FROM recent_contacts ORDER BY id ASC",
+  contract_memory: "SELECT * FROM contract_memory ORDER BY id ASC"
 };
 
 const serialSequences = [
@@ -99,7 +101,8 @@ const serialSequences = [
   { tableName: "email_trail", sequenceName: "email_trail_id_seq", pkColumn: "id" },
   { tableName: "approval_logs", sequenceName: "approval_logs_id_seq", pkColumn: "id" },
   { tableName: "approval_action_tokens", sequenceName: "approval_action_tokens_id_seq", pkColumn: "id" },
-  { tableName: "recent_contacts", sequenceName: "recent_contacts_id_seq", pkColumn: "id" }
+  { tableName: "recent_contacts", sequenceName: "recent_contacts_id_seq", pkColumn: "id" },
+  { tableName: "contract_memory", sequenceName: "contract_memory_id_seq", pkColumn: "id" }
 ];
 
 function ensureDirectory(dirPath) {
@@ -1520,6 +1523,34 @@ async function runSchema() {
       )
     `);
   } catch (e) { /* email_content_archive table optional */ }
+
+  try {
+    await query(`
+      CREATE TABLE IF NOT EXISTS contract_memory (
+        id BIGSERIAL PRIMARY KEY,
+        memory_key TEXT UNIQUE,
+        project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+        employee_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        source_email_id INTEGER REFERENCES emails(id) ON DELETE CASCADE,
+        source_attachment_id INTEGER REFERENCES attachments(id) ON DELETE CASCADE,
+        source_kind TEXT DEFAULT 'email',
+        memory_type TEXT DEFAULT 'general',
+        title TEXT DEFAULT '',
+        snippet TEXT NOT NULL,
+        source_file_name TEXT DEFAULT '',
+        reference_key TEXT DEFAULT '',
+        confidence TEXT DEFAULT 'medium',
+        source_updated_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await query(`CREATE INDEX IF NOT EXISTS idx_contract_memory_project_id ON contract_memory(project_id)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_contract_memory_employee_id ON contract_memory(employee_id)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_contract_memory_email_id ON contract_memory(source_email_id)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_contract_memory_attachment_id ON contract_memory(source_attachment_id)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_contract_memory_type ON contract_memory(memory_type)`);
+  } catch (e) { /* contract_memory table optional */ }
 
   try {
     await query(`
@@ -5022,6 +5053,359 @@ async function getEmailsByProject(projectId) {
   return result.rows;
 }
 
+async function getProjectEmailHistoryForDrafting({
+  projectId,
+  employeeId = null,
+  excludeEmailId = null,
+  limit = 10
+} = {}) {
+  if (!projectId) {
+    return [];
+  }
+
+  const params = [Number(projectId)];
+  let whereSql = `WHERE er.project_id = $1`;
+
+  if (employeeId) {
+    params.push(Number(employeeId));
+    whereSql += ` AND e.employee_id = $${params.length}`;
+  }
+  if (excludeEmailId) {
+    params.push(Number(excludeEmailId));
+    whereSql += ` AND e.id != $${params.length}`;
+  }
+
+  params.push(Math.min(20, Math.max(1, Number(limit || 10))));
+
+  const result = await query(
+    `
+      SELECT
+        er.email_db_id,
+        er.email_id,
+        er.project_id,
+        er.thread_id,
+        er.serial_number,
+        p.project_code,
+        p.project_name,
+        e.subject,
+        e.sender_name,
+        e.sender_email,
+        e.recipient_email,
+        e.cc_list,
+        e.received_at,
+        e.sent_at,
+        COALESCE(aa.summary, eca.ai_summary, '') AS ai_summary,
+        SUBSTRING(
+          REGEXP_REPLACE(COALESCE(eca.raw_body, e.body, e.body_html, ''), '<[^>]+>', ' ', 'g')
+          FROM 1 FOR 1400
+        ) AS body_excerpt
+      FROM email_registry er
+      JOIN emails e ON e.id = er.email_id
+      LEFT JOIN projects p ON p.id = er.project_id
+      LEFT JOIN email_content_archive eca ON eca.email_db_id = er.email_db_id
+      LEFT JOIN ai_analysis aa ON aa.email_id = er.email_id
+      ${whereSql}
+      ORDER BY COALESCE(e.sent_at, e.received_at, er.updated_at) DESC, er.email_db_id DESC
+      LIMIT $${params.length}
+    `,
+    params
+  );
+
+  return result.rows || [];
+}
+
+function normalizeContractMemoryText(value = "") {
+  return String(value || "")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function looksLikeContractMemoryCandidate(text = "", fileName = "", mimeType = "") {
+  const combined = `${text || ""}\n${fileName || ""}\n${mimeType || ""}`.toLowerCase();
+  return /(contract|agreement|mou|memorandum|annex|appendix|quotation|quote|proposal|offer|pricing|price|payment terms|sla|scope of work|statement of work|po\b|invoice|nd?a|warranty|penalty|liability|delivery|milestone|renewal|amendment|terms and conditions|اتفاقية|عقد|ملحق|عرض سعر|عرض فني|عرض مالي|التزام|شروط|أحكام|ضمان|غرامة|مسؤولية|موعد تسليم|دفعات|نطاق العمل|أمر شراء|فاتورة)/i.test(combined);
+}
+
+function inferContractMemoryType(text = "", fileName = "", mimeType = "") {
+  const combined = `${text || ""}\n${fileName || ""}\n${mimeType || ""}`.toLowerCase();
+  if (/(price|pricing|discount|quotation|quote|offer|عرض سعر|خصم|سعر)/i.test(combined)) return "pricing";
+  if (/(payment terms|invoice|iban|swift|remittance|دفعة|دفعات|فاتورة|سداد|تحويل)/i.test(combined)) return "payment_terms";
+  if (/(sla|delivery|deadline|milestone|due date|موعد|تسليم|جدول زمني|مهلة)/i.test(combined)) return "sla";
+  if (/(liability|penalty|warranty|indemnity|guarantee|nda|terms and conditions|مسؤولية|غرامة|ضمان|شروط|أحكام)/i.test(combined)) return "legal";
+  if (/(scope of work|statement of work|deliverables|scope|نطاق العمل|المخرجات|المواصفات)/i.test(combined)) return "scope";
+  if (/(contract|agreement|mou|memorandum|amendment|annex|appendix|عقد|اتفاقية|ملحق)/i.test(combined)) return "contract";
+  return "general";
+}
+
+function buildContractMemorySnippets(text = "", maxSnippets = 3) {
+  const normalized = normalizeContractMemoryText(text);
+  if (!normalized) return [];
+
+  const sentences = normalized
+    .split(/(?<=[\.\!\?])\s+|\n+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const prioritySentences = sentences.filter((sentence) => looksLikeContractMemoryCandidate(sentence));
+  const source = prioritySentences.length ? prioritySentences : sentences;
+  const snippets = [];
+
+  for (const sentence of source) {
+    if (sentence.length < 25) continue;
+    const compact = sentence.slice(0, 650).trim();
+    if (!compact) continue;
+    snippets.push(compact);
+    if (snippets.length >= maxSnippets) break;
+  }
+
+  if (!snippets.length && normalized.length) {
+    snippets.push(normalized.slice(0, 650).trim());
+  }
+
+  return [...new Set(snippets)].slice(0, maxSnippets);
+}
+
+function isSupportedAttachmentTextExtension(extension = "") {
+  return [".txt", ".md", ".csv", ".json", ".xml", ".html", ".htm", ".log", ".xlsx", ".xls"].includes(String(extension || "").toLowerCase());
+}
+
+function extractTextFromSpreadsheet(filePath) {
+  try {
+    const workbook = XLSX.readFile(filePath, { cellDates: false });
+    const sheetTexts = (workbook.SheetNames || []).slice(0, 3).map((sheetName) => {
+      const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { header: 1, raw: false });
+      const rowText = rows
+        .slice(0, 80)
+        .map((row) => Array.isArray(row) ? row.filter(Boolean).join(" | ") : "")
+        .filter(Boolean)
+        .join("\n");
+      return rowText ? `Sheet: ${sheetName}\n${rowText}` : "";
+    }).filter(Boolean);
+    return sheetTexts.join("\n\n");
+  } catch {
+    return "";
+  }
+}
+
+function extractAttachmentTextForContractMemory(attachment = {}) {
+  const filePath = resolveStoredAttachmentDiskPath(attachment.file_path || "");
+  if (!filePath || !fs.existsSync(filePath)) {
+    return "";
+  }
+
+  const extension = path.extname(String(attachment.file_name || attachment.originalname || "")).toLowerCase();
+  if (!isSupportedAttachmentTextExtension(extension)) {
+    return "";
+  }
+
+  try {
+    if (extension === ".xlsx" || extension === ".xls") {
+      return extractTextFromSpreadsheet(filePath);
+    }
+    return fs.readFileSync(filePath, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+function buildContractMemoryReference(email = {}, attachment = null, snippetIndex = 0) {
+  const serial = email.serial_number || email.serial || email.subject || "memory";
+  const attachmentName = attachment?.file_name || attachment?.originalname || "";
+  return [serial, attachmentName, snippetIndex + 1].filter(Boolean).join(" | ");
+}
+
+async function upsertContractMemoryEntry(entry = {}) {
+  if (!entry?.memory_key || !entry?.project_id || !entry?.snippet) {
+    return null;
+  }
+  const result = await query(
+    `
+      INSERT INTO contract_memory (
+        memory_key, project_id, employee_id, source_email_id, source_attachment_id, source_kind,
+        memory_type, title, snippet, source_file_name, reference_key, confidence, source_updated_at, updated_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
+      ON CONFLICT (memory_key)
+      DO UPDATE SET
+        project_id = EXCLUDED.project_id,
+        employee_id = EXCLUDED.employee_id,
+        source_email_id = EXCLUDED.source_email_id,
+        source_attachment_id = EXCLUDED.source_attachment_id,
+        source_kind = EXCLUDED.source_kind,
+        memory_type = EXCLUDED.memory_type,
+        title = EXCLUDED.title,
+        snippet = EXCLUDED.snippet,
+        source_file_name = EXCLUDED.source_file_name,
+        reference_key = EXCLUDED.reference_key,
+        confidence = EXCLUDED.confidence,
+        source_updated_at = EXCLUDED.source_updated_at,
+        updated_at = NOW()
+      RETURNING *
+    `,
+    [
+      entry.memory_key,
+      entry.project_id,
+      entry.employee_id || null,
+      entry.source_email_id || null,
+      entry.source_attachment_id || null,
+      entry.source_kind || "email",
+      entry.memory_type || "general",
+      entry.title || "",
+      entry.snippet,
+      entry.source_file_name || "",
+      entry.reference_key || "",
+      entry.confidence || "medium",
+      entry.source_updated_at || null
+    ]
+  );
+  return result.rows[0] || null;
+}
+
+async function ensureContractMemoryForProject(projectId, employeeId = null) {
+  if (!projectId) {
+    return [];
+  }
+
+  const params = [Number(projectId)];
+  let whereSql = `WHERE er.project_id = $1`;
+  if (employeeId) {
+    params.push(Number(employeeId));
+    whereSql += ` AND e.employee_id = $${params.length}`;
+  }
+
+  const emailResult = await query(
+    `
+      SELECT
+        er.email_db_id,
+        er.email_id,
+        er.serial_number,
+        er.thread_id,
+        er.project_id,
+        er.employee_id,
+        e.subject,
+        e.body,
+        e.body_html,
+        e.received_at,
+        e.sent_at,
+        e.updated_at AS email_updated_at,
+        COALESCE(aa.summary, eca.ai_summary, '') AS ai_summary,
+        eca.updated_at AS archive_updated_at
+      FROM email_registry er
+      JOIN emails e ON e.id = er.email_id
+      LEFT JOIN email_content_archive eca ON eca.email_db_id = er.email_db_id
+      LEFT JOIN ai_analysis aa ON aa.email_id = er.email_id
+      ${whereSql}
+      ORDER BY COALESCE(e.sent_at, e.received_at, e.updated_at) DESC, er.email_db_id DESC
+      LIMIT 60
+    `,
+    params
+  );
+
+  const refreshedEntries = [];
+  for (const email of emailResult.rows || []) {
+    const emailSourceUpdatedAt = email.archive_updated_at || email.email_updated_at || email.sent_at || email.received_at || new Date().toISOString();
+    const emailText = [email.subject, email.ai_summary, email.body, email.body_html].filter(Boolean).join("\n");
+    if (looksLikeContractMemoryCandidate(emailText, email.subject || "", "message/rfc822")) {
+      const emailSnippets = buildContractMemorySnippets(emailText, 2);
+      for (const [index, snippet] of emailSnippets.entries()) {
+        const entry = await upsertContractMemoryEntry({
+          memory_key: `email:${email.project_id}:${email.email_id}:${index}`,
+          project_id: email.project_id,
+          employee_id: email.employee_id || employeeId || null,
+          source_email_id: email.email_id,
+          source_attachment_id: null,
+          source_kind: "email",
+          memory_type: inferContractMemoryType(snippet, email.subject || "", "message/rfc822"),
+          title: email.subject || "Project email context",
+          snippet,
+          source_file_name: "",
+          reference_key: buildContractMemoryReference(email, null, index),
+          confidence: "medium",
+          source_updated_at: emailSourceUpdatedAt
+        });
+        if (entry) refreshedEntries.push(entry);
+      }
+    }
+
+    const attachments = await getEmailAttachments(email.email_id);
+    for (const attachment of attachments || []) {
+      const candidate = looksLikeContractMemoryCandidate("", attachment.file_name || "", attachment.mime_type || "");
+      const attachmentTextRaw = candidate ? extractAttachmentTextForContractMemory(attachment) : "";
+      const attachmentText = normalizeContractMemoryText(attachmentTextRaw);
+      if (!candidate && !looksLikeContractMemoryCandidate(attachmentText, attachment.file_name || "", attachment.mime_type || "")) {
+        continue;
+      }
+
+      const snippets = attachmentText
+        ? buildContractMemorySnippets(attachmentText, 3)
+        : [`Attachment "${attachment.file_name || "file"}" was referenced in project correspondence and appears to contain contractual or commercial terms.`];
+
+      for (const [index, snippet] of snippets.entries()) {
+        const entry = await upsertContractMemoryEntry({
+          memory_key: `attachment:${email.project_id}:${email.email_id}:${attachment.id}:${index}`,
+          project_id: email.project_id,
+          employee_id: email.employee_id || employeeId || null,
+          source_email_id: email.email_id,
+          source_attachment_id: attachment.id,
+          source_kind: "attachment",
+          memory_type: inferContractMemoryType(snippet, attachment.file_name || "", attachment.mime_type || ""),
+          title: attachment.file_name || email.subject || "Attachment contract memory",
+          snippet,
+          source_file_name: attachment.file_name || "",
+          reference_key: buildContractMemoryReference(email, attachment, index),
+          confidence: attachmentText ? "high" : "low",
+          source_updated_at: emailSourceUpdatedAt
+        });
+        if (entry) refreshedEntries.push(entry);
+      }
+    }
+  }
+
+  return refreshedEntries;
+}
+
+async function getContractMemoryForProject({
+  projectId,
+  employeeId = null,
+  limit = 12
+} = {}) {
+  if (!projectId) {
+    return [];
+  }
+
+  await ensureContractMemoryForProject(projectId, employeeId);
+
+  const params = [Number(projectId)];
+  let whereSql = `WHERE project_id = $1`;
+  if (employeeId) {
+    params.push(Number(employeeId));
+    whereSql += ` AND (employee_id = $${params.length} OR employee_id IS NULL)`;
+  }
+  params.push(Math.min(30, Math.max(1, Number(limit || 12))));
+
+  const result = await query(
+    `
+      SELECT *
+      FROM contract_memory
+      ${whereSql}
+      ORDER BY
+        CASE confidence
+          WHEN 'high' THEN 0
+          WHEN 'medium' THEN 1
+          ELSE 2
+        END ASC,
+        updated_at DESC,
+        id DESC
+      LIMIT $${params.length}
+    `,
+    params
+  );
+
+  return result.rows || [];
+}
+
 async function parseSubjectForMetadata(subject) {
   const metadata = { key_code: null, project_code: null, clean_subject: subject };
 
@@ -6108,6 +6492,8 @@ export {
   updateProject,
   deleteProject,
   getEmailsByProject,
+  getProjectEmailHistoryForDrafting,
+  getContractMemoryForProject,
   parseSubjectForMetadata,
   generateHiddenFooter,
   extractHiddenRef,

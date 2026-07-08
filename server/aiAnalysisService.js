@@ -687,9 +687,571 @@ async function analyzeEmailBrain(context) {
   }
 }
 
+function normalizeDraftReplyPayload(payload = {}, fallback = {}) {
+  const guidanceSource = Array.isArray(payload?.guidance)
+    ? payload.guidance
+    : Array.isArray(fallback?.guidance)
+      ? fallback.guidance
+      : [];
+  const referencesSource = Array.isArray(payload?.historical_references)
+    ? payload.historical_references
+    : Array.isArray(fallback?.historical_references)
+      ? fallback.historical_references
+      : [];
+
+  return {
+    subject: String(payload?.subject || fallback?.subject || "").trim(),
+    reply_body: String(payload?.reply_body || fallback?.reply_body || "").trim(),
+    guidance: guidanceSource.map((item) => String(item || "").trim()).filter(Boolean).slice(0, 6),
+    historical_references: referencesSource.map((item) => String(item || "").trim()).filter(Boolean).slice(0, 8),
+    language: String(payload?.language || fallback?.language || "auto").trim() || "auto",
+    provider: String(payload?.provider || fallback?.provider || "rules").trim() || "rules"
+  };
+}
+
+function buildHistoricalReplyPrompt({
+  sourceEmail = {},
+  historyEmails = [],
+  contractMemoryEntries = [],
+  project = null,
+  requestedSubject = "",
+  existingDraftBody = "",
+  replyMode = "reply"
+} = {}) {
+  const historySection = historyEmails.length
+    ? historyEmails.map((item, index) => {
+      return [
+        `History #${index + 1}`,
+        `Serial: ${item.serial_number || "-"}`,
+        `Thread: ${item.thread_id || "-"}`,
+        `Subject: ${item.subject || "-"}`,
+        `From: ${item.sender_name || ""} <${item.sender_email || ""}>`,
+        `To: ${item.recipient_email || ""}`,
+        `Date: ${item.sent_at || item.received_at || ""}`,
+        `AI Summary: ${item.ai_summary || "-"}`,
+        "Body Excerpt:",
+        item.body_excerpt || "-"
+      ].join("\n");
+    }).join("\n\n----------------\n\n")
+    : "No historical project emails were found.";
+  const contractMemorySection = contractMemoryEntries.length
+    ? contractMemoryEntries.map((item, index) => {
+      return [
+        `Contract Memory #${index + 1}`,
+        `Type: ${item.memory_type || "general"}`,
+        `Title: ${item.title || "-"}`,
+        `Reference: ${item.reference_key || "-"}`,
+        `Source File: ${item.source_file_name || "-"}`,
+        `Snippet: ${item.snippet || "-"}`
+      ].join("\n");
+    }).join("\n\n----------------\n\n")
+    : "No structured contract memory snippets were found.";
+
+  return [
+    "You are an enterprise email drafting assistant for a project-based Outlook workflow.",
+    "Your job is to draft a reply that is consistent with the historical correspondence of the same project.",
+    "Return strict JSON only.",
+    "JSON schema:",
+    "{",
+    '  "subject": "final reply subject",',
+    '  "reply_body": "professional plain-text email body only, ready to paste before the quoted original message",',
+    '  "guidance": ["short guidance bullets explaining why this draft matches the project history"],',
+    '  "historical_references": ["serial or subject references you relied on"],',
+    '  "language": "ar|en|mixed",',
+    '  "provider": "openai|gemini|rules"',
+    "}",
+    "Rules:",
+    "- Use the same working language as the incoming email unless the historical context strongly indicates a different language.",
+    "- Do not invent facts, approvals, prices, deadlines, or commitments that are not supported by the current email, historical correspondence, or contract memory snippets.",
+    "- If the historical context or contract memory contains previous commitments, preserve continuity and tone.",
+    "- If the current draft body contains user notes, incorporate them without duplicating the quoted original message.",
+    "- Keep the reply concise, professional, and operational.",
+    "- reply_body must NOT include markdown fences or explanations.",
+    "",
+    `Reply mode: ${replyMode || "reply"}`,
+    `Project: ${project?.project_code || "Unknown"} | ${project?.project_name || ""}`,
+    `Requested subject: ${requestedSubject || sourceEmail?.subject || ""}`,
+    "",
+    "Current email to reply to:",
+    `Subject: ${sourceEmail?.subject || ""}`,
+    `From: ${sourceEmail?.sender_name || ""} <${sourceEmail?.sender_email || ""}>`,
+    `To: ${sourceEmail?.recipient_email || ""}`,
+    `CC: ${sourceEmail?.cc_list || ""}`,
+    `Date: ${sourceEmail?.sent_at || sourceEmail?.received_at || ""}`,
+    "Body:",
+    sourceEmail?.body || "",
+    "",
+    "Existing draft body before the quoted original message:",
+    existingDraftBody || "",
+    "",
+    "Historical project context:",
+    historySection,
+    "",
+    "Structured contract memory:",
+    contractMemorySection
+  ].join("\n");
+}
+
+function buildRulesFallbackReplyDraft({
+  sourceEmail = {},
+  project = null,
+  historyEmails = [],
+  contractMemoryEntries = [],
+  requestedSubject = ""
+} = {}) {
+  const subject = String(
+    requestedSubject
+    || sourceEmail?.subject
+    || "RE: Follow-up"
+  ).trim();
+  const primaryReference = contractMemoryEntries[0]?.reference_key || historyEmails[0]?.serial_number || historyEmails[0]?.subject || "";
+  const likelyArabic = /[\u0600-\u06FF]/.test(`${sourceEmail?.subject || ""}\n${sourceEmail?.body || ""}`);
+  const replyBody = likelyArabic
+    ? [
+      `السادة الكرام،`,
+      "",
+      `نشكر رسالتكم بخصوص ${project?.project_code ? `المشروع ${project.project_code}` : "الموضوع المشار إليه"}.`,
+      primaryReference ? `قمنا بمراجعة المراسلات السابقة ذات الصلة، بما في ذلك المرجع ${primaryReference}.` : "قمنا بمراجعة المراسلات السابقة ذات الصلة ضمن نفس المشروع.",
+      "سنقوم بمتابعة المطلوب والعودة إليكم بالتحديث المناسب في أقرب وقت.",
+      "",
+      "مع الشكر،"
+    ].join("\n")
+    : [
+      "Dear Team,",
+      "",
+      `Thank you for your message regarding ${project?.project_code ? `project ${project.project_code}` : "the referenced matter"}.`,
+      primaryReference
+        ? `We reviewed the related historical correspondence, including reference ${primaryReference}.`
+        : "We reviewed the related historical correspondence for this project.",
+      "We will follow up on the requested points and revert with the appropriate update shortly.",
+      "",
+      "Best regards,"
+    ].join("\n");
+
+  return normalizeDraftReplyPayload({
+    subject,
+    reply_body: replyBody,
+    guidance: [
+      project?.project_code ? `Linked to project ${project.project_code}` : "Generated from current email context",
+      historyEmails.length ? `Used ${historyEmails.length} historical project email(s)` : "No historical project emails were available",
+      contractMemoryEntries.length ? `Used ${contractMemoryEntries.length} contract memory snippet(s)` : "No contract memory snippets were available"
+    ],
+    historical_references: [
+      ...contractMemoryEntries.map((item) => item.reference_key || item.title || "").filter(Boolean),
+      ...historyEmails.map((item) => item.serial_number || item.subject || "").filter(Boolean)
+    ].slice(0, 8),
+    language: likelyArabic ? "ar" : "en",
+    provider: "rules"
+  });
+}
+
+async function generateReplyDraftWithHistory(context = {}) {
+  const openAiConfig = getOpenAiConfig();
+  const geminiConfig = getGeminiConfig();
+  const fallback = buildRulesFallbackReplyDraft(context);
+
+  if (!openAiConfig && !geminiConfig) {
+    return fallback;
+  }
+
+  const prompt = buildHistoricalReplyPrompt(context);
+  try {
+    let payload = null;
+    if (openAiConfig) {
+      const response = await fetch(`${openAiConfig.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${openAiConfig.apiKey}`
+        },
+        body: JSON.stringify({
+          model: openAiConfig.model,
+          temperature: 0.2,
+          response_format: { type: "json_object" },
+          messages: [
+            { role: "system", content: "You draft enterprise email replies. Return only JSON." },
+            { role: "user", content: prompt }
+          ]
+        })
+      });
+      const json = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(json?.error?.message || "OpenAI reply drafting request failed.");
+      }
+      payload = {
+        ...parseLlmJson(json?.choices?.[0]?.message?.content || ""),
+        provider: "openai"
+      };
+    } else {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(geminiConfig.model)}:generateContent?key=${encodeURIComponent(geminiConfig.apiKey)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            generationConfig: {
+              temperature: 0.2,
+              responseMimeType: "application/json"
+            },
+            contents: [
+              {
+                role: "user",
+                parts: [{ text: prompt }]
+              }
+            ]
+          })
+        }
+      );
+      const json = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(json?.error?.message || "Gemini reply drafting request failed.");
+      }
+      payload = {
+        ...parseLlmJson(json?.candidates?.[0]?.content?.parts?.map((part) => part?.text || "").join("\n") || ""),
+        provider: "gemini"
+      };
+    }
+
+    return normalizeDraftReplyPayload(payload, fallback);
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizePolicySeverity(value = "", fallback = "low") {
+  const normalized = String(value || fallback || "low").trim().toLowerCase();
+  if (["low", "medium", "high", "critical"].includes(normalized)) {
+    return normalized;
+  }
+  return fallback;
+}
+
+function normalizePolicyVerdict(value = "", fallback = "clear") {
+  const normalized = String(value || fallback || "clear").trim().toLowerCase();
+  if (["clear", "review_required", "blocked"].includes(normalized)) {
+    return normalized;
+  }
+  return fallback;
+}
+
+function normalizePolicyIssues(value = [], fallback = []) {
+  const source = Array.isArray(value) ? value : Array.isArray(fallback) ? fallback : [];
+  return source
+    .map((item) => ({
+      type: String(item?.type || "general").trim() || "general",
+      title: String(item?.title || "").trim(),
+      severity: normalizePolicySeverity(item?.severity, "medium"),
+      details: String(item?.details || "").trim(),
+      supported_by_history: Boolean(item?.supported_by_history),
+      historical_reference: String(item?.historical_reference || "").trim()
+    }))
+    .filter((item) => item.title || item.details);
+}
+
+function normalizeResponsePolicyGuardPayload(payload = {}, fallback = {}) {
+  const supportedPointsSource = Array.isArray(payload?.supported_points)
+    ? payload.supported_points
+    : Array.isArray(fallback?.supported_points)
+      ? fallback.supported_points
+      : [];
+  const checkedReferencesSource = Array.isArray(payload?.checked_references)
+    ? payload.checked_references
+    : Array.isArray(fallback?.checked_references)
+      ? fallback.checked_references
+      : [];
+
+  return {
+    verdict: normalizePolicyVerdict(payload?.verdict, fallback?.verdict || "clear"),
+    severity: normalizePolicySeverity(payload?.severity, fallback?.severity || "low"),
+    summary: String(payload?.summary || fallback?.summary || "").trim(),
+    issues: normalizePolicyIssues(payload?.issues, fallback?.issues),
+    supported_points: supportedPointsSource.map((item) => String(item || "").trim()).filter(Boolean).slice(0, 8),
+    checked_references: checkedReferencesSource.map((item) => String(item || "").trim()).filter(Boolean).slice(0, 10),
+    provider: String(payload?.provider || fallback?.provider || "rules").trim() || "rules"
+  };
+}
+
+function buildResponsePolicyGuardPrompt({
+  sourceEmail = {},
+  project = null,
+  historyEmails = [],
+  contractMemoryEntries = [],
+  draftSubject = "",
+  draftBody = ""
+} = {}) {
+  const historySection = historyEmails.length
+    ? historyEmails.map((item, index) => [
+      `History #${index + 1}`,
+      `Serial: ${item.serial_number || "-"}`,
+      `Subject: ${item.subject || "-"}`,
+      `Date: ${item.sent_at || item.received_at || ""}`,
+      `AI Summary: ${item.ai_summary || "-"}`,
+      "Body Excerpt:",
+      item.body_excerpt || "-"
+    ].join("\n")).join("\n\n----------------\n\n")
+    : "No historical project emails were found.";
+  const contractMemorySection = contractMemoryEntries.length
+    ? contractMemoryEntries.map((item, index) => [
+      `Contract Memory #${index + 1}`,
+      `Type: ${item.memory_type || "general"}`,
+      `Title: ${item.title || "-"}`,
+      `Reference: ${item.reference_key || "-"}`,
+      `Source File: ${item.source_file_name || "-"}`,
+      `Snippet: ${item.snippet || "-"}`
+    ].join("\n")).join("\n\n----------------\n\n")
+    : "No structured contract memory snippets were found.";
+
+  return [
+    "You are a Response Policy Guard for an enterprise email system.",
+    "Review the proposed reply draft against the historical project correspondence and structured contract memory.",
+    "Identify contradictions, unsupported promises, pricing exposure, deadline changes, legal commitments, approval claims, and mismatches against contractual snippets.",
+    "Return strict JSON only.",
+    "JSON schema:",
+    "{",
+    '  "verdict": "clear|review_required|blocked",',
+    '  "severity": "low|medium|high|critical",',
+    '  "summary": "short Arabic summary",',
+    '  "issues": [{',
+    '    "type": "commitment|deadline|pricing|legal|approval|scope|general",',
+    '    "title": "short issue title",',
+    '    "severity": "low|medium|high|critical",',
+    '    "details": "clear explanation in Arabic",',
+    '    "supported_by_history": true/false,',
+    '    "historical_reference": "serial/subject or empty"',
+    "  }],",
+    '  "supported_points": ["claims in the draft that are supported by history"],',
+    '  "checked_references": ["serials or subjects used for validation"],',
+    '  "provider": "openai|gemini|rules"',
+    "}",
+    "Rules:",
+    "- Focus on unsupported promises, delivery commitments, approvals, legal guarantees, price/discount statements, payment confirmations, deadline commitments, and scope changes.",
+    "- If the draft introduces a strong promise without historical support, severity should be high or critical.",
+    "- If the draft contradicts an earlier rejection, limitation, or unresolved issue, verdict should be review_required or blocked.",
+    "- Use Arabic in summary/details when possible.",
+    "- Do not invent references; only cite references present in the provided history or contract memory.",
+    "",
+    `Project: ${project?.project_code || "Unknown"} | ${project?.project_name || ""}`,
+    "Current source email:",
+    `Subject: ${sourceEmail?.subject || ""}`,
+    `From: ${sourceEmail?.sender_name || ""} <${sourceEmail?.sender_email || ""}>`,
+    `Body: ${sourceEmail?.body || ""}`,
+    "",
+    "Proposed draft to validate:",
+    `Subject: ${draftSubject || ""}`,
+    "Body:",
+    draftBody || "",
+    "",
+    "Historical project context:",
+    historySection,
+    "",
+    "Structured contract memory:",
+    contractMemorySection
+  ].join("\n");
+}
+
+function containsAny(text = "", patterns = []) {
+  const normalized = String(text || "").toLowerCase();
+  return patterns.some((pattern) => normalized.includes(String(pattern).toLowerCase()));
+}
+
+function extractDraftDates(text = "") {
+  const matches = String(text || "").match(/\b\d{4}-\d{2}-\d{2}\b/g);
+  return matches ? [...new Set(matches)] : [];
+}
+
+function buildRulesFallbackResponsePolicyGuard({
+  sourceEmail = {},
+  project = null,
+  historyEmails = [],
+  contractMemoryEntries = [],
+  draftSubject = "",
+  draftBody = ""
+} = {}) {
+  const draftText = `${draftSubject || ""}\n${draftBody || ""}`.toLowerCase();
+  const historyText = historyEmails
+    .map((item) => `${item.subject || ""}\n${item.ai_summary || ""}\n${item.body_excerpt || ""}`)
+    .join("\n")
+    .toLowerCase();
+  const contractMemoryText = contractMemoryEntries
+    .map((item) => `${item.title || ""}\n${item.snippet || ""}\n${item.reference_key || ""}`)
+    .join("\n")
+    .toLowerCase();
+  const evidenceText = `${historyText}\n${contractMemoryText}`;
+  const references = [
+    ...contractMemoryEntries.map((item) => item.reference_key || item.title || "").filter(Boolean),
+    ...historyEmails.map((item) => item.serial_number || item.subject || "").filter(Boolean)
+  ].slice(0, 8);
+  const issues = [];
+  const supportedPoints = [];
+
+  const strongCommitmentPatterns = ["guarantee", "guaranteed", "commit", "committed", "we confirm", "confirmed", "نضمن", "التزام", "نؤكد", "ملتزمون"];
+  if (containsAny(draftText, strongCommitmentPatterns) && !containsAny(evidenceText, strongCommitmentPatterns)) {
+    issues.push({
+      type: "commitment",
+      title: "التزام جديد غير مدعوم",
+      severity: "high",
+      details: "مسودة الرد تحتوي على تعهد أو تأكيد قوي لا يظهر بوضوح في المراسلات السابقة للمشروع.",
+      supported_by_history: false,
+      historical_reference: references[0] || ""
+    });
+  } else if (containsAny(draftText, strongCommitmentPatterns)) {
+    supportedPoints.push("يوجد في التاريخ ما يدعم وجود التزام أو تأكيد مشابه.");
+  }
+
+  const pricingPatterns = ["price", "pricing", "discount", "quotation", "quoted", "usd", "jod", "eur", "$", "سعر", "خصم", "عرض سعر", "دولار", "يورو"];
+  if (containsAny(draftText, pricingPatterns) && !containsAny(evidenceText, pricingPatterns)) {
+    issues.push({
+      type: "pricing",
+      title: "إشارة سعرية جديدة",
+      severity: "high",
+      details: "المسودة تتضمن سعرًا أو خصمًا أو عرضًا ماليًا جديدًا غير ظاهر في السجل التاريخي المتاح.",
+      supported_by_history: false,
+      historical_reference: references[0] || ""
+    });
+  }
+
+  const legalPatterns = ["liability", "penalty", "waive", "indemnity", "guarantee", "legal", "مسؤولية", "غرامة", "إعفاء", "ضمان", "التزام قانوني"];
+  if (containsAny(draftText, legalPatterns) && !containsAny(evidenceText, legalPatterns)) {
+    issues.push({
+      type: "legal",
+      title: "التزام قانوني أو تعاقدي غير موثق",
+      severity: "critical",
+      details: "المسودة تحتوي على لغة قانونية أو ضمانات أو تنازلات لا يدعمها تاريخ المشروع الحالي.",
+      supported_by_history: false,
+      historical_reference: references[0] || ""
+    });
+  }
+
+  const approvalPatterns = ["approved", "approval granted", "confirmed by management", "approved internally", "موافقة", "تمت الموافقة", "اعتماد", "مصادق"];
+  const negativeApprovalHistory = ["rejected", "not approved", "pending approval", "مرفوض", "لم تتم الموافقة", "بانتظار الموافقة"];
+  if (containsAny(draftText, approvalPatterns) && containsAny(evidenceText, negativeApprovalHistory)) {
+    issues.push({
+      type: "approval",
+      title: "احتمال تعارض مع حالة الموافقات السابقة",
+      severity: "high",
+      details: "المسودة توحي بوجود موافقة أو اعتماد، بينما السجل التاريخي يحتوي مؤشرات على رفض أو انتظار موافقة.",
+      supported_by_history: false,
+      historical_reference: references[0] || ""
+    });
+  }
+
+  const draftDates = extractDraftDates(draftText);
+  const unsupportedDates = draftDates.filter((date) => !evidenceText.includes(date));
+  if (unsupportedDates.length) {
+    issues.push({
+      type: "deadline",
+      title: "موعد جديد يحتاج مراجعة",
+      severity: "medium",
+      details: `المسودة تتضمن موعدًا أو تاريخًا (${unsupportedDates.join(", ")}) لا يظهر ضمن السياق التاريخي المتاح.`,
+      supported_by_history: false,
+      historical_reference: references[0] || ""
+    });
+  }
+
+  const verdict = issues.some((item) => item.severity === "critical")
+    ? "blocked"
+    : issues.some((item) => item.severity === "high" || item.severity === "medium")
+      ? "review_required"
+      : "clear";
+  const severity = issues.some((item) => item.severity === "critical")
+    ? "critical"
+    : issues.some((item) => item.severity === "high")
+      ? "high"
+      : issues.some((item) => item.severity === "medium")
+        ? "medium"
+        : "low";
+
+  return normalizeResponsePolicyGuardPayload({
+    verdict,
+    severity,
+    summary: issues.length
+      ? `تم رصد ${issues.length} نقطة تحتاج مراجعة قبل اعتماد الرد.`
+      : `لم يتم رصد تعارضات واضحة في مسودة الرد الحالية${project?.project_code ? ` ضمن المشروع ${project.project_code}` : ""}.`,
+    issues,
+    supported_points: supportedPoints,
+    checked_references: references,
+    provider: "rules"
+  });
+}
+
+async function generateResponsePolicyGuard(context = {}) {
+  const openAiConfig = getOpenAiConfig();
+  const geminiConfig = getGeminiConfig();
+  const fallback = buildRulesFallbackResponsePolicyGuard(context);
+
+  if (!openAiConfig && !geminiConfig) {
+    return fallback;
+  }
+
+  const prompt = buildResponsePolicyGuardPrompt(context);
+  try {
+    let payload = null;
+    if (openAiConfig) {
+      const response = await fetch(`${openAiConfig.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${openAiConfig.apiKey}`
+        },
+        body: JSON.stringify({
+          model: openAiConfig.model,
+          temperature: 0.1,
+          response_format: { type: "json_object" },
+          messages: [
+            { role: "system", content: "You validate enterprise email replies. Return only JSON." },
+            { role: "user", content: prompt }
+          ]
+        })
+      });
+      const json = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(json?.error?.message || "OpenAI response policy guard request failed.");
+      }
+      payload = {
+        ...parseLlmJson(json?.choices?.[0]?.message?.content || ""),
+        provider: "openai"
+      };
+    } else {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(geminiConfig.model)}:generateContent?key=${encodeURIComponent(geminiConfig.apiKey)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            generationConfig: {
+              temperature: 0.1,
+              responseMimeType: "application/json"
+            },
+            contents: [
+              {
+                role: "user",
+                parts: [{ text: prompt }]
+              }
+            ]
+          })
+        }
+      );
+      const json = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(json?.error?.message || "Gemini response policy guard request failed.");
+      }
+      payload = {
+        ...parseLlmJson(json?.candidates?.[0]?.content?.parts?.map((part) => part?.text || "").join("\n") || ""),
+        provider: "gemini"
+      };
+    }
+
+    return normalizeResponsePolicyGuardPayload(payload, fallback);
+  } catch {
+    return fallback;
+  }
+}
+
 export {
   analyzeDraftWithLlm,
   analyzeInboundTaskExtractionWithLlm,
   analyzeEmailBrain,
-  normalizeEmailBrainPayload
+  normalizeEmailBrainPayload,
+  generateReplyDraftWithHistory,
+  generateResponsePolicyGuard
 };

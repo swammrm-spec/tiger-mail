@@ -1,6 +1,6 @@
 import { useState } from "react";
 import dayjs from "dayjs";
-import { Archive, Paperclip, Send, X } from "lucide-react";
+import { AlertTriangle, Archive, Paperclip, Send, ShieldAlert, Sparkles, X } from "lucide-react";
 
 export default function MailComposeView({
   isSendingEmail,
@@ -18,7 +18,15 @@ export default function MailComposeView({
   requiresManagerApproval,
   currentUser,
   composeSourceEmail,
+  composeReplySourceEmail,
   composeAiRecommendations,
+  isGeneratingReplyDraft,
+  handleGenerateReplyDraft,
+  draftAssistantMeta,
+  responsePolicyGuard,
+  isCheckingResponsePolicyGuard,
+  isResponsePolicyGuardStale,
+  handleRunResponsePolicyGuard,
   handleSubmit,
   showFrom,
   renderChipEmailInput,
@@ -56,6 +64,28 @@ export default function MailComposeView({
           <button className="o365-ribbon-btn" type="submit" form="compose-form" disabled={isSubmitting || !canArchive}>
             <Archive size={20} /><span className="o365-ribbon-btn-label">{isSubmitting ? "Saving..." : "Save"}</span>
           </button>
+          {composeReplySourceEmail ? (
+            <button
+              type="button"
+              className="o365-ribbon-btn"
+              disabled={isGeneratingReplyDraft}
+              onClick={handleGenerateReplyDraft}
+              title="Generate a contextual reply from the project history"
+            >
+              <Sparkles size={20} /><span className="o365-ribbon-btn-label">{isGeneratingReplyDraft ? "Drafting..." : "AI Reply"}</span>
+            </button>
+          ) : null}
+          {composeReplySourceEmail ? (
+            <button
+              type="button"
+              className="o365-ribbon-btn"
+              disabled={isCheckingResponsePolicyGuard}
+              onClick={handleRunResponsePolicyGuard}
+              title="Validate this reply against historical project commitments"
+            >
+              <ShieldAlert size={20} /><span className="o365-ribbon-btn-label">{isCheckingResponsePolicyGuard ? "Checking..." : "Policy Guard"}</span>
+            </button>
+          ) : null}
           <button className="o365-ribbon-btn" onClick={() => setCurrentView("mail")}>
             <X size={20} /><span className="o365-ribbon-btn-label">Cancel</span>
           </button>
@@ -130,6 +160,64 @@ export default function MailComposeView({
           <ul className="o365-compose-guidance-list">
             {composeAiRecommendations.map((item) => <li key={item}>{item}</li>)}
           </ul>
+        </div>
+      ) : null}
+      {composeReplySourceEmail ? (
+        <div className="o365-compose-banner ai">
+          <div className="o365-compose-banner-title">Drafting Assistant</div>
+          <div>
+            Source: <strong>{composeReplySourceEmail.subject || composeReplySourceEmail.serial || "Reply draft"}</strong>
+          </div>
+          <div style={{ marginTop: 4 }}>
+            Project: <strong>{draftAssistantMeta?.projectCode || "Will resolve from project history"}</strong>
+            {draftAssistantMeta?.projectName ? ` | ${draftAssistantMeta.projectName}` : ""}
+          </div>
+          <div style={{ marginTop: 4 }}>
+            Historical context: <strong>{Number(draftAssistantMeta?.historyCount || 0)}</strong> email(s)
+          </div>
+          {draftAssistantMeta?.references?.length ? (
+            <div style={{ marginTop: 6, fontSize: 12, color: "#555" }}>
+              References: {draftAssistantMeta.references.slice(0, 5).join(" | ")}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+      {composeReplySourceEmail ? (
+        <div className={`o365-compose-banner ${["high", "critical"].includes(String(responsePolicyGuard?.severity || "").toLowerCase()) ? "rejected" : "ai"}`}>
+          <div className="o365-compose-banner-title">Response Policy Guard</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 6, fontWeight: 600 }}>
+              <AlertTriangle size={14} />
+              {responsePolicyGuard
+                ? `Verdict: ${responsePolicyGuard.verdict || "clear"} | Severity: ${responsePolicyGuard.severity || "low"}`
+                : "No validation has been run for this reply yet."}
+            </span>
+            {isResponsePolicyGuardStale && responsePolicyGuard ? (
+              <span style={{ fontSize: 12, color: "#a4262c" }}>Draft changed after last validation.</span>
+            ) : null}
+          </div>
+          {responsePolicyGuard?.summary ? (
+            <div style={{ marginTop: 6 }}>{responsePolicyGuard.summary}</div>
+          ) : (
+            <div style={{ marginTop: 6 }}>
+              Run Policy Guard before sending to check for unsupported promises, deadline changes, pricing exposure, or contract conflicts.
+            </div>
+          )}
+          {responsePolicyGuard?.issues?.length ? (
+            <ul className="o365-compose-guidance-list" style={{ marginTop: 8 }}>
+              {responsePolicyGuard.issues.slice(0, 5).map((issue, index) => (
+                <li key={`${issue.type || "issue"}-${index}`}>
+                  <strong>{issue.title || issue.type || "Issue"}:</strong> {issue.details || "Needs review."}
+                  {issue.historical_reference ? ` (${issue.historical_reference})` : ""}
+                </li>
+              ))}
+            </ul>
+          ) : null}
+          {responsePolicyGuard?.checked_references?.length ? (
+            <div style={{ marginTop: 6, fontSize: 12, color: "#555" }}>
+              Checked references: {responsePolicyGuard.checked_references.join(" | ")}
+            </div>
+          ) : null}
         </div>
       ) : null}
       <form id="compose-form" onSubmit={handleSubmit} onKeyDown={(e) => { if (e.key === "Enter" && !e.ctrlKey && !e.metaKey) e.preventDefault(); }} style={{ display: "flex", flexDirection: "column", flex: 1 }}>

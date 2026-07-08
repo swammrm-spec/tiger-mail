@@ -201,6 +201,18 @@ export default function MailReaderPane({
                     <div className="ai-task-content">
                       <span className="ai-task-desc">{task.task_description}</span>
                       {task.due_date && <span className="ai-task-due">Due: {task.due_date}</span>}
+                      {task.assigned_to_name || task.assigned_to_email || task.assigned_department ? (
+                        <span className="ai-task-due">
+                          Assigned: {task.assigned_to_name || task.assigned_to_email || task.assigned_department}
+                        </span>
+                      ) : null}
+                      {Array.isArray(task.checklist) && task.checklist.length ? (
+                        <div style={{ marginTop: 4, fontSize: 11, color: "#666" }}>
+                          {task.checklist.map((item, checklistIndex) => (
+                            <div key={`${i}-${checklistIndex}`}>- {item}</div>
+                          ))}
+                        </div>
+                      ) : null}
                     </div>
                   </div>
                 ))}

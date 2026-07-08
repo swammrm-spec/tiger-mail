@@ -68,6 +68,11 @@ const persistedTableQueries = {
   app_settings: "SELECT * FROM app_settings ORDER BY id ASC",
   user_mail_settings: "SELECT * FROM user_mail_settings ORDER BY id ASC",
   outbox_queue: "SELECT * FROM outbox_queue ORDER BY id ASC",
+  tasks: "SELECT * FROM tasks ORDER BY id ASC",
+  milestones: "SELECT * FROM milestones ORDER BY id ASC",
+  email_registry: "SELECT * FROM email_registry ORDER BY email_db_id ASC",
+  email_content_archive: "SELECT * FROM email_content_archive ORDER BY email_db_id ASC",
+  tracking_tasks: "SELECT * FROM tracking_tasks ORDER BY task_id ASC",
   email_archives: "SELECT * FROM email_archives ORDER BY id ASC",
   email_trail: "SELECT * FROM email_trail ORDER BY id ASC",
   approval_logs: "SELECT * FROM approval_logs ORDER BY id ASC",
@@ -76,21 +81,25 @@ const persistedTableQueries = {
 };
 
 const serialSequences = [
-  ["users", "users_id_seq"],
-  ["folders", "folders_id_seq"],
-  ["emails", "emails_id_seq"],
-  ["attachments", "attachments_id_seq"],
-  ["reminders", "reminders_id_seq"],
-  ["recommendations", "recommendations_id_seq"],
-  ["reports", "reports_id_seq"],
-  ["calendar_events", "calendar_events_id_seq"],
-  ["user_mail_settings", "user_mail_settings_id_seq"],
-  ["outbox_queue", "outbox_queue_id_seq"],
-  ["email_archives", "email_archives_id_seq"],
-  ["email_trail", "email_trail_id_seq"],
-  ["approval_logs", "approval_logs_id_seq"],
-  ["approval_action_tokens", "approval_action_tokens_id_seq"],
-  ["recent_contacts", "recent_contacts_id_seq"]
+  { tableName: "users", sequenceName: "users_id_seq", pkColumn: "id" },
+  { tableName: "folders", sequenceName: "folders_id_seq", pkColumn: "id" },
+  { tableName: "emails", sequenceName: "emails_id_seq", pkColumn: "id" },
+  { tableName: "attachments", sequenceName: "attachments_id_seq", pkColumn: "id" },
+  { tableName: "reminders", sequenceName: "reminders_id_seq", pkColumn: "id" },
+  { tableName: "recommendations", sequenceName: "recommendations_id_seq", pkColumn: "id" },
+  { tableName: "reports", sequenceName: "reports_id_seq", pkColumn: "id" },
+  { tableName: "calendar_events", sequenceName: "calendar_events_id_seq", pkColumn: "id" },
+  { tableName: "user_mail_settings", sequenceName: "user_mail_settings_id_seq", pkColumn: "id" },
+  { tableName: "outbox_queue", sequenceName: "outbox_queue_id_seq", pkColumn: "id" },
+  { tableName: "tasks", sequenceName: "tasks_id_seq", pkColumn: "id" },
+  { tableName: "milestones", sequenceName: "milestones_id_seq", pkColumn: "id" },
+  { tableName: "email_registry", sequenceName: "email_registry_email_db_id_seq", pkColumn: "email_db_id" },
+  { tableName: "tracking_tasks", sequenceName: "tracking_tasks_task_id_seq", pkColumn: "task_id" },
+  { tableName: "email_archives", sequenceName: "email_archives_id_seq", pkColumn: "id" },
+  { tableName: "email_trail", sequenceName: "email_trail_id_seq", pkColumn: "id" },
+  { tableName: "approval_logs", sequenceName: "approval_logs_id_seq", pkColumn: "id" },
+  { tableName: "approval_action_tokens", sequenceName: "approval_action_tokens_id_seq", pkColumn: "id" },
+  { tableName: "recent_contacts", sequenceName: "recent_contacts_id_seq", pkColumn: "id" }
 ];
 
 function ensureDirectory(dirPath) {
@@ -427,6 +436,28 @@ async function query(text, params = []) {
   return result;
 }
 
+async function ensureDeferredTable(tableName, createStatement, indexStatements = [], orphanIndexName = "") {
+  try {
+    await query(`SELECT 1 FROM ${tableName} LIMIT 1`);
+  } catch {
+    try {
+      await query(createStatement);
+    } catch (error) {
+      const message = String(error?.message || "");
+      if (databaseMode === "pg-mem" && orphanIndexName && message.includes(`relation "${orphanIndexName}" already exists`)) {
+        await query(`DROP INDEX IF EXISTS ${orphanIndexName}`);
+        await query(createStatement);
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  for (const statement of indexStatements) {
+    await query(statement);
+  }
+}
+
 async function createSerial(subject) {
   const slug =
     (subject || "untitled")
@@ -735,6 +766,8 @@ async function initializeDatabase() {
   await seedRecentContactsFromAllEmails();
   await seedDefaults();
   await ensureSystemDefaults();
+  await repairIncomingUncategorizedEmails();
+  await backfillArchiveTrackingData();
   persistenceReady = true;
   await savePersistentState();
 
@@ -748,6 +781,27 @@ async function initializeDatabase() {
   await createBackupSnapshot("startup", { trigger: "server-start" });
 
   return pool;
+}
+
+async function repairIncomingUncategorizedEmails() {
+  const folderLookup = await query("SELECT id, name FROM folders WHERE name IN ('Inbox', 'Uncategorized')");
+  const inboxFolder = folderLookup.rows.find((row) => row.name === "Inbox");
+  const uncategorizedFolder = folderLookup.rows.find((row) => row.name === "Uncategorized");
+
+  if (!inboxFolder || !uncategorizedFolder) {
+    return;
+  }
+
+  await query(
+    `
+      UPDATE emails
+      SET folder_id = $1
+      WHERE folder_id = $2
+        AND status = 'Received'
+        AND source IN ('pop3', 'imap', 'graph')
+    `,
+    [inboxFolder.id, uncategorizedFolder.id]
+  );
 }
 
 async function migrateLegacyDefaultAdminIdentity() {
@@ -849,10 +903,10 @@ async function insertPersistedRow(tableName, row) {
 }
 
 async function resetPersistedSequences() {
-  for (const [tableName, sequenceName] of serialSequences) {
+  for (const { tableName, sequenceName, pkColumn } of serialSequences) {
     try {
       await pool.query(
-        `SELECT setval('${sequenceName}', COALESCE((SELECT MAX(id) FROM ${tableName}), 1), true)`
+        `SELECT setval('${sequenceName}', COALESCE((SELECT MAX(${pkColumn}) FROM ${tableName}), 1), true)`
       );
     } catch {
       // ignore sequence reset issues on unsupported backends
@@ -1371,6 +1425,124 @@ async function runSchema() {
     await query(`ALTER TABLE projects ADD COLUMN IF NOT EXISTS budget NUMERIC DEFAULT 0`);
     await query(`ALTER TABLE projects ADD COLUMN IF NOT EXISTS completion_pct INTEGER DEFAULT 0`);
   } catch (e) { /* columns may already exist */ }
+
+  // Tasks and milestones depend on projects, so ensure they exist only after
+  // the projects table has been created successfully.
+  await ensureDeferredTable(
+    "tasks",
+    `
+      CREATE TABLE IF NOT EXISTS tasks (
+        id SERIAL PRIMARY KEY,
+        email_id INTEGER REFERENCES emails(id) ON DELETE SET NULL,
+        project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+        assigned_to INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        title TEXT NOT NULL,
+        description TEXT DEFAULT '',
+        task_type TEXT DEFAULT 'general',
+        status TEXT DEFAULT 'pending',
+        priority TEXT DEFAULT 'medium',
+        due_date TIMESTAMPTZ,
+        alerted BOOLEAN DEFAULT FALSE,
+        alerted_at TIMESTAMPTZ,
+        completed_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `,
+    [
+      `CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)`,
+      `CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(due_date)`,
+      `CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_tasks_assigned ON tasks(assigned_to)`
+    ],
+    "tasks_pkey"
+  );
+
+  await ensureDeferredTable(
+    "milestones",
+    `
+      CREATE TABLE IF NOT EXISTS milestones (
+        id SERIAL PRIMARY KEY,
+        project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+        milestone_name TEXT NOT NULL,
+        description TEXT DEFAULT '',
+        due_date TIMESTAMPTZ,
+        status TEXT DEFAULT 'pending',
+        completed_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `,
+    [
+      `CREATE INDEX IF NOT EXISTS idx_milestones_project ON milestones(project_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_milestones_due ON milestones(due_date)`
+    ],
+    "milestones_pkey"
+  );
+
+  try {
+    await query(`
+      CREATE TABLE IF NOT EXISTS email_registry (
+        email_db_id BIGSERIAL PRIMARY KEY,
+        email_id INTEGER UNIQUE REFERENCES emails(id) ON DELETE CASCADE,
+        project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+        employee_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        assigned_manager_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        message_id TEXT UNIQUE,
+        thread_id TEXT,
+        subject_key TEXT,
+        serial_number TEXT,
+        folder_name TEXT DEFAULT 'Inbox',
+        approval_status TEXT DEFAULT 'none',
+        source_provider TEXT DEFAULT 'manual',
+        risk_level TEXT DEFAULT 'low',
+        is_archived BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await query(`CREATE INDEX IF NOT EXISTS idx_email_registry_email_id ON email_registry(email_id)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_email_registry_project_id ON email_registry(project_id)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_email_registry_thread_id ON email_registry(thread_id)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_email_registry_serial_number ON email_registry(serial_number)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_email_registry_subject_key ON email_registry(subject_key)`);
+  } catch (e) { /* email_registry table optional */ }
+
+  try {
+    await query(`
+      CREATE TABLE IF NOT EXISTS email_content_archive (
+        email_db_id BIGINT PRIMARY KEY REFERENCES email_registry(email_db_id) ON DELETE CASCADE,
+        raw_body TEXT,
+        body_html TEXT,
+        ai_summary TEXT,
+        attachments_path TEXT DEFAULT '',
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+  } catch (e) { /* email_content_archive table optional */ }
+
+  try {
+    await query(`
+      CREATE TABLE IF NOT EXISTS tracking_tasks (
+        task_id BIGSERIAL PRIMARY KEY,
+        existing_task_id INTEGER UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
+        email_db_id BIGINT REFERENCES email_registry(email_db_id) ON DELETE SET NULL,
+        email_id INTEGER REFERENCES emails(id) ON DELETE SET NULL,
+        assigned_to INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        task_type TEXT DEFAULT 'general',
+        priority TEXT DEFAULT 'medium',
+        due_date TIMESTAMPTZ,
+        status TEXT DEFAULT 'PENDING',
+        is_alerted BOOLEAN DEFAULT FALSE,
+        alert_count INTEGER DEFAULT 0,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await query(`CREATE INDEX IF NOT EXISTS idx_tracking_tasks_email_db_id ON tracking_tasks(email_db_id)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_tracking_tasks_status ON tracking_tasks(status)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_tracking_tasks_due_date ON tracking_tasks(due_date)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_tracking_tasks_assigned_to ON tracking_tasks(assigned_to)`);
+  } catch (e) { /* tracking_tasks table optional */ }
 
   try {
     await query(`
@@ -2387,12 +2559,6 @@ async function listConfiguredMailSettings() {
 
 async function listBootstrapData(currentUserId) {
   const currentUser = await getUserById(currentUserId);
-  // #region debug-point send-receive-sync:bootstrap-user
-  fetch("http://127.0.0.1:7777/event",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionId:"send-receive-sync",runId:"pre-fix",hypothesisId:"H4",location:"server/database.js:listBootstrapData:user",msg:"[DEBUG] sync bootstrap requested",data:{currentUserId:Number(currentUserId||0),currentUserEmail:String(currentUser?.email||""),role:String(currentUser?.role||"")},ts:Date.now()})}).catch(()=>{});
-  // #endregion
-  // #region debug-point C:list-bootstrap-user
-  fetch("http://127.0.0.1:7777/event",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionId:"approval-fetch-failure",runId:"pre-fix",hypothesisId:"C",location:"server/database.js:listBootstrapData:user",msg:"[DEBUG] listBootstrapData entered",data:{currentUserId:Number(currentUserId||0),currentUserEmail:String(currentUser?.email||""),role:String(currentUser?.role||"")},ts:Date.now()})}).catch(()=>{});
-  // #endregion
   // The daily mail workspace is always scoped to the signed-in user.
   // Managers review employee submissions through Pending Approvals, not via employee mailboxes.
   // Admin (user_id=1) sees all emails.
@@ -2459,13 +2625,6 @@ async function listBootstrapData(currentUserId) {
     query("SELECT * FROM calendar_events ORDER BY starts_at ASC"),
     getMailSettingsForUser(currentUserId)
   ]);
-
-  // #region debug-point send-receive-sync:bootstrap-result
-  fetch("http://127.0.0.1:7777/event",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionId:"send-receive-sync",runId:"pre-fix",hypothesisId:"H4",location:"server/database.js:listBootstrapData:result",msg:"[DEBUG] sync bootstrap results ready",data:{currentUserId:Number(currentUserId||0),emailCount:Number(emails?.rows?.length||0),folderCount:Number(folders?.rows?.length||0),latestEmailIds:(emails?.rows||[]).slice(0,5).map((row)=>Number(row?.id||0)),latestSources:(emails?.rows||[]).slice(0,5).map((row)=>({id:Number(row?.id||0),source:String(row?.source||""),employeeId:Number(row?.employee_id||0),folder:String(row?.folder_name||"")}))},ts:Date.now()})}).catch(()=>{});
-  // #endregion
-  // #region debug-point C:list-bootstrap-result
-  fetch("http://127.0.0.1:7777/event",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionId:"approval-fetch-failure",runId:"pre-fix",hypothesisId:"C",location:"server/database.js:listBootstrapData:result",msg:"[DEBUG] listBootstrapData query results ready",data:{currentUserId:Number(currentUserId||0),currentUserEmail:String(currentUser?.email||""),folderCount:Number(folders?.rows?.length||0),emailCount:Number(emails?.rows?.length||0),attachmentCount:Number(attachments?.rows?.length||0),latestEmailIds:(emails?.rows||[]).slice(0,5).map((row)=>Number(row?.id||0)),latestStatuses:(emails?.rows||[]).slice(0,5).map((row)=>({id:Number(row?.id||0),folder:String(row?.folder_name||""),status:String(row?.status||""),approvalStatus:String(row?.approval_status||"")}))},ts:Date.now()})}).catch(()=>{});
-  // #endregion
 
   return {
     currentUser: await sanitizeUser(currentUser),
@@ -2666,10 +2825,7 @@ async function createEmail(email, files = [], source = "manual", employeeId = nu
     `,
     [savedEmail.id]
   );
-
-  // #region debug-point send-receive-sync:create-email
-  fetch("http://127.0.0.1:7777/event",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionId:"send-receive-sync",runId:"pre-fix",hypothesisId:"H2",location:"server/database.js:createEmail",msg:"[DEBUG] sync email persisted",data:{emailId:Number(fullEmail?.rows?.[0]?.id||0),source:String(source||""),folderName:String(fullEmail?.rows?.[0]?.folder_name||folder?.name||""),requestedEmployeeId:Number(employeeId||email?.employee_id||0),persistedEmployeeId:Number(fullEmail?.rows?.[0]?.employee_id||0),senderEmail:String(email?.sender_email||""),recipientEmail:String(email?.recipient_email||""),externalMessageId:String(externalMessageId||"")},ts:Date.now()})}).catch(()=>{});
-  // #endregion
+  await syncEmailRegistryForEmail(fullEmail.rows[0]);
   return fullEmail.rows[0];
 }
 
@@ -3337,6 +3493,7 @@ async function moveEmailToFolder(emailId, targetFolderName) {
   }
 
   const updated = await getEmailById(emailId);
+  await syncEmailRegistryForEmail(updated);
   return updated;
 }
 
@@ -4094,6 +4251,7 @@ async function approveEmail(emailId, approverId, managerComments = "", ipAddress
     metadata: JSON.stringify({ assigned_manager_id: updated.assigned_manager_id }),
     ipAddress
   });
+  await syncEmailRegistryForEmail(updated);
   return updated;
 }
 
@@ -4143,6 +4301,7 @@ async function rejectEmail(emailId, approverId, reason = "", ipAddress = "") {
     metadata: JSON.stringify({ assigned_manager_id: updated.assigned_manager_id }),
     ipAddress
   });
+  await syncEmailRegistryForEmail(updated);
   return updated;
 }
 
@@ -4338,6 +4497,284 @@ async function getThreadMessages(threadId) {
   return result.rows[0] || null;
 }
 
+function deriveRegistryThreadId(email) {
+  if (!email) return null;
+  if (email.approval_root_id) return `approval:${email.approval_root_id}`;
+  if (email.parent_id) return `parent:${email.parent_id}`;
+  if (email.serial) return `serial:${email.serial}`;
+  if (email.external_message_id) return `message:${email.external_message_id}`;
+  return `email:${email.id}`;
+}
+
+function deriveArchiveSummary(email) {
+  const summary =
+    email?.ai_recommendations ||
+    email?.recommendation ||
+    email?.preview ||
+    email?.body ||
+    "";
+  return String(summary || "").trim();
+}
+
+function buildAttachmentsPathValue(attachments = []) {
+  if (!attachments.length) return "";
+  return JSON.stringify(
+    attachments.map((attachment) => ({
+      file_name: attachment.file_name || "",
+      file_path: attachment.file_path || "",
+      mime_type: attachment.mime_type || "",
+      content_id: attachment.content_id || null,
+      is_inline: Boolean(attachment.is_inline)
+    }))
+  );
+}
+
+async function getHydratedEmailForArchive(emailOrId) {
+  if (!emailOrId) return null;
+  if (typeof emailOrId === "number") {
+    return getEmailById(emailOrId);
+  }
+  if (!emailOrId.folder_name && emailOrId.id) {
+    return getEmailById(emailOrId.id);
+  }
+  return emailOrId;
+}
+
+async function syncEmailRegistryForEmail(emailOrId) {
+  const email = await getHydratedEmailForArchive(emailOrId);
+  if (!email?.id) {
+    return null;
+  }
+
+  const attachmentsResult = await query(
+    `SELECT file_name, file_path, mime_type, content_id, is_inline
+     FROM attachments
+     WHERE email_id = $1
+     ORDER BY id ASC`,
+    [email.id]
+  );
+  const attachments = attachmentsResult.rows || [];
+  const isArchived = String(email.folder_name || "").toLowerCase() === "archive";
+  const existing = await query(
+    `SELECT email_db_id FROM email_registry WHERE email_id = $1 LIMIT 1`,
+    [email.id]
+  );
+
+  let registry;
+  if (existing.rows[0]) {
+    const updated = await query(
+      `
+        UPDATE email_registry
+        SET project_id = $1,
+            employee_id = $2,
+            assigned_manager_id = $3,
+            message_id = $4,
+            thread_id = $5,
+            subject_key = $6,
+            serial_number = $7,
+            folder_name = $8,
+            approval_status = $9,
+            source_provider = $10,
+            risk_level = $11,
+            is_archived = $12,
+            updated_at = NOW()
+        WHERE email_db_id = $13
+        RETURNING *
+      `,
+      [
+        email.project_id || null,
+        email.employee_id || null,
+        email.assigned_manager_id || null,
+        email.external_message_id || null,
+        deriveRegistryThreadId(email),
+        email.subject_key || "",
+        email.serial || "",
+        email.folder_name || "Inbox",
+        email.approval_status || "none",
+        email.source || "manual",
+        email.risk_level || "low",
+        isArchived,
+        existing.rows[0].email_db_id
+      ]
+    );
+    registry = updated.rows[0];
+  } else {
+    const inserted = await query(
+      `
+        INSERT INTO email_registry (
+          email_id, project_id, employee_id, assigned_manager_id, message_id, thread_id,
+          subject_key, serial_number, folder_name, approval_status, source_provider,
+          risk_level, is_archived, created_at, updated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
+        RETURNING *
+      `,
+      [
+        email.id,
+        email.project_id || null,
+        email.employee_id || null,
+        email.assigned_manager_id || null,
+        email.external_message_id || null,
+        deriveRegistryThreadId(email),
+        email.subject_key || "",
+        email.serial || "",
+        email.folder_name || "Inbox",
+        email.approval_status || "none",
+        email.source || "manual",
+        email.risk_level || "low",
+        isArchived,
+        email.received_at || email.sent_at || new Date().toISOString()
+      ]
+    );
+    registry = inserted.rows[0];
+  }
+
+  if (!registry?.email_db_id) {
+    return null;
+  }
+
+  const contentExists = await query(
+    `SELECT email_db_id FROM email_content_archive WHERE email_db_id = $1 LIMIT 1`,
+    [registry.email_db_id]
+  );
+  const attachmentsPath = buildAttachmentsPathValue(attachments);
+  if (contentExists.rows[0]) {
+    await query(
+      `
+        UPDATE email_content_archive
+        SET raw_body = $1,
+            body_html = $2,
+            ai_summary = $3,
+            attachments_path = $4,
+            updated_at = NOW()
+        WHERE email_db_id = $5
+      `,
+      [
+        email.body || "",
+        email.body_html || null,
+        deriveArchiveSummary(email),
+        attachmentsPath,
+        registry.email_db_id
+      ]
+    );
+  } else {
+    await query(
+      `
+        INSERT INTO email_content_archive (
+          email_db_id, raw_body, body_html, ai_summary, attachments_path, updated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, NOW())
+      `,
+      [
+        registry.email_db_id,
+        email.body || "",
+        email.body_html || null,
+        deriveArchiveSummary(email),
+        attachmentsPath
+      ]
+    );
+  }
+
+  return registry;
+}
+
+async function syncTrackingTaskRecord(taskOrId) {
+  const task = typeof taskOrId === "number" ? await getTaskById(taskOrId) : taskOrId;
+  if (!task?.id) {
+    return null;
+  }
+
+  const registry = task.email_id ? await syncEmailRegistryForEmail(task.email_id) : null;
+  const existing = await query(
+    `SELECT task_id, alert_count FROM tracking_tasks WHERE existing_task_id = $1 LIMIT 1`,
+    [task.id]
+  );
+
+  const nextAlertCount = task.alerted
+    ? Math.max(Number(existing.rows[0]?.alert_count || 0), 1)
+    : Number(existing.rows[0]?.alert_count || 0);
+
+  if (existing.rows[0]) {
+    const updated = await query(
+      `
+        UPDATE tracking_tasks
+        SET email_db_id = $1,
+            email_id = $2,
+            assigned_to = $3,
+            task_type = $4,
+            priority = $5,
+            due_date = $6,
+            status = $7,
+            is_alerted = $8,
+            alert_count = $9,
+            updated_at = NOW()
+        WHERE task_id = $10
+        RETURNING *
+      `,
+      [
+        registry?.email_db_id || null,
+        task.email_id || null,
+        task.assigned_to || null,
+        task.task_type || "general",
+        task.priority || "medium",
+        task.due_date || null,
+        String(task.status || "pending").toUpperCase(),
+        Boolean(task.alerted),
+        nextAlertCount,
+        existing.rows[0].task_id
+      ]
+    );
+    return updated.rows[0] || null;
+  }
+
+  const inserted = await query(
+    `
+      INSERT INTO tracking_tasks (
+        existing_task_id, email_db_id, email_id, assigned_to, task_type,
+        priority, due_date, status, is_alerted, alert_count, updated_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+      RETURNING *
+    `,
+    [
+      task.id,
+      registry?.email_db_id || null,
+      task.email_id || null,
+      task.assigned_to || null,
+      task.task_type || "general",
+      task.priority || "medium",
+      task.due_date || null,
+      String(task.status || "pending").toUpperCase(),
+      Boolean(task.alerted),
+      task.alerted ? 1 : 0
+    ]
+  );
+  return inserted.rows[0] || null;
+}
+
+async function backfillArchiveTrackingData() {
+  try {
+    const emailsResult = await query(
+      `
+        SELECT emails.*, folders.name AS folder_name
+        FROM emails
+        JOIN folders ON folders.id = emails.folder_id
+        ORDER BY emails.id ASC
+      `
+    );
+    for (const email of emailsResult.rows) {
+      await syncEmailRegistryForEmail(email);
+    }
+
+    const tasksResult = await query(`SELECT * FROM tasks ORDER BY id ASC`);
+    for (const task of tasksResult.rows) {
+      await syncTrackingTaskRecord(task);
+    }
+  } catch (error) {
+    console.warn("Archive/tracking backfill skipped:", error.message);
+  }
+}
+
 async function createTask(taskData) {
   const result = await query(
     `INSERT INTO tasks (email_id, project_id, assigned_to, created_by, title, description, task_type, status, priority, due_date)
@@ -4347,6 +4784,7 @@ async function createTask(taskData) {
      taskData.task_type || "general", taskData.status || "pending",
      taskData.priority || "medium", taskData.due_date || null]
   );
+  await syncTrackingTaskRecord(result.rows[0]);
   return result.rows[0];
 }
 
@@ -4403,7 +4841,9 @@ async function updateTask(id, taskData) {
   if (fields.length === 0) return null;
   values.push(id);
   await query(`UPDATE tasks SET ${fields.join(", ")} WHERE id = $${idx}`, values);
-  return getTaskById(id);
+  const updated = await getTaskById(id);
+  await syncTrackingTaskRecord(updated);
+  return updated;
 }
 
 async function deleteTask(id) {
@@ -4428,6 +4868,7 @@ async function getDueTasks(hoursAhead = 48) {
 
 async function markTaskAlerted(taskId) {
   await query(`UPDATE tasks SET alerted = TRUE, alerted_at = NOW() WHERE id = $1`, [taskId]);
+  await syncTrackingTaskRecord(taskId);
 }
 
 async function getTaskStats(userId = null) {
@@ -4476,7 +4917,11 @@ async function classifyEmail(emailId, projectId, keyId) {
     `UPDATE emails SET project_id = $1, email_key_id = $2 WHERE id = $3 RETURNING *`,
     [projectId || null, keyId || null, emailId]
   );
-  return result.rows[0] || null;
+  const updated = result.rows[0] || null;
+  if (updated) {
+    await syncEmailRegistryForEmail(updated);
+  }
+  return updated;
 }
 
 async function createEmailKey(keyData) {
@@ -4909,6 +5354,206 @@ async function getArchiveStats() {
   return { stats: totalResult.rows[0], recent: recentResult.rows };
 }
 
+function normalizeArchiveExplorerFilters(filters = {}) {
+  return {
+    project_code: String(filters.project_code || "").trim(),
+    serial_number: String(filters.serial_number || "").trim(),
+    thread_id: String(filters.thread_id || "").trim(),
+    limit: Math.min(200, Math.max(1, Number(filters.limit || 50)))
+  };
+}
+
+function buildArchiveExplorerWhereClause(filters = {}) {
+  const params = [];
+  const clauses = [];
+
+  if (filters.project_code) {
+    params.push(`%${filters.project_code}%`);
+    clauses.push(`p.project_code ILIKE $${params.length}`);
+  }
+  if (filters.serial_number) {
+    params.push(`%${filters.serial_number}%`);
+    clauses.push(`er.serial_number ILIKE $${params.length}`);
+  }
+  if (filters.thread_id) {
+    params.push(`%${filters.thread_id}%`);
+    clauses.push(`er.thread_id ILIKE $${params.length}`);
+  }
+
+  return {
+    whereSql: clauses.length ? `WHERE ${clauses.join(" AND ")}` : "",
+    params
+  };
+}
+
+async function listAdminArchiveExplorer(filters = {}) {
+  const normalized = normalizeArchiveExplorerFilters(filters);
+  const { whereSql, params } = buildArchiveExplorerWhereClause(normalized);
+  const limitParam = params.length + 1;
+  const queryParams = [...params, normalized.limit];
+
+  const registryResult = await query(
+    `
+      SELECT
+        er.email_db_id,
+        er.email_id,
+        er.project_id,
+        er.employee_id,
+        er.assigned_manager_id,
+        er.message_id,
+        er.thread_id,
+        er.subject_key,
+        er.serial_number,
+        er.folder_name,
+        er.approval_status,
+        er.source_provider,
+        er.risk_level,
+        er.is_archived,
+        er.created_at,
+        er.updated_at,
+        p.project_code,
+        p.project_name,
+        employee.name AS employee_name,
+        employee.email AS employee_email,
+        manager.name AS assigned_manager_name,
+        manager.email AS assigned_manager_email,
+        e.subject,
+        e.sender_name,
+        e.sender_email,
+        e.recipient_email,
+        e.cc_list,
+        e.status AS email_status,
+        e.received_at,
+        e.sent_at
+      FROM email_registry er
+      LEFT JOIN projects p ON p.id = er.project_id
+      LEFT JOIN users employee ON employee.id = er.employee_id
+      LEFT JOIN users manager ON manager.id = er.assigned_manager_id
+      LEFT JOIN emails e ON e.id = er.email_id
+      ${whereSql}
+      ORDER BY er.updated_at DESC, er.email_db_id DESC
+      LIMIT $${limitParam}
+    `,
+    queryParams
+  );
+
+  const contentResult = await query(
+    `
+      SELECT
+        eca.email_db_id,
+        er.email_id,
+        er.thread_id,
+        er.serial_number,
+        er.folder_name,
+        er.risk_level,
+        p.project_code,
+        p.project_name,
+        e.subject,
+        e.sender_email,
+        e.recipient_email,
+        eca.ai_summary,
+        eca.attachments_path,
+        SUBSTRING(COALESCE(eca.raw_body, '') FROM 1 FOR 500) AS raw_body_preview,
+        COALESCE(LENGTH(eca.raw_body), 0)::int AS raw_body_length,
+        eca.updated_at
+      FROM email_content_archive eca
+      JOIN email_registry er ON er.email_db_id = eca.email_db_id
+      LEFT JOIN projects p ON p.id = er.project_id
+      LEFT JOIN emails e ON e.id = er.email_id
+      ${whereSql}
+      ORDER BY eca.updated_at DESC, eca.email_db_id DESC
+      LIMIT $${limitParam}
+    `,
+    queryParams
+  );
+
+  const trackingResult = await query(
+    `
+      SELECT
+        tt.task_id,
+        tt.existing_task_id,
+        tt.email_db_id,
+        tt.email_id,
+        tt.assigned_to,
+        tt.task_type,
+        tt.priority,
+        tt.due_date,
+        tt.status,
+        tt.is_alerted,
+        tt.alert_count,
+        tt.updated_at,
+        er.thread_id,
+        er.serial_number,
+        er.folder_name,
+        p.project_code,
+        p.project_name,
+        assigned.name AS assigned_to_name,
+        assigned.email AS assigned_to_email,
+        e.subject AS email_subject,
+        e.sender_email,
+        e.recipient_email,
+        t.title AS source_task_title,
+        t.description AS source_task_description,
+        aa.email_category,
+        aa.summary AS ai_summary,
+        aa.ai_tasks
+      FROM tracking_tasks tt
+      LEFT JOIN email_registry er ON er.email_db_id = tt.email_db_id
+      LEFT JOIN projects p ON p.id = er.project_id
+      LEFT JOIN users assigned ON assigned.id = tt.assigned_to
+      LEFT JOIN emails e ON e.id = COALESCE(tt.email_id, er.email_id)
+      LEFT JOIN tasks t ON t.id = tt.existing_task_id
+      LEFT JOIN ai_analysis aa ON aa.email_id = COALESCE(tt.email_id, er.email_id)
+      ${whereSql}
+      ORDER BY tt.updated_at DESC, tt.task_id DESC
+      LIMIT $${limitParam}
+    `,
+    queryParams
+  );
+
+  const registryCountResult = await query(
+    `
+      SELECT COUNT(*)::int AS total
+      FROM email_registry er
+      LEFT JOIN projects p ON p.id = er.project_id
+      ${whereSql}
+    `,
+    params
+  );
+  const contentCountResult = await query(
+    `
+      SELECT COUNT(*)::int AS total
+      FROM email_content_archive eca
+      JOIN email_registry er ON er.email_db_id = eca.email_db_id
+      LEFT JOIN projects p ON p.id = er.project_id
+      ${whereSql}
+    `,
+    params
+  );
+  const trackingCountResult = await query(
+    `
+      SELECT COUNT(*)::int AS total
+      FROM tracking_tasks tt
+      LEFT JOIN email_registry er ON er.email_db_id = tt.email_db_id
+      LEFT JOIN projects p ON p.id = er.project_id
+      ${whereSql}
+    `,
+    params
+  );
+
+  return {
+    filters: normalized,
+    totals: {
+      registry: Number(registryCountResult.rows[0]?.total || 0),
+      content_archive: Number(contentCountResult.rows[0]?.total || 0),
+      tracking_tasks: Number(trackingCountResult.rows[0]?.total || 0)
+    },
+    email_registry: registryResult.rows || [],
+    email_content_archive: contentResult.rows || [],
+    tracking_tasks: trackingResult.rows || []
+  };
+}
+
 function getDatabaseMode() {
   return databaseMode;
 }
@@ -5246,6 +5891,7 @@ async function getThreadAnalytics(serial) {
 }
 
 export {
+  query,
   uploadsDir,
   getDataRootDir,
   getBackupsRootDir,
@@ -5333,6 +5979,7 @@ export {
   searchEmailsBySerial,
   getThreadBySerial,
   getArchiveStats,
+  listAdminArchiveExplorer,
   trackEmailThread,
   resolveSerialFromHeaders,
   getThreadByEmailId,

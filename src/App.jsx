@@ -870,9 +870,23 @@ function App() {
   const [emailTrailFilters, setEmailTrailFilters] = useState({ employee_id: "", folder_name: "", search: "", from_date: "", to_date: "", limit: 100, offset: 0 });
   const [archives, setArchives] = useState([]);
   const [archiveForm, setArchiveForm] = useState({ employee_id: "", email_ids: [], notes: "" });
+  const [archiveExplorerFilters, setArchiveExplorerFilters] = useState({ project_code: "", serial_number: "", thread_id: "", limit: 50 });
+  const [archiveExplorerData, setArchiveExplorerData] = useState({
+    totals: { registry: 0, content_archive: 0, tracking_tasks: 0 },
+    email_registry: [],
+    email_content_archive: [],
+    tracking_tasks: []
+  });
+  const [archiveBackfillForm, setArchiveBackfillForm] = useState({ limit: 200, includeSent: false, force: true });
+  const [archiveBackfillSummary, setArchiveBackfillSummary] = useState(null);
+  const [archiveBackfillJob, setArchiveBackfillJob] = useState(null);
   const [analytics, setAnalytics] = useState(null);
   const [isSavingEmployee, setIsSavingEmployee] = useState(false);
   const [isLoadingTrail, setIsLoadingTrail] = useState(false);
+  const [isLoadingArchiveExplorer, setIsLoadingArchiveExplorer] = useState(false);
+  const [isRunningArchiveBackfill, setIsRunningArchiveBackfill] = useState(false);
+  const [isCancellingArchiveBackfill, setIsCancellingArchiveBackfill] = useState(false);
+  const [isRetryingArchiveBackfill, setIsRetryingArchiveBackfill] = useState(false);
   const [isCreatingArchive, setIsCreatingArchive] = useState(false);
   const [pendingApprovals, setPendingApprovals] = useState([]);
   const [isLoadingApprovals, setIsLoadingApprovals] = useState(false);
@@ -1207,21 +1221,12 @@ function App() {
     if (activeToken) headers.set("Authorization", `Bearer ${activeToken}`);
     const request = { ...options, headers };
     if (options.body && !(options.body instanceof FormData) && !headers.has("Content-Type")) { headers.set("Content-Type", "application/json"); request.body = JSON.stringify(options.body); }
-    // #region debug-point A:api-fetch-request
-    fetch("http://127.0.0.1:7777/event",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionId:"approval-fetch-failure",runId:"pre-fix",hypothesisId:"A",location:"src/App.jsx:apiFetch:request",msg:"[DEBUG] apiFetch request started",data:{url:String(url||""),method:String(request?.method||"GET"),hasToken:Boolean(activeToken),hasBody:Boolean(options?.body)},ts:Date.now()})}).catch(()=>{});
-    // #endregion
     let response;
     try {
       response = await fetch(url, request);
     } catch (fetchError) {
-      // #region debug-point A:api-fetch-network-error
-      fetch("http://127.0.0.1:7777/event",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionId:"approval-fetch-failure",runId:"pre-fix",hypothesisId:"A",location:"src/App.jsx:apiFetch:network-error",msg:"[DEBUG] apiFetch network failure",data:{url:String(url||""),method:String(request?.method||"GET"),error:String(fetchError?.message||fetchError)},ts:Date.now()})}).catch(()=>{});
-      // #endregion
       throw fetchError;
     }
-    // #region debug-point A:api-fetch-response
-    fetch("http://127.0.0.1:7777/event",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionId:"approval-fetch-failure",runId:"pre-fix",hypothesisId:"A",location:"src/App.jsx:apiFetch:response",msg:"[DEBUG] apiFetch response received",data:{url:String(url||""),status:Number(response?.status||0),ok:Boolean(response?.ok)},ts:Date.now()})}).catch(()=>{});
-    // #endregion
     if (response.status === 401) {
       localStorage.removeItem("emailarray_token"); setToken(""); setCurrentUser(null);
       throw new Error("__SESSION_EXPIRED__");
@@ -1233,14 +1238,8 @@ function App() {
   async function loadBootstrap(activeToken = token) {
     setIsLoading(true);
     try {
-      // #region debug-point E:load-bootstrap-start
-      fetch("http://127.0.0.1:7777/event",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionId:"approval-fetch-failure",runId:"pre-fix",hypothesisId:"E",location:"src/App.jsx:loadBootstrap:start",msg:"[DEBUG] loadBootstrap started",data:{hasToken:Boolean(activeToken),lastKnownUserEmail:String(lastKnownUser?.email||""),currentUserEmail:String(currentUser?.email||"")},ts:Date.now()})}).catch(()=>{});
-      // #endregion
       const payload = await apiFetch("/api/bootstrap", {}, activeToken);
       if (!payload.currentUser) { throw new Error("User session expired. Please log in again."); }
-      // #region debug-point E:load-bootstrap-success
-      fetch("http://127.0.0.1:7777/event",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionId:"approval-fetch-failure",runId:"pre-fix",hypothesisId:"E",location:"src/App.jsx:loadBootstrap:success",msg:"[DEBUG] loadBootstrap succeeded",data:{userEmail:String(payload?.currentUser?.email||""),emailCount:Number(payload?.emails?.length||0),folderCount:Number(payload?.folders?.length||0)},ts:Date.now()})}).catch(()=>{});
-      // #endregion
       setData(payload);
       setCurrentUser(payload.currentUser);
       if (payload.settings) {
@@ -1269,9 +1268,6 @@ function App() {
       setLastKnownUser(persistedUser);
       setError(""); setSuccessMessage("");
     } catch (loadError) {
-      // #region debug-point E:load-bootstrap-error
-      fetch("http://127.0.0.1:7777/event",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionId:"approval-fetch-failure",runId:"pre-fix",hypothesisId:"E",location:"src/App.jsx:loadBootstrap:error",msg:"[DEBUG] loadBootstrap failed",data:{error:String(loadError?.message||loadError),currentUserEmail:String(currentUser?.email||""),lastKnownUserEmail:String(lastKnownUser?.email||"")},ts:Date.now()})}).catch(()=>{});
-      // #endregion
       if (loadError.message === "__SESSION_EXPIRED__") {
         setSuccessMessage("Your session has expired. Please log in again.");
         return;
@@ -1568,6 +1564,160 @@ function App() {
   async function loadArchives() {
     try { const r = await apiFetch("/api/admin/archives"); setArchives(r.archives || []); } catch (e) { setError(e.message); }
   }
+
+  async function loadArchiveExplorer(nextFilters = null) {
+    setIsLoadingArchiveExplorer(true);
+    try {
+      const effectiveFilters = nextFilters ? { ...archiveExplorerFilters, ...nextFilters } : archiveExplorerFilters;
+      const params = new URLSearchParams();
+      Object.entries(effectiveFilters).forEach(([key, value]) => {
+        if (value !== "" && value !== null && value !== undefined) {
+          params.set(key, String(value));
+        }
+      });
+      const queryString = params.toString();
+      const response = await apiFetch(`/api/admin/archive-explorer${queryString ? `?${queryString}` : ""}`);
+      setArchiveExplorerData({
+        totals: response.totals || { registry: 0, content_archive: 0, tracking_tasks: 0 },
+        email_registry: response.email_registry || [],
+        email_content_archive: response.email_content_archive || [],
+        tracking_tasks: response.tracking_tasks || []
+      });
+      setArchiveExplorerFilters((prev) => ({
+        ...prev,
+        ...(response.filters || effectiveFilters)
+      }));
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setIsLoadingArchiveExplorer(false);
+    }
+  }
+
+  async function runArchiveBackfill(nextOptions = null) {
+    setIsRunningArchiveBackfill(true);
+    setError("");
+    setSuccessMessage("");
+    try {
+      const effectiveOptions = nextOptions ? { ...archiveBackfillForm, ...nextOptions } : archiveBackfillForm;
+      const response = await apiFetch("/api/admin/ai-backfill/reanalyze", {
+        method: "POST",
+        body: {
+          limit: Number(effectiveOptions.limit || 0) || null,
+          includeSent: Boolean(effectiveOptions.includeSent),
+          force: Boolean(effectiveOptions.force)
+        }
+      });
+      setArchiveBackfillJob(response.job || null);
+      setArchiveBackfillSummary(response.job?.summary || null);
+      setArchiveBackfillForm((prev) => ({ ...prev, ...effectiveOptions }));
+    } catch (e) {
+      setError(e.message);
+      setIsRunningArchiveBackfill(false);
+    }
+  }
+
+  async function pollArchiveBackfillJob(jobId) {
+    try {
+      const response = await apiFetch(`/api/admin/ai-backfill/reanalyze/${jobId}`);
+      const job = response.job || null;
+      setArchiveBackfillJob(job);
+      setArchiveBackfillSummary(job?.summary || null);
+
+      if (job?.status === "completed") {
+        setIsRunningArchiveBackfill(false);
+        setIsCancellingArchiveBackfill(false);
+        setIsRetryingArchiveBackfill(false);
+        setSuccessMessage(
+          `Backfill completed. Scanned: ${Number(job.summary?.scanned || 0)}, analyzed: ${Number(job.summary?.analyzed || 0)}, created: ${Number(job.summary?.tasks_created || 0)}, updated: ${Number(job.summary?.tasks_updated || 0)}, errors: ${Number(job.summary?.errors || 0)}.`
+        );
+        if (adminTab === "archives") {
+          loadArchiveExplorer();
+          loadArchives();
+        }
+      } else if (job?.status === "cancelled") {
+        setIsRunningArchiveBackfill(false);
+        setIsCancellingArchiveBackfill(false);
+        setIsRetryingArchiveBackfill(false);
+        setSuccessMessage(
+          `Backfill cancelled. Processed: ${Number(job.summary?.processed || 0)} / ${Number(job.summary?.scanned || 0)}.`
+        );
+      } else if (job?.status === "failed") {
+        setIsRunningArchiveBackfill(false);
+        setIsCancellingArchiveBackfill(false);
+        setIsRetryingArchiveBackfill(false);
+        setError(job?.summary?.error || "AI backfill job failed.");
+      }
+    } catch (e) {
+      setIsRunningArchiveBackfill(false);
+      setIsCancellingArchiveBackfill(false);
+      setIsRetryingArchiveBackfill(false);
+      setError(e.message);
+    }
+  }
+
+  async function cancelArchiveBackfillJob() {
+    if (!archiveBackfillJob?.job_id) return;
+    setIsCancellingArchiveBackfill(true);
+    setError("");
+    setSuccessMessage("");
+    try {
+      const response = await apiFetch(`/api/admin/ai-backfill/reanalyze/${archiveBackfillJob.job_id}/cancel`, {
+        method: "POST"
+      });
+      setArchiveBackfillJob(response.job || archiveBackfillJob);
+      setSuccessMessage("Cancellation requested. The current job will stop after the current item.");
+    } catch (e) {
+      setError(e.message);
+      setIsCancellingArchiveBackfill(false);
+    }
+  }
+
+  async function retryFailedArchiveBackfillItems() {
+    if (!archiveBackfillJob?.job_id) return;
+    setIsRetryingArchiveBackfill(true);
+    setIsRunningArchiveBackfill(true);
+    setError("");
+    setSuccessMessage("");
+    try {
+      const response = await apiFetch(`/api/admin/ai-backfill/reanalyze/${archiveBackfillJob.job_id}/retry-failed`, {
+        method: "POST",
+        body: { force: true }
+      });
+      setArchiveBackfillJob(response.job || null);
+      setArchiveBackfillSummary(response.job?.summary || null);
+      setSuccessMessage("Retry job started for failed items.");
+    } catch (e) {
+      setError(e.message);
+      setIsRunningArchiveBackfill(false);
+      setIsRetryingArchiveBackfill(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!archiveBackfillJob?.job_id || !isRunningArchiveBackfill) {
+      return undefined;
+    }
+
+    const handle = window.setTimeout(() => {
+      pollArchiveBackfillJob(archiveBackfillJob.job_id);
+    }, 1200);
+
+    return () => window.clearTimeout(handle);
+  }, [archiveBackfillJob?.job_id, archiveBackfillJob?.status, isRunningArchiveBackfill]);
+
+  useEffect(() => {
+    if (archiveBackfillJob?.status === "queued" || archiveBackfillJob?.status === "running") {
+      setIsRunningArchiveBackfill(true);
+    }
+  }, [archiveBackfillJob?.status]);
+
+  useEffect(() => {
+    if (adminTab !== "archives" || !archiveBackfillJob?.job_id || !isRunningArchiveBackfill) {
+      return;
+    }
+    pollArchiveBackfillJob(archiveBackfillJob.job_id);
+  }, [adminTab]);
 
   async function loadSmartFolder(type) {
     try {
@@ -1982,7 +2132,7 @@ function App() {
       if (adminTab === "overview") loadAnalytics();
       if (adminTab === "employees") loadEmployees();
       if (adminTab === "trail") loadEmailTrailData();
-      if (adminTab === "archives") loadArchives();
+      if (adminTab === "archives") { loadArchives(); loadArchiveExplorer(); }
       if (adminTab === "approval") loadApprovalAnalytics();
       if (adminTab === "mail-tests" && !adminMailTests) runAdminMailTests();
     }
@@ -2012,22 +2162,20 @@ function App() {
   // Auto-refresh emails every 60 seconds + browser notification for new emails
   useEffect(() => {
     if (!token) return;
-    let prevEmailCount = data.emails.length;
-    let prevEmailIds = new Set(data.emails.map(e => e.id));
+    const prevEmailIdsRef = { current: new Set(data.emails.map(e => e.id)) };
 
     const interval = setInterval(async () => {
       try {
-        const prevCount = prevEmailCount;
-        const prevIds = prevEmailIds;
-        await loadBootstrap(token);
+        const prevIds = prevEmailIdsRef.current;
+        const payload = await apiFetch("/api/bootstrap", {}, token);
+        if (!payload?.emails) return;
 
-        const currentEmails = data.emails;
-        const newEmails = currentEmails.filter(e => !prevIds.has(e.id));
+        const newEmails = payload.emails.filter(e => !prevIds.has(e.id));
 
-        if (newEmails.length > 0 && prevCount > 0) {
+        if (newEmails.length > 0 && prevIds.size > 0) {
           const newUnread = newEmails.filter(e => !e.is_read);
 
-          if (Notification.permission === "granted") {
+          if (typeof Notification !== "undefined" && Notification.permission === "granted") {
             newUnread.forEach(email => {
               new Notification("New Email", {
                 body: `${email.sender_name || email.sender_email}\n${email.subject}`,
@@ -2042,8 +2190,8 @@ function App() {
           }
         }
 
-        prevEmailCount = currentEmails.length;
-        prevEmailIds = new Set(currentEmails.map(e => e.id));
+        prevEmailIdsRef.current = new Set(payload.emails.map(e => e.id));
+        setData(payload);
       } catch (e) { /* silent */ }
     }, 60000);
 
@@ -2146,11 +2294,6 @@ function App() {
   const selectedEmail = filteredEmails.find(e => e.id === selectedEmailId) || data.emails.find(e => e.id === selectedEmailId) || filteredEmails[0] || null;
   useEffect(() => {
     if (!token || !currentUser?.email) return;
-    const rejectedEmails = data.emails.filter((email) => email.approval_status === "rejected");
-    const rejectedVisible = filteredEmails.filter((email) => email.approval_status === "rejected");
-    // #region debug-point E:mail-visibility-state
-    fetch("http://127.0.0.1:7777/event",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionId:"approval-fetch-failure",runId:"pre-fix",hypothesisId:"E",location:"src/App.jsx:mail-visibility-state",msg:"[DEBUG] mail visibility snapshot",data:{userEmail:String(currentUser.email||""),selectedFolder:String(selectedFolder||""),activeFilter:String(activeFilter||""),searchScope:String(searchScope||""),searchQuery:String(searchQuery||""),filteredCount:Number(filteredEmails.length||0),totalEmailCount:Number(data.emails.length||0),rejectedTotal:Number(rejectedEmails.length||0),rejectedVisible:Number(rejectedVisible.length||0),rejectedIds:rejectedEmails.map((email)=>Number(email.id||0)).slice(0,10),selectedEmailId:Number(selectedEmail?.id||0)},ts:Date.now()})}).catch(()=>{});
-    // #endregion
   }, [token, currentUser?.email, selectedFolder, activeFilter, searchScope, searchQuery, filteredEmails, data.emails, selectedEmail?.id]);
 
   useEffect(() => {
@@ -2653,7 +2796,9 @@ function App() {
       }
 
       setSuccessMessage(cycleSummary);
-    } catch (e) { setError(e.message); } finally { setIsRunningCycle(false); }
+    } catch (e) {
+      setError(e.message);
+    } finally { setIsRunningCycle(false); }
   }
 
   async function handleRunFullMailSync() {
@@ -2677,7 +2822,7 @@ function App() {
     if (adminTab === "overview") loadAnalytics();
     if (adminTab === "employees") loadEmployees();
     if (adminTab === "trail") loadEmailTrailData();
-    if (adminTab === "archives") loadArchives();
+    if (adminTab === "archives") { loadArchives(); loadArchiveExplorer(); }
     if (adminTab === "approval") loadApprovalAnalytics();
     if (adminTab === "mail-tests") runAdminMailTests();
   }
@@ -4196,6 +4341,21 @@ function App() {
             isCreatingArchive={isCreatingArchive}
             onCreateArchive={handleCreateArchive}
             archives={archives}
+            archiveExplorerFilters={archiveExplorerFilters}
+            setArchiveExplorerFilters={setArchiveExplorerFilters}
+            archiveExplorerData={archiveExplorerData}
+            isLoadingArchiveExplorer={isLoadingArchiveExplorer}
+            onLoadArchiveExplorer={loadArchiveExplorer}
+            archiveBackfillForm={archiveBackfillForm}
+            setArchiveBackfillForm={setArchiveBackfillForm}
+            archiveBackfillJob={archiveBackfillJob}
+            archiveBackfillSummary={archiveBackfillSummary}
+            isRunningArchiveBackfill={isRunningArchiveBackfill}
+            isCancellingArchiveBackfill={isCancellingArchiveBackfill}
+            isRetryingArchiveBackfill={isRetryingArchiveBackfill}
+            onRunArchiveBackfill={runArchiveBackfill}
+            onCancelArchiveBackfill={cancelArchiveBackfillJob}
+            onRetryFailedArchiveBackfill={retryFailedArchiveBackfillItems}
             apiFetch={apiFetch}
           />
         </Suspense>

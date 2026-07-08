@@ -33,57 +33,35 @@ import {
   resolveSerialFromHeaders,
   getEmailAccountById,
   getUserActiveAccounts,
+  query,
   parseSubjectForMetadata,
   generateHiddenFooter,
   extractEmailMetadata,
   extractHiddenRef,
-  createTask
+  createTask,
+  getAiAnalysisByEmailId,
+  saveAiAnalysis,
+  updateTask
 } from "./database.js";
+import { analyzeInboundTaskExtractionWithLlm } from "./aiAnalysisService.js";
 
 const activeConfigs = new Map();
 const smtpTransporters = new Map();
 const userServiceState = new Map();
 const nextCycleByUser = new Map();
+const aiBackfillJobs = new Map();
 let schedulerHandle = null;
 const cycleInFlightByUser = new Map();
 let globalCycleInFlight = null;
 const backgroundFetchIntervalMinutes = Math.max(0.5, Number(process.env.BACKGROUND_MAIL_FETCH_MINUTES || 1));
 
-// #region debug-point send-receive-auth:reporter
 function reportSendReceiveAuthDebug(location, msg, data = {}, runId = "pre-fix", hypothesisId = "") {
-  fetch("http://127.0.0.1:7777/event", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      sessionId: "send-receive-auth",
-      runId: process.env.DEBUG_RUN_ID || runId,
-      hypothesisId,
-      location,
-      msg,
-      data,
-      ts: Date.now()
-    })
-  }).catch(() => {});
+  return undefined;
 }
-// #endregion
 
-// #region debug-point send-receive-sync:reporter
 function reportSendReceiveSyncDebug(location, msg, data = {}, runId = "pre-fix", hypothesisId = "") {
-  fetch("http://127.0.0.1:7777/event", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      sessionId: "send-receive-sync",
-      runId: process.env.DEBUG_RUN_ID || runId,
-      hypothesisId,
-      location,
-      msg,
-      data,
-      ts: Date.now()
-    })
-  }).catch(() => {});
+  return undefined;
 }
-// #endregion
 
 let serviceState = {
   configured: false,
@@ -1526,6 +1504,896 @@ function addressListToString(addressObject) {
     .join(", ");
 }
 
+function normalizeAiPriority(priority = "Medium") {
+  const normalized = String(priority || "").trim().toLowerCase();
+  if (normalized === "high") return "High";
+  if (normalized === "low") return "Low";
+  return "Medium";
+}
+
+function normalizeTaskPriority(priority = "Medium") {
+  const normalized = normalizeAiPriority(priority);
+  if (normalized === "High") return "high";
+  if (normalized === "Low") return "low";
+  return "medium";
+}
+
+function detectDateInText(text = "", baseDate = new Date()) {
+  const raw = String(text || "");
+  const normalized = raw.toLowerCase();
+
+  const isoLike = raw.match(/\b(20\d{2})[-\/](\d{1,2})[-\/](\d{1,2})\b/);
+  if (isoLike) {
+    const [, year, month, day] = isoLike;
+    return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  }
+
+  const dmy = raw.match(/\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})\b/);
+  if (dmy) {
+    const [, day, month, yearValue] = dmy;
+    const year = yearValue.length === 2 ? `20${yearValue}` : yearValue;
+    return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  }
+
+  if (/\btoday\b|اليوم/.test(normalized)) {
+    return new Date(baseDate).toISOString().slice(0, 10);
+  }
+  if (/\btomorrow\b|غد/.test(normalized)) {
+    const target = new Date(baseDate);
+    target.setDate(target.getDate() + 1);
+    return target.toISOString().slice(0, 10);
+  }
+
+  const withinDays = normalized.match(/within\s+(\d{1,2})\s+day/);
+  if (withinDays) {
+    const target = new Date(baseDate);
+    target.setDate(target.getDate() + Number(withinDays[1]));
+    return target.toISOString().slice(0, 10);
+  }
+
+  return null;
+}
+
+function buildCategoryChecklist(category = "GENERAL") {
+  if (category === "CUSTOMS") {
+    return [
+      "Review customs documents and shipping references",
+      "Confirm clearance status, broker action, and missing papers",
+      "Update shipment owner with blockers and next action"
+    ];
+  }
+  if (category === "TENDER") {
+    return [
+      "Review submission requirements and deadlines",
+      "Prepare technical and commercial response items",
+      "Confirm approvals before final submission"
+    ];
+  }
+  if (category === "PAYMENT") {
+    return [
+      "Validate invoice or payment reference details",
+      "Confirm finance status, due amount, and supporting documents",
+      "Follow up on remittance, approval, or overdue blockers"
+    ];
+  }
+  return [
+    "Review the email details and attachments",
+    "Confirm required follow-up with the responsible owner"
+  ];
+}
+
+function getSuggestedDepartmentForCategory(category = "GENERAL") {
+  if (category === "CUSTOMS") return "customs";
+  if (category === "TENDER") return "sales";
+  if (category === "PAYMENT") return "finance";
+  return "";
+}
+
+function findBestCandidateAssignee(candidateAssignees = [], { preferredEmail = "", preferredDepartment = "", fullText = "" } = {}) {
+  const normalizedEmail = String(preferredEmail || "").trim().toLowerCase();
+  const normalizedDepartment = String(preferredDepartment || "").trim().toLowerCase();
+  const text = String(fullText || "").toLowerCase();
+
+  if (normalizedEmail) {
+    const exactEmail = candidateAssignees.find((candidate) => String(candidate.email || "").trim().toLowerCase() === normalizedEmail);
+    if (exactEmail) return exactEmail;
+  }
+
+  if (normalizedDepartment) {
+    const departmentMatch = candidateAssignees.find((candidate) => String(candidate.department || "").toLowerCase().includes(normalizedDepartment));
+    if (departmentMatch) return departmentMatch;
+  }
+
+  const textMatch = candidateAssignees.find((candidate) => {
+    const candidateName = String(candidate.name || "").toLowerCase();
+    const candidateDepartment = String(candidate.department || "").toLowerCase();
+    return (candidateName && text.includes(candidateName)) || (candidateDepartment && text.includes(candidateDepartment));
+  });
+  if (textMatch) return textMatch;
+
+  return null;
+}
+
+function buildInboundAiExtraction({
+  parsed,
+  textBody,
+  inboundAnalysis,
+  projectMatch,
+  senderEmail,
+  recipientEmail,
+  attachments = [],
+  candidateAssignees = []
+}) {
+  const subject = String(parsed?.subject || "New email").trim();
+  const fullText = `${subject}\n${textBody || ""}`.toLowerCase();
+  const inferredDueDate = detectDateInText(`${subject}\n${textBody || ""}`, parsed?.date || new Date());
+
+  const categories = [
+    {
+      key: "CUSTOMS",
+      task_type: "customs",
+      keywords: [
+        "customs", "clearance", "broker", "shipment release", "bill of lading",
+        "manifest", "hs code", "duty", "port", "container", "الجمارك",
+        "تخليص", "بيان جمركي", "شحنة", "بوليصة", "منفذ"
+      ],
+      summary_ar: "معاملة جمركية",
+      task_description: `Review customs clearance requirements and shipping documents for "${subject}".`
+    },
+    {
+      key: "TENDER",
+      task_type: "tender",
+      keywords: [
+        "tender", "bid", "rfq", "rfp", "submission", "technical proposal",
+        "commercial proposal", "boq", "prequalification", "closing date",
+        "مناقصة", "عطاء", "عرض فني", "عرض مالي", "موعد الإغلاق", "تسعير"
+      ],
+      summary_ar: "مناقصة أو عرض",
+      task_description: `Prepare tender submission requirements and response pack for "${subject}".`
+    },
+    {
+      key: "PAYMENT",
+      task_type: "payment",
+      keywords: [
+        "payment", "invoice", "remittance", "swift", "iban", "bank transfer",
+        "due amount", "overdue", "payment certificate", "payable", "فاتورة",
+        "دفعة", "تحويل بنكي", "مستحق", "سداد", "اشعار دفع"
+      ],
+      summary_ar: "دفعة أو مطالبة مالية",
+      task_description: `Validate payment request, invoice details, and finance follow-up for "${subject}".`
+    }
+  ];
+
+  const matchedCategories = categories
+    .map((category) => ({
+      ...category,
+      score: category.keywords.filter((keyword) => fullText.includes(keyword)).length
+    }))
+    .filter((category) => category.score > 0)
+    .sort((left, right) => right.score - left.score)
+    .slice(0, 2);
+
+  const inferredPriority = /\burgent\b|\basap\b|\bdeadline\b|\boverdue\b|عاجل|فوري|نهائي|اليوم|غد/.test(fullText)
+    ? "High"
+    : inboundAnalysis?.risk_level === "high" || inboundAnalysis?.risk_level === "critical"
+      ? "High"
+      : inboundAnalysis?.risk_level === "medium"
+        ? "Medium"
+        : "Low";
+
+  const routingCategory = matchedCategories[0]?.key || "GENERAL";
+  const preferredDepartment = getSuggestedDepartmentForCategory(routingCategory);
+  const suggestedCandidate = findBestCandidateAssignee(candidateAssignees, {
+    preferredEmail: recipientEmail,
+    preferredDepartment,
+    fullText
+  });
+
+  const aiTasks = matchedCategories.map((category) => ({
+    task_description: category.task_description,
+    due_date: inferredDueDate,
+    task_type: category.task_type,
+    category: category.key,
+    checklist: buildCategoryChecklist(category.key),
+    assigned_to_email: suggestedCandidate?.email || "",
+    assigned_to_name: suggestedCandidate?.name || "",
+    assigned_department: suggestedCandidate?.department || preferredDepartment || "",
+    priority: inferredPriority,
+    confidence: category.score >= 3 ? "high" : category.score === 2 ? "medium" : "low"
+  }));
+
+  const primaryCategory = routingCategory;
+  const primarySummary = matchedCategories[0]?.summary_ar || "متابعة بريد وارد";
+  const attachmentNote = attachments.length ? ` يحتوي على ${attachments.length} مرفق/مرفقات.` : "";
+
+  return {
+    sender_email: senderEmail || "",
+    receiver_email: recipientEmail || "",
+    project_id: projectMatch?.project_code || null,
+    email_category: primaryCategory,
+    summary: `تحليل آلي: ${primarySummary} بخصوص "${subject || "رسالة جديدة"}".${attachmentNote}`.trim(),
+    ai_tasks: aiTasks,
+    priority: normalizeAiPriority(inferredPriority),
+    routing: {
+      suggested_assigned_to_email: suggestedCandidate?.email || "",
+      suggested_assigned_to_name: suggestedCandidate?.name || "",
+      suggested_department: suggestedCandidate?.department || preferredDepartment || "",
+      reason: suggestedCandidate
+        ? "Matched from recipient/candidate directory and detected category."
+        : preferredDepartment
+          ? `Suggested by detected category ${primaryCategory}.`
+          : "No strong assignee signal detected."
+    }
+  };
+}
+
+async function resolveProjectTaskAssignee(projectId, fallbackUserId = null) {
+  if (projectId) {
+    try {
+      const project = await query("SELECT project_manager_id FROM projects WHERE id = $1", [projectId]);
+      if (project.rows[0]?.project_manager_id) {
+        return Number(project.rows[0].project_manager_id);
+      }
+    } catch {
+      // Ignore optional project lookup failures and fall back to the owner.
+    }
+  }
+  return fallbackUserId || null;
+}
+
+async function listInboundTaskCandidateAssignees(projectId = null, fallbackUserId = null) {
+  const params = [];
+  let projectManagerJoin = "";
+  if (projectId) {
+    params.push(projectId);
+    projectManagerJoin = `
+      LEFT JOIN projects prj ON prj.id = $1
+    `;
+  }
+  const fallbackOffset = params.length;
+  if (fallbackUserId) {
+    params.push(Number(fallbackUserId));
+  }
+
+  const { rows } = await query(
+    `
+      SELECT
+        u.id,
+        u.name,
+        u.email,
+        u.role,
+        u.department,
+        CASE
+          ${projectId ? "WHEN prj.project_manager_id = u.id THEN 0" : ""}
+          ${projectId && fallbackUserId ? "WHEN u.id = $" + (fallbackOffset + 1) + " THEN 1" : ""}
+          ${!projectId && fallbackUserId ? "WHEN u.id = $" + (fallbackOffset + 1) + " THEN 0" : ""}
+          WHEN LOWER(COALESCE(u.role, '')) = 'admin' THEN 2
+          WHEN LOWER(COALESCE(u.role, '')) = 'manager' THEN 3
+          ELSE 4
+        END AS rank_order
+      FROM users u
+      ${projectManagerJoin}
+      WHERE COALESCE(u.is_active, TRUE) = TRUE
+      ORDER BY rank_order ASC, u.name ASC
+      LIMIT 20
+    `,
+    params
+  );
+  return rows || [];
+}
+
+async function resolveUserIdByRoutingHints({ email = "", name = "", department = "" } = {}) {
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+  if (normalizedEmail) {
+    const exact = await query(
+      `SELECT id FROM users WHERE LOWER(email) = $1 AND COALESCE(is_active, TRUE) = TRUE LIMIT 1`,
+      [normalizedEmail]
+    );
+    if (exact.rows[0]?.id) {
+      return Number(exact.rows[0].id);
+    }
+  }
+
+  const normalizedName = String(name || "").trim();
+  if (normalizedName) {
+    const byName = await query(
+      `SELECT id FROM users WHERE name ILIKE $1 AND COALESCE(is_active, TRUE) = TRUE ORDER BY id ASC LIMIT 1`,
+      [`%${normalizedName}%`]
+    );
+    if (byName.rows[0]?.id) {
+      return Number(byName.rows[0].id);
+    }
+  }
+
+  const normalizedDepartment = String(department || "").trim();
+  if (normalizedDepartment) {
+    const byDepartment = await query(
+      `SELECT id FROM users WHERE department ILIKE $1 AND COALESCE(is_active, TRUE) = TRUE ORDER BY CASE WHEN LOWER(role) = 'manager' THEN 0 ELSE 1 END, name ASC LIMIT 1`,
+      [`%${normalizedDepartment}%`]
+    );
+    if (byDepartment.rows[0]?.id) {
+      return Number(byDepartment.rows[0].id);
+    }
+  }
+
+  return null;
+}
+
+async function resolveSuggestedTaskAssignee({ task = {}, extraction = {}, projectId = null, fallbackUserId = null } = {}) {
+  const directMatch = await resolveUserIdByRoutingHints({
+    email: task.assigned_to_email,
+    name: task.assigned_to_name,
+    department: task.assigned_department
+  });
+  if (directMatch) {
+    return directMatch;
+  }
+
+  const routingMatch = await resolveUserIdByRoutingHints({
+    email: extraction?.routing?.suggested_assigned_to_email,
+    name: extraction?.routing?.suggested_assigned_to_name,
+    department: extraction?.routing?.suggested_department
+  });
+  if (routingMatch) {
+    return routingMatch;
+  }
+
+  return resolveProjectTaskAssignee(projectId, fallbackUserId);
+}
+
+async function createInboundAutoTasks({
+  archivedEmail,
+  parsed,
+  extraction,
+  projectId,
+  effectiveEmployeeId,
+  senderEmail,
+  allowGenericProjectFallback = true
+}) {
+  if (!archivedEmail?.id) {
+    return { created: 0, updated: 0, skipped: 0 };
+  }
+
+  const taskPriority = normalizeTaskPriority(extraction?.priority);
+  const extractedTasks = Array.isArray(extraction?.ai_tasks) ? extraction.ai_tasks.slice(0, 3) : [];
+  let created = 0;
+  let updated = 0;
+  let skipped = 0;
+
+  async function upsertGeneratedTask(taskPayload) {
+    const existingTask = await query(
+      `SELECT id FROM tasks WHERE email_id = $1 AND task_type = $2 AND title = $3 ORDER BY id ASC LIMIT 1`,
+      [taskPayload.email_id || null, taskPayload.task_type || "general", taskPayload.title]
+    );
+
+    if (existingTask.rows[0]?.id) {
+      await updateTask(existingTask.rows[0].id, {
+        title: taskPayload.title,
+        description: taskPayload.description,
+        assigned_to: taskPayload.assigned_to,
+        priority: taskPayload.priority,
+        due_date: taskPayload.due_date,
+        status: taskPayload.status
+      });
+      updated += 1;
+      return;
+    }
+
+    await createTask(taskPayload);
+    created += 1;
+  }
+
+  if (!extractedTasks.length) {
+    if (!projectId || !allowGenericProjectFallback) {
+      skipped += 1;
+      return { created, updated, skipped };
+    }
+
+    const assignedTo = await resolveProjectTaskAssignee(projectId, effectiveEmployeeId);
+    await upsertGeneratedTask({
+      email_id: archivedEmail.id,
+      project_id: projectId,
+      assigned_to: assignedTo,
+      created_by: effectiveEmployeeId,
+      title: `Review: ${parsed.subject || "New email"}`,
+      description: `Incoming email from ${senderEmail || "unknown"} regarding project follow-up.`,
+      task_type: "email_review",
+      status: "pending",
+      priority: taskPriority,
+      due_date: null
+    });
+    return { created, updated, skipped };
+  }
+
+  for (const task of extractedTasks) {
+    const assignedTo = await resolveSuggestedTaskAssignee({
+      task,
+      extraction,
+      projectId,
+      fallbackUserId: effectiveEmployeeId
+    });
+    const checklistText = Array.isArray(task.checklist) && task.checklist.length
+      ? `\nChecklist:\n- ${task.checklist.join("\n- ")}`
+      : "";
+    await upsertGeneratedTask({
+      email_id: archivedEmail.id,
+      project_id: projectId || null,
+      assigned_to: assignedTo,
+      created_by: effectiveEmployeeId,
+      title: `[${task.category || extraction.email_category || "FOLLOW-UP"}] ${parsed.subject || "New email"}`,
+      description: `${task.task_description || `Follow up on inbound email from ${senderEmail || "unknown"}.`}${checklistText}`,
+      task_type: task.task_type || "general",
+      status: "pending",
+      priority: normalizeTaskPriority(task.priority || extraction.priority),
+      due_date: task.due_date || null
+    });
+  }
+
+  return { created, updated, skipped };
+}
+
+async function buildInboundExtractionForStoredEmail(email) {
+  if (!email?.id) {
+    throw new Error("Email record is required for AI backfill extraction.");
+  }
+
+  const bodyText = String(email.body || "").replace(/<[^>]+>/g, " ").trim();
+  const attachments = await getEmailAttachments(email.id);
+  const inboundAnalysis = await analyzeIncomingEmail({
+    subject: email.subject || "Imported email",
+    body: bodyText || email.body_html || "",
+    senderEmail: email.sender_email || "",
+    recipientEmail: email.recipient_email || "",
+    ccList: email.cc_list || "",
+    attachmentNames: attachments.map((attachment) => attachment.file_name || attachment.originalname || "")
+  });
+
+  const projectCode = email.project_id
+    ? (await query("SELECT project_code FROM projects WHERE id = $1 LIMIT 1", [email.project_id])).rows[0]?.project_code || null
+    : null;
+  const projectMatch = {
+    project_id: email.project_id || null,
+    project_code: projectCode,
+    key_id: email.email_key_id || null,
+    key_code: null,
+    source: email.project_id ? "existing_email_metadata" : "none",
+    confidence: email.project_id ? "high" : "none"
+  };
+  const parsedLike = {
+    subject: email.subject || "Imported email",
+    date: email.sent_at || email.received_at ? new Date(email.sent_at || email.received_at) : new Date()
+  };
+  const candidateAssignees = await listInboundTaskCandidateAssignees(email.project_id || null, email.employee_id || null);
+  const fallbackExtraction = buildInboundAiExtraction({
+    parsed: parsedLike,
+    textBody: bodyText,
+    inboundAnalysis,
+    projectMatch,
+    senderEmail: email.sender_email || "",
+    recipientEmail: email.recipient_email || "",
+    attachments,
+    candidateAssignees
+  });
+  const extractionContext = {
+    subject: email.subject || "Imported email",
+    body: bodyText || email.body_html || "",
+    senderEmail: email.sender_email || "",
+    recipientEmail: email.recipient_email || "",
+    ccList: email.cc_list || "",
+    receivedAt: email.sent_at || email.received_at || "",
+    activeProjects: projectCode ? [projectCode] : [],
+    candidateAssignees
+  };
+  const extraction = await analyzeInboundTaskExtractionWithLlm(extractionContext, fallbackExtraction);
+
+  return {
+    extraction,
+    projectId: email.project_id || null
+  };
+}
+
+async function listEmailsForAiBackfill({
+  limit = null,
+  includeSent = false,
+  emailIds = null
+} = {}) {
+  if (Array.isArray(emailIds) && emailIds.length) {
+    const normalizedIds = emailIds
+      .map((value) => Number(value))
+      .filter((value) => Number.isInteger(value) && value > 0);
+    if (!normalizedIds.length) {
+      return [];
+    }
+    const placeholders = normalizedIds.map((_, index) => `$${index + 1}`).join(", ");
+    const result = await query(
+      `
+        SELECT e.*, f.name AS folder_name
+        FROM emails e
+        JOIN folders f ON f.id = e.folder_id
+        WHERE e.id IN (${placeholders})
+        ORDER BY e.id ASC
+      `,
+      normalizedIds
+    );
+    return result.rows || [];
+  }
+
+  const params = [];
+  const where = [
+    "COALESCE(e.body, e.body_html, '') != ''"
+  ];
+
+  if (!includeSent) {
+    where.push("LOWER(f.name) NOT IN ('sent', 'drafts', 'outbox')");
+  }
+
+  let limitSql = "";
+  if (limit && Number(limit) > 0) {
+    params.push(Number(limit));
+    limitSql = `LIMIT $${params.length}`;
+  }
+
+  const result = await query(
+    `
+      SELECT e.*, f.name AS folder_name
+      FROM emails e
+      JOIN folders f ON f.id = e.folder_id
+      WHERE ${where.join(" AND ")}
+      ORDER BY e.id ASC
+      ${limitSql}
+    `,
+    params
+  );
+  return result.rows || [];
+}
+
+async function runAiBackfillReanalysis({
+  actorUserId = null,
+  limit = null,
+  includeSent = false,
+  force = true,
+  onProgress = null,
+  shouldCancel = null,
+  emailIds = null
+} = {}) {
+  const emails = await listEmailsForAiBackfill({ limit, includeSent, emailIds });
+
+  const summary = {
+    scanned: emails.length,
+    processed: 0,
+    analyzed: 0,
+    tasks_created: 0,
+    tasks_updated: 0,
+    tasks_skipped: 0,
+    errors: 0,
+    items: []
+  };
+
+  if (typeof onProgress === "function") {
+    await onProgress({
+      stage: "initialized",
+      summary: { ...summary }
+    });
+  }
+
+  for (const email of emails) {
+    if (typeof shouldCancel === "function" && shouldCancel()) {
+      summary.cancelled = true;
+      summary.items.push({
+        email_id: email.id,
+        subject: email.subject || "",
+        status: "cancelled_before_processing"
+      });
+      break;
+    }
+
+    try {
+      if (!force) {
+        const existing = await getAiAnalysisByEmailId(email.id);
+        if (existing) {
+          summary.processed += 1;
+          summary.tasks_skipped += 1;
+          summary.items.push({
+            email_id: email.id,
+            subject: email.subject || "",
+            status: "skipped_existing_analysis"
+          });
+          if (typeof onProgress === "function") {
+            await onProgress({
+              stage: "processing",
+              current_email_id: email.id,
+              current_subject: email.subject || "",
+              summary: { ...summary }
+            });
+          }
+          continue;
+        }
+      }
+
+      const { extraction, projectId } = await buildInboundExtractionForStoredEmail(email);
+      await saveAiAnalysis(email.id, extraction, actorUserId || email.employee_id || null);
+      const taskSummary = await createInboundAutoTasks({
+        archivedEmail: email,
+        parsed: {
+          subject: email.subject || "Imported email"
+        },
+        extraction,
+        projectId,
+        effectiveEmployeeId: email.employee_id || null,
+        senderEmail: email.sender_email || "",
+        allowGenericProjectFallback: false
+      });
+
+      summary.processed += 1;
+      summary.analyzed += 1;
+      summary.tasks_created += Number(taskSummary?.created || 0);
+      summary.tasks_updated += Number(taskSummary?.updated || 0);
+      summary.tasks_skipped += Number(taskSummary?.skipped || 0);
+      summary.items.push({
+        email_id: email.id,
+        subject: email.subject || "",
+        category: extraction.email_category || "GENERAL",
+        created: Number(taskSummary?.created || 0),
+        updated: Number(taskSummary?.updated || 0),
+        skipped: Number(taskSummary?.skipped || 0),
+        status: "processed"
+      });
+    } catch (error) {
+      summary.processed += 1;
+      summary.errors += 1;
+      summary.items.push({
+        email_id: email.id,
+        subject: email.subject || "",
+        status: "error",
+        error: error?.message || "AI backfill failed."
+      });
+    }
+
+    if (typeof onProgress === "function") {
+      await onProgress({
+        stage: summary.cancelled ? "cancelled" : "processing",
+        current_email_id: email.id,
+        current_subject: email.subject || "",
+        summary: { ...summary }
+      });
+    }
+
+    if (summary.cancelled) {
+      break;
+    }
+  }
+
+  if (typeof onProgress === "function") {
+    await onProgress({
+      stage: summary.cancelled ? "cancelled" : "completed",
+      summary: { ...summary }
+    });
+  }
+
+  return summary;
+}
+
+function getAiBackfillJobStatus(jobId) {
+  const job = aiBackfillJobs.get(String(jobId || "").trim());
+  if (!job) {
+    return null;
+  }
+
+  return {
+    job_id: job.job_id,
+    status: job.status,
+    cancel_requested: Boolean(job.cancel_requested),
+    created_at: job.created_at,
+    started_at: job.started_at,
+    finished_at: job.finished_at,
+    options: job.options,
+    progress: job.progress,
+    summary: job.summary
+  };
+}
+
+function listAiBackfillJobs(limit = 20) {
+  const normalizedLimit = Math.min(50, Math.max(1, Number(limit || 20)));
+  return Array.from(aiBackfillJobs.values())
+    .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime())
+    .slice(0, normalizedLimit)
+    .map((job) => getAiBackfillJobStatus(job.job_id));
+}
+
+function cancelAiBackfillJob(jobId) {
+  const id = String(jobId || "").trim();
+  const current = aiBackfillJobs.get(id);
+  if (!current) {
+    return null;
+  }
+
+  const next = updateAiBackfillJob(id, (job) => ({
+    ...job,
+    cancel_requested: true,
+    progress: {
+      ...job.progress,
+      stage: job.status === "queued" ? "cancel_requested" : job.progress.stage
+    }
+  }));
+  return next ? getAiBackfillJobStatus(id) : null;
+}
+
+function trimStoredBackfillJobs(maxJobs = 10) {
+  const jobs = Array.from(aiBackfillJobs.values())
+    .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime());
+  jobs.slice(maxJobs).forEach((job) => {
+    aiBackfillJobs.delete(job.job_id);
+  });
+}
+
+function updateAiBackfillJob(jobId, updater) {
+  const current = aiBackfillJobs.get(jobId);
+  if (!current) {
+    return null;
+  }
+  const next = typeof updater === "function" ? updater(current) : { ...current, ...updater };
+  aiBackfillJobs.set(jobId, next);
+  return next;
+}
+
+function createInitialBackfillProgress() {
+  return {
+    stage: "queued",
+    percent: 0,
+    scanned: 0,
+    processed: 0,
+    analyzed: 0,
+    created: 0,
+    updated: 0,
+    skipped: 0,
+    errors: 0,
+    current_email_id: null,
+    current_subject: ""
+  };
+}
+
+async function startAiBackfillReanalysisJob(options = {}) {
+  const jobId = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const normalizedOptions = {
+    actorUserId: options.actorUserId || null,
+    limit: options.limit || null,
+    includeSent: Boolean(options.includeSent),
+    force: options.force !== false,
+    emailIds: Array.isArray(options.emailIds) ? options.emailIds : null,
+    sourceJobId: options.sourceJobId || null,
+    retryFailedOnly: Boolean(options.retryFailedOnly)
+  };
+
+  aiBackfillJobs.set(jobId, {
+    job_id: jobId,
+    status: "queued",
+    cancel_requested: false,
+    created_at: now,
+    started_at: null,
+    finished_at: null,
+    options: {
+      limit: normalizedOptions.limit,
+      includeSent: normalizedOptions.includeSent,
+      force: normalizedOptions.force,
+      source_job_id: normalizedOptions.sourceJobId,
+      retry_failed_only: normalizedOptions.retryFailedOnly,
+      email_ids_count: Array.isArray(normalizedOptions.emailIds) ? normalizedOptions.emailIds.length : null
+    },
+    progress: createInitialBackfillProgress(),
+    summary: {
+      scanned: 0,
+      processed: 0,
+      analyzed: 0,
+      tasks_created: 0,
+      tasks_updated: 0,
+      tasks_skipped: 0,
+      errors: 0,
+      items: []
+    }
+  });
+  trimStoredBackfillJobs();
+
+  Promise.resolve().then(async () => {
+    updateAiBackfillJob(jobId, (job) => ({
+      ...job,
+      status: "running",
+      started_at: new Date().toISOString(),
+      progress: {
+        ...job.progress,
+        stage: "starting"
+      }
+    }));
+
+    try {
+      const summary = await runAiBackfillReanalysis({
+        ...normalizedOptions,
+        shouldCancel: () => Boolean(aiBackfillJobs.get(jobId)?.cancel_requested),
+        onProgress: async ({ stage, current_email_id = null, current_subject = "", summary: nextSummary }) => {
+          updateAiBackfillJob(jobId, (job) => {
+            const scanned = Number(nextSummary?.scanned || 0);
+            const processed = Number(nextSummary?.processed || 0);
+            const percent = scanned > 0 ? Math.min(100, Math.round((processed / scanned) * 100)) : 0;
+            return {
+              ...job,
+              progress: {
+                stage: stage || job.progress.stage,
+                percent,
+                scanned,
+                processed,
+                analyzed: Number(nextSummary?.analyzed || 0),
+                created: Number(nextSummary?.tasks_created || 0),
+                updated: Number(nextSummary?.tasks_updated || 0),
+                skipped: Number(nextSummary?.tasks_skipped || 0),
+                errors: Number(nextSummary?.errors || 0),
+                current_email_id,
+                current_subject
+              },
+              summary: nextSummary
+            };
+          });
+        }
+      });
+
+      updateAiBackfillJob(jobId, (job) => ({
+        ...job,
+        status: summary?.cancelled ? "cancelled" : "completed",
+        finished_at: new Date().toISOString(),
+        progress: {
+          ...job.progress,
+          stage: summary?.cancelled ? "cancelled" : "completed",
+          percent: summary?.cancelled ? job.progress.percent : 100,
+          current_email_id: null,
+          current_subject: ""
+        },
+        summary
+      }));
+    } catch (error) {
+      updateAiBackfillJob(jobId, (job) => ({
+        ...job,
+        status: "failed",
+        finished_at: new Date().toISOString(),
+        progress: {
+          ...job.progress,
+          stage: "failed"
+        },
+        summary: {
+          ...(job.summary || {}),
+          error: error?.message || "AI backfill job failed."
+        }
+      }));
+    }
+  });
+
+  return getAiBackfillJobStatus(jobId);
+}
+
+async function retryFailedAiBackfillItems(jobId, options = {}) {
+  const sourceJob = aiBackfillJobs.get(String(jobId || "").trim());
+  if (!sourceJob) {
+    throw new Error("Source AI backfill job not found.");
+  }
+
+  const failedEmailIds = Array.isArray(sourceJob.summary?.items)
+    ? sourceJob.summary.items
+        .filter((item) => item.status === "error" && Number(item.email_id) > 0)
+        .map((item) => Number(item.email_id))
+    : [];
+
+  if (!failedEmailIds.length) {
+    throw new Error("No failed items found to retry.");
+  }
+
+  return startAiBackfillReanalysisJob({
+    actorUserId: options.actorUserId || null,
+    force: options.force !== false,
+    includeSent: true,
+    emailIds: failedEmailIds,
+    sourceJobId: sourceJob.job_id,
+    retryFailedOnly: true
+  });
+}
+
 function shouldDeleteFromServer(existingEmail, config, messageDate) {
   if (!config.leave_copy_on_server) {
     return true;
@@ -1727,7 +2595,9 @@ async function archiveIncomingParsedEmail({
   const projectMatch = await identifyProject(parsed);
   const emailKeyId = projectMatch.key_id || null;
   const projectId = projectMatch.project_id || null;
-  const targetFolder = projectMatch.confidence === "none" ? "Uncategorized" : targetFolderName;
+  // Keep all inbound mail visible in the mailbox folder; project classification
+  // should enrich metadata, not move unread messages out of Inbox.
+  const targetFolder = targetFolderName;
 
   await ensureFolder("Uncategorized", "Archive", 0);
 
@@ -1808,24 +2678,40 @@ async function archiveIncomingParsedEmail({
     })
   );
 
-  if (projectId && archivedEmail.id) {
-    try {
-      const project = await query("SELECT * FROM projects WHERE id = $1", [projectId]);
-      if (project.rows.length) {
-        await createTask({
-          email_id: archivedEmail.id,
-          project_id: projectId,
-          assigned_to: project.rows[0].project_manager_id || effectiveEmployeeId,
-          created_by: effectiveEmployeeId,
-          title: `Review: ${parsed.subject || "New email"}`,
-          description: `Incoming email from ${sender.address || "unknown"} regarding project ${project.rows[0].project_code}`,
-          task_type: "email_review",
-          status: "pending",
-          priority: "medium",
-          due_date: null
-        });
-      }
-    } catch (taskError) { /* auto-task creation optional */ }
+  try {
+    const candidateAssignees = await listInboundTaskCandidateAssignees(projectId, effectiveEmployeeId);
+    const fallbackExtraction = buildInboundAiExtraction({
+      parsed,
+      textBody,
+      inboundAnalysis,
+      projectMatch,
+      senderEmail: sender.address || "",
+      recipientEmail: toLine,
+      attachments,
+      candidateAssignees
+    });
+    const extractionContext = {
+      subject: parsed.subject || "Imported email",
+      body: textBody || parsed.textAsHtml || parsed.html || "",
+      senderEmail: sender.address || "",
+      recipientEmail: toLine,
+      ccList: ccLine,
+      receivedAt,
+      activeProjects: projectMatch.project_code ? [projectMatch.project_code] : [],
+      candidateAssignees
+    };
+    const extraction = await analyzeInboundTaskExtractionWithLlm(extractionContext, fallbackExtraction);
+    await saveAiAnalysis(archivedEmail.id, extraction, effectiveEmployeeId || null);
+    await createInboundAutoTasks({
+      archivedEmail,
+      parsed,
+      extraction,
+      projectId,
+      effectiveEmployeeId,
+      senderEmail: sender.address || ""
+    });
+  } catch (taskError) {
+    // Auto AI extraction should never block the main archive pipeline.
   }
 
   return archivedEmail;
@@ -2976,4 +3862,4 @@ function getMailServiceStatus(userId = null) {
   };
 }
 
-export { applyMailSettings, applyAllMailSettings, testMailSettings, getMailServiceStatus, runCycle, runFullMailSyncAllAccounts, receiveEmailsOnce, sendMailMessage, deliverApprovalEmail, retryQueuedEmailNow, repairLegacyEmailAttachments, stopScheduler, saveParsedAttachments, getSmtpTransporter };
+export { applyMailSettings, applyAllMailSettings, testMailSettings, getMailServiceStatus, runCycle, runFullMailSyncAllAccounts, receiveEmailsOnce, sendMailMessage, deliverApprovalEmail, retryQueuedEmailNow, repairLegacyEmailAttachments, runAiBackfillReanalysis, startAiBackfillReanalysisJob, getAiBackfillJobStatus, listAiBackfillJobs, cancelAiBackfillJob, retryFailedAiBackfillItems, stopScheduler, saveParsedAttachments, getSmtpTransporter };

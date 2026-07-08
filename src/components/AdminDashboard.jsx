@@ -45,8 +45,80 @@ export default function AdminDashboard({
   setArchiveForm,
   isCreatingArchive,
   onCreateArchive,
-  archives
+  archives,
+  archiveExplorerFilters,
+  setArchiveExplorerFilters,
+  archiveExplorerData,
+  isLoadingArchiveExplorer,
+  onLoadArchiveExplorer,
+  archiveBackfillForm,
+  setArchiveBackfillForm,
+  archiveBackfillJob,
+  archiveBackfillSummary,
+  isRunningArchiveBackfill,
+  isCancellingArchiveBackfill,
+  isRetryingArchiveBackfill,
+  onRunArchiveBackfill,
+  onCancelArchiveBackfill,
+  onRetryFailedArchiveBackfill
 }) {
+  const registryRows = archiveExplorerData?.email_registry || [];
+  const contentRows = archiveExplorerData?.email_content_archive || [];
+  const trackingRows = archiveExplorerData?.tracking_tasks || [];
+
+  function updateArchiveExplorerFilter(key, value) {
+    setArchiveExplorerFilters({ ...archiveExplorerFilters, [key]: value });
+  }
+
+  function handleArchiveExplorerSearch() {
+    onLoadArchiveExplorer(archiveExplorerFilters);
+  }
+
+  function handleArchiveExplorerReset() {
+    const defaults = { project_code: "", serial_number: "", thread_id: "", limit: 50 };
+    setArchiveExplorerFilters(defaults);
+    onLoadArchiveExplorer(defaults);
+  }
+
+  function formatDateTime(value) {
+    return value ? dayjs(value).format("MMM D, YYYY HH:mm") : "-";
+  }
+
+  function getAttachmentCount(value) {
+    if (!value) return 0;
+    try {
+      const parsed = typeof value === "string" ? JSON.parse(value) : value;
+      return Array.isArray(parsed) ? parsed.length : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  function getAiTaskCount(value) {
+    if (!value) return 0;
+    if (Array.isArray(value)) return value.length;
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed.length : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  function updateArchiveBackfillField(key, value) {
+    setArchiveBackfillForm({ ...archiveBackfillForm, [key]: value });
+  }
+
+  function handleRunArchiveBackfill() {
+    onRunArchiveBackfill(archiveBackfillForm);
+  }
+
+  const archiveBackfillProgress = archiveBackfillJob?.progress || null;
+  const archiveBackfillStatus = archiveBackfillJob?.status || "idle";
+  const archiveBackfillPercent = Math.max(0, Math.min(100, Number(archiveBackfillProgress?.percent || 0)));
+  const hasFailedItems = Array.isArray(archiveBackfillSummary?.items)
+    && archiveBackfillSummary.items.some((item) => item.status === "error");
+
   return (
     <div className="o365-admin">
       {canAccessAdmin ? (
@@ -425,6 +497,261 @@ export default function AdminDashboard({
                   <div><label style={{ fontSize: 11, display: "block", color: "#666" }}>Email IDs (comma-separated)</label><input value={archiveForm.email_ids.join(",")} onChange={(e) => setArchiveForm({ ...archiveForm, email_ids: e.target.value.split(",").map((value) => value.trim()).filter(Boolean) })} style={{ fontSize: 12, width: 200 }} /></div>
                   <div><label style={{ fontSize: 11, display: "block", color: "#666" }}>Notes</label><input value={archiveForm.notes} onChange={(e) => setArchiveForm({ ...archiveForm, notes: e.target.value })} style={{ fontSize: 12, width: 160 }} /></div>
                   <button disabled={isCreatingArchive} onClick={onCreateArchive} style={{ fontSize: 12, padding: "6px 12px", background: "var(--c-primary)", color: "#fff", border: "none", borderRadius: 4, cursor: "pointer" }}>{isCreatingArchive ? "Creating..." : "Create Archive"}</button>
+                </div>
+              </div>
+              <div className="o365-settings-section" style={{ marginTop: 16 }}>
+                <h3>AI Re-analyze / Backfill</h3>
+                <div className="o365-settings-body">
+                  <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end", marginBottom: 12 }}>
+                    <div>
+                      <label style={{ fontSize: 11, display: "block", color: "#666" }}>Limit</label>
+                      <input
+                        type="number"
+                        min="1"
+                        max="5000"
+                        value={archiveBackfillForm.limit}
+                        onChange={(e) => updateArchiveBackfillField("limit", e.target.value)}
+                        style={{ fontSize: 12, width: 100 }}
+                      />
+                    </div>
+                    <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "#444" }}>
+                      <input
+                        type="checkbox"
+                        checked={Boolean(archiveBackfillForm.includeSent)}
+                        onChange={(e) => updateArchiveBackfillField("includeSent", e.target.checked)}
+                      />
+                      Include Sent
+                    </label>
+                    <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "#444" }}>
+                      <input
+                        type="checkbox"
+                        checked={Boolean(archiveBackfillForm.force)}
+                        onChange={(e) => updateArchiveBackfillField("force", e.target.checked)}
+                      />
+                      Force Re-analyze
+                    </label>
+                    <button
+                      onClick={handleRunArchiveBackfill}
+                      disabled={isRunningArchiveBackfill || isCancellingArchiveBackfill || isRetryingArchiveBackfill}
+                      style={{ fontSize: 12, padding: "6px 12px", background: "#107c10", color: "#fff", border: "none", borderRadius: 4, cursor: "pointer" }}
+                    >
+                      {isRunningArchiveBackfill ? "Running..." : "Run Backfill"}
+                    </button>
+                    <button
+                      onClick={onCancelArchiveBackfill}
+                      disabled={!isRunningArchiveBackfill || isCancellingArchiveBackfill}
+                      style={{ fontSize: 12, padding: "6px 12px", background: "#d83b01", color: "#fff", border: "none", borderRadius: 4, cursor: !isRunningArchiveBackfill || isCancellingArchiveBackfill ? "not-allowed" : "pointer", opacity: !isRunningArchiveBackfill || isCancellingArchiveBackfill ? 0.6 : 1 }}
+                    >
+                      {isCancellingArchiveBackfill ? "Cancelling..." : "Cancel Job"}
+                    </button>
+                    <button
+                      onClick={onRetryFailedArchiveBackfill}
+                      disabled={isRunningArchiveBackfill || isRetryingArchiveBackfill || !hasFailedItems}
+                      style={{ fontSize: 12, padding: "6px 12px", background: "#1a73e8", color: "#fff", border: "none", borderRadius: 4, cursor: isRunningArchiveBackfill || isRetryingArchiveBackfill || !hasFailedItems ? "not-allowed" : "pointer", opacity: isRunningArchiveBackfill || isRetryingArchiveBackfill || !hasFailedItems ? 0.6 : 1 }}
+                    >
+                      {isRetryingArchiveBackfill ? "Retrying..." : "Retry Failed Items"}
+                    </button>
+                  </div>
+                  <div style={{ fontSize: 12, color: "#666", marginBottom: archiveBackfillSummary ? 12 : 0 }}>
+                    Re-analyzes archived emails and creates or updates old tracking tasks without duplicating them.
+                  </div>
+                  {(isRunningArchiveBackfill || archiveBackfillJob) ? (
+                    <div style={{ marginBottom: 12, border: "1px solid #e1e1e1", borderRadius: 8, background: "#fff", padding: 12 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginBottom: 8, fontSize: 12 }}>
+                        <strong>Status: {archiveBackfillStatus}</strong>
+                        <span>{archiveBackfillPercent}%</span>
+                      </div>
+                      <div style={{ width: "100%", height: 10, background: "#f0f0f0", borderRadius: 999, overflow: "hidden", marginBottom: 8 }}>
+                        <div style={{ width: `${archiveBackfillPercent}%`, height: "100%", background: archiveBackfillStatus === "failed" ? "#d83b01" : "#107c10", transition: "width 0.3s ease" }} />
+                      </div>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 12, fontSize: 12, color: "#555" }}>
+                        <span>Processed: {Number(archiveBackfillProgress?.processed || 0)} / {Number(archiveBackfillProgress?.scanned || 0)}</span>
+                        <span>Analyzed: {Number(archiveBackfillProgress?.analyzed || 0)}</span>
+                        <span>Created: {Number(archiveBackfillProgress?.created || 0)}</span>
+                        <span>Updated: {Number(archiveBackfillProgress?.updated || 0)}</span>
+                        <span>Skipped: {Number(archiveBackfillProgress?.skipped || 0)}</span>
+                        <span>Errors: {Number(archiveBackfillProgress?.errors || 0)}</span>
+                      </div>
+                      {archiveBackfillProgress?.current_subject ? (
+                        <div style={{ marginTop: 8, fontSize: 12, color: "#666" }}>
+                          Current: {archiveBackfillProgress.current_subject}
+                        </div>
+                      ) : null}
+                      {archiveBackfillJob?.cancel_requested ? (
+                        <div style={{ marginTop: 8, fontSize: 12, color: "#d83b01" }}>
+                          Cancellation requested. The job will stop safely after the current item.
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
+                  {archiveBackfillSummary ? (
+                    <div style={{ border: "1px solid #e1e1e1", borderRadius: 8, background: "#fff" }}>
+                      <div className="o365-admin-grid" style={{ padding: 12, marginBottom: 0 }}>
+                        <div className="o365-admin-card"><strong>{Number(archiveBackfillSummary.scanned || 0)}</strong><span>Scanned</span></div>
+                        <div className="o365-admin-card"><strong>{Number(archiveBackfillSummary.analyzed || 0)}</strong><span>Analyzed</span></div>
+                        <div className="o365-admin-card"><strong>{Number(archiveBackfillSummary.tasks_created || 0)}</strong><span>Tasks Created</span></div>
+                        <div className="o365-admin-card"><strong>{Number(archiveBackfillSummary.tasks_updated || 0)}</strong><span>Tasks Updated</span></div>
+                        <div className="o365-admin-card"><strong>{Number(archiveBackfillSummary.tasks_skipped || 0)}</strong><span>Skipped</span></div>
+                        <div className="o365-admin-card"><strong>{Number(archiveBackfillSummary.errors || 0)}</strong><span>Errors</span></div>
+                      </div>
+                      <div style={{ borderTop: "1px solid #eee", padding: 12 }}>
+                        <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>
+                          Last Run Details ({Array.isArray(archiveBackfillSummary.items) ? archiveBackfillSummary.items.length : 0})
+                        </div>
+                        <div style={{ maxHeight: 220, overflow: "auto" }}>
+                          {!Array.isArray(archiveBackfillSummary.items) || !archiveBackfillSummary.items.length ? (
+                            <div style={{ fontSize: 12, color: "#666" }}>No detail rows returned.</div>
+                          ) : archiveBackfillSummary.items.map((item, index) => (
+                            <div key={`${item.email_id || "row"}-${index}`} style={{ padding: "8px 0", borderBottom: "1px solid #f0f0f0", fontSize: 12 }}>
+                              <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                                <strong>{item.subject || `Email ${item.email_id || "-"}`}</strong>
+                                <span style={{ color: item.status === "error" ? "#d83b01" : "#666" }}>{item.status || "-"}</span>
+                              </div>
+                              <div style={{ color: "#666", marginTop: 4 }}>
+                                Email ID: {item.email_id || "-"} | Category: {item.category || "-"} | Created: {Number(item.created || 0)} | Updated: {Number(item.updated || 0)} | Skipped: {Number(item.skipped || 0)}
+                              </div>
+                              {item.error ? <div style={{ marginTop: 4, color: "#d83b01" }}>{item.error}</div> : null}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+              <div className="o365-settings-section" style={{ marginTop: 16 }}>
+                <h3>Archive Explorer</h3>
+                <div className="o365-settings-body">
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end", marginBottom: 12 }}>
+                    <div>
+                      <label style={{ fontSize: 11, display: "block", color: "#666" }}>Project Code</label>
+                      <input
+                        value={archiveExplorerFilters.project_code}
+                        onChange={(e) => updateArchiveExplorerFilter("project_code", e.target.value)}
+                        placeholder="e.g. PROJ-1001"
+                        style={{ fontSize: 12, width: 150 }}
+                      />
+                    </div>
+                    <div>
+                      <label style={{ fontSize: 11, display: "block", color: "#666" }}>Serial Number</label>
+                      <input
+                        value={archiveExplorerFilters.serial_number}
+                        onChange={(e) => updateArchiveExplorerFilter("serial_number", e.target.value)}
+                        placeholder="e.g. TENDER-2026-0001"
+                        style={{ fontSize: 12, width: 180 }}
+                      />
+                    </div>
+                    <div>
+                      <label style={{ fontSize: 11, display: "block", color: "#666" }}>Thread ID</label>
+                      <input
+                        value={archiveExplorerFilters.thread_id}
+                        onChange={(e) => updateArchiveExplorerFilter("thread_id", e.target.value)}
+                        placeholder="approval:123 or message:..."
+                        style={{ fontSize: 12, width: 220 }}
+                      />
+                    </div>
+                    <div>
+                      <label style={{ fontSize: 11, display: "block", color: "#666" }}>Limit</label>
+                      <input
+                        type="number"
+                        min="1"
+                        max="200"
+                        value={archiveExplorerFilters.limit}
+                        onChange={(e) => updateArchiveExplorerFilter("limit", e.target.value)}
+                        style={{ fontSize: 12, width: 80 }}
+                      />
+                    </div>
+                    <button onClick={handleArchiveExplorerSearch} disabled={isLoadingArchiveExplorer} style={{ fontSize: 12, padding: "6px 12px", background: "var(--c-primary)", color: "#fff", border: "none", borderRadius: 4, cursor: "pointer" }}>
+                      {isLoadingArchiveExplorer ? "Loading..." : "Search"}
+                    </button>
+                    <button onClick={handleArchiveExplorerReset} disabled={isLoadingArchiveExplorer} style={{ fontSize: 12, padding: "6px 12px", background: "none", border: "1px solid #ddd", borderRadius: 4, cursor: "pointer" }}>
+                      Reset
+                    </button>
+                  </div>
+
+                  <div className="o365-admin-grid" style={{ marginBottom: 12 }}>
+                    <div className="o365-admin-card"><strong>{Number(archiveExplorerData?.totals?.registry || 0)}</strong><span>Email Registry</span></div>
+                    <div className="o365-admin-card"><strong>{Number(archiveExplorerData?.totals?.content_archive || 0)}</strong><span>Content Archive</span></div>
+                    <div className="o365-admin-card"><strong>{Number(archiveExplorerData?.totals?.tracking_tasks || 0)}</strong><span>Tracking Tasks</span></div>
+                    <div className="o365-admin-card"><strong>{Number(registryRows.length + contentRows.length + trackingRows.length || 0)}</strong><span>Loaded Rows</span></div>
+                  </div>
+
+                  <div style={{ display: "grid", gap: 16 }}>
+                    <div style={{ border: "1px solid #e1e1e1", borderRadius: 8, overflow: "hidden", background: "#fff" }}>
+                      <div style={{ padding: "10px 12px", borderBottom: "1px solid #eee", background: "#f8f9fa", fontSize: 13, fontWeight: 600 }}>
+                        email_registry ({registryRows.length})
+                      </div>
+                      <div style={{ maxHeight: 300, overflow: "auto" }}>
+                        {!registryRows.length ? <div style={{ padding: 12, fontSize: 12, color: "#666" }}>No registry rows found.</div> : registryRows.map((row) => (
+                          <div key={row.email_db_id} style={{ padding: 12, borderBottom: "1px solid #f0f0f0", fontSize: 12 }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginBottom: 4 }}>
+                              <strong>{row.serial_number || `Email DB ${row.email_db_id}`}</strong>
+                              <span style={{ color: "#666" }}>{formatDateTime(row.updated_at)}</span>
+                            </div>
+                            <div>{row.subject || "No subject"}</div>
+                            <div style={{ color: "#555", marginTop: 4 }}>
+                              {row.project_code || "No project"} | {row.thread_id || "No thread"} | {row.folder_name || "-"} | {row.approval_status || "none"} | {row.risk_level || "low"}
+                            </div>
+                            <div style={{ color: "#777", marginTop: 4 }}>
+                              {row.sender_email || "-"} → {row.recipient_email || "-"}
+                            </div>
+                            <div style={{ color: "#888", marginTop: 4 }}>
+                              Employee: {row.employee_name || "-"} | Manager: {row.assigned_manager_name || "-"} | Provider: {row.source_provider || "-"}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div style={{ border: "1px solid #e1e1e1", borderRadius: 8, overflow: "hidden", background: "#fff" }}>
+                      <div style={{ padding: "10px 12px", borderBottom: "1px solid #eee", background: "#f8f9fa", fontSize: 13, fontWeight: 600 }}>
+                        email_content_archive ({contentRows.length})
+                      </div>
+                      <div style={{ maxHeight: 320, overflow: "auto" }}>
+                        {!contentRows.length ? <div style={{ padding: 12, fontSize: 12, color: "#666" }}>No archived content rows found.</div> : contentRows.map((row) => (
+                          <div key={row.email_db_id} style={{ padding: 12, borderBottom: "1px solid #f0f0f0", fontSize: 12 }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginBottom: 4 }}>
+                              <strong>{row.serial_number || `Content ${row.email_db_id}`}</strong>
+                              <span style={{ color: "#666" }}>{formatDateTime(row.updated_at)}</span>
+                            </div>
+                            <div>{row.subject || "No subject"}</div>
+                            <div style={{ color: "#555", marginTop: 4 }}>
+                              {row.project_code || "No project"} | {row.thread_id || "No thread"} | Attachments: {getAttachmentCount(row.attachments_path)} | Body chars: {Number(row.raw_body_length || 0)}
+                            </div>
+                            {row.ai_summary ? <div style={{ marginTop: 6, padding: "6px 8px", background: "#fafafa", borderRadius: 4, color: "#444" }}>{row.ai_summary}</div> : null}
+                            {row.raw_body_preview ? <div style={{ marginTop: 6, color: "#777", whiteSpace: "pre-wrap" }}>{row.raw_body_preview}</div> : null}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div style={{ border: "1px solid #e1e1e1", borderRadius: 8, overflow: "hidden", background: "#fff" }}>
+                      <div style={{ padding: "10px 12px", borderBottom: "1px solid #eee", background: "#f8f9fa", fontSize: 13, fontWeight: 600 }}>
+                        tracking_tasks ({trackingRows.length})
+                      </div>
+                      <div style={{ maxHeight: 320, overflow: "auto" }}>
+                        {!trackingRows.length ? <div style={{ padding: 12, fontSize: 12, color: "#666" }}>No tracking tasks found.</div> : trackingRows.map((row) => (
+                          <div key={row.task_id} style={{ padding: 12, borderBottom: "1px solid #f0f0f0", fontSize: 12 }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginBottom: 4 }}>
+                              <strong>{row.source_task_title || row.email_subject || `Task ${row.task_id}`}</strong>
+                              <span style={{ color: "#666" }}>{formatDateTime(row.updated_at)}</span>
+                            </div>
+                            <div style={{ color: "#555" }}>
+                              {row.task_type || "general"} | {row.status || "PENDING"} | {row.priority || "medium"} | Due: {formatDateTime(row.due_date)}
+                            </div>
+                            <div style={{ color: "#777", marginTop: 4 }}>
+                              {row.project_code || "No project"} | {row.serial_number || "No serial"} | {row.thread_id || "No thread"}
+                            </div>
+                            <div style={{ color: "#888", marginTop: 4 }}>
+                              Assigned to: {row.assigned_to_name || "-"} | Alerts: {Number(row.alert_count || 0)} | AI tasks: {getAiTaskCount(row.ai_tasks)}
+                            </div>
+                            {row.source_task_description ? <div style={{ marginTop: 6, color: "#444" }}>{row.source_task_description}</div> : null}
+                            {row.ai_summary ? <div style={{ marginTop: 6, padding: "6px 8px", background: "#fafafa", borderRadius: 4, color: "#444" }}>{row.ai_summary}</div> : null}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
                 </div>
               </div>
               <div className="o365-settings-section" style={{ marginTop: 16 }}>

@@ -70,6 +70,7 @@ import {
   searchEmailsBySerial,
   getThreadBySerial,
   getArchiveStats,
+  listAdminArchiveExplorer,
   trackEmailThread,
   resolveSerialFromHeaders,
   createEmailAccount,
@@ -116,7 +117,7 @@ import {
   requireAdminAccess,
   requireSyncKey
 } from "./auth.js";
-import { applyMailSettings, applyAllMailSettings, testMailSettings, getMailServiceStatus, runCycle, runFullMailSyncAllAccounts, sendMailMessage, deliverApprovalEmail, retryQueuedEmailNow, repairLegacyEmailAttachments, saveParsedAttachments, getSmtpTransporter } from "./mailService.js";
+import { applyMailSettings, applyAllMailSettings, testMailSettings, getMailServiceStatus, runCycle, runFullMailSyncAllAccounts, sendMailMessage, deliverApprovalEmail, retryQueuedEmailNow, repairLegacyEmailAttachments, runAiBackfillReanalysis, startAiBackfillReanalysisJob, getAiBackfillJobStatus, listAiBackfillJobs, cancelAiBackfillJob, retryFailedAiBackfillItems, saveParsedAttachments, getSmtpTransporter } from "./mailService.js";
 import {
   buildApprovalActionLinks,
   verifyApprovalActionToken,
@@ -126,6 +127,7 @@ import {
   parseTelegramApprovalUpdate,
   answerTelegramCallback
 } from "./telegramApprovalBot.js";
+import { analyzeInboundTaskExtractionWithLlm } from "./aiAnalysisService.js";
 import { SMTPServer } from "smtp-server";
 import { simpleParser } from "mailparser";
 
@@ -447,9 +449,6 @@ async function executeApprovalAction({
   source = "app",
   approvalToken = ""
 }) {
-  // #region debug-point B:execute-approval-entry
-  fetch("http://127.0.0.1:7777/event",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionId:"approval-fetch-failure",runId:"pre-fix",hypothesisId:"B",location:"server/index.js:executeApprovalAction:entry",msg:"[DEBUG] executeApprovalAction entered",data:{emailId:Number(emailId||0),action:String(action||""),actorUserId:Number(actorUserId||0),source:String(source||""),hasApprovalToken:Boolean(approvalToken)},ts:Date.now()})}).catch(()=>{});
-  // #endregion
   if (action === "approve") {
     const emailRecord = await approveEmail(emailId, actorUserId, managerComments || "", ipAddress);
     if (approvalToken) {
@@ -469,9 +468,6 @@ async function executeApprovalAction({
       size: attachment.file_size
     }));
     const result = await deliverApprovalEmail(emailRecord, files, emailRecord.employee_id);
-    // #region debug-point D:approve-delivery-result
-    fetch("http://127.0.0.1:7777/event",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionId:"approval-fetch-failure",runId:"pre-fix",hypothesisId:"D",location:"server/index.js:executeApprovalAction:approve-result",msg:"[DEBUG] approval delivery attempted",data:{emailId:Number(emailRecord?.id||0),employeeId:Number(emailRecord?.employee_id||0),recipientEmail:String(emailRecord?.recipient_email||""),queued:Boolean(result?.queued),folderName:String(result?.email?.folder_name||emailRecord?.folder_name||""),status:String(result?.email?.status||emailRecord?.status||""),approvalStatus:String(result?.email?.approval_status||emailRecord?.approval_status||"")},ts:Date.now()})}).catch(()=>{});
-    // #endregion
     await logEmailTrail(
       emailRecord.id,
       actorUserId,
@@ -493,9 +489,6 @@ async function executeApprovalAction({
   if (action === "reject") {
     const rejectionReason = managerComments || "Rejected via secure approval action.";
     const email = await rejectEmail(emailId, actorUserId, rejectionReason, ipAddress);
-    // #region debug-point D:reject-result
-    fetch("http://127.0.0.1:7777/event",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionId:"approval-fetch-failure",runId:"pre-fix",hypothesisId:"D",location:"server/index.js:executeApprovalAction:reject-result",msg:"[DEBUG] approval rejection completed",data:{emailId:Number(email?.id||emailId||0),employeeId:Number(email?.employee_id||0),folderName:String(email?.folder_name||""),status:String(email?.status||""),approvalStatus:String(email?.approval_status||""),rejectionReason:String(email?.rejection_reason||rejectionReason||"")},ts:Date.now()})}).catch(()=>{});
-    // #endregion
     if (approvalToken) {
       await markApprovalActionTokenConsumed(approvalToken);
     }
@@ -587,9 +580,6 @@ async function handleComposeSendRoute(req, res) {
     const user = employeeId ? await getUserById(employeeId) : null;
     const managedUsers = user?.id ? await getEmployeesWithManager() : [];
     const { requiresManagerApproval } = getUserApprovalPolicy(user, managedUsers);
-    // #region debug-point C:compose-policy
-    fetch("http://127.0.0.1:7777/event",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionId:"approval-fetch-failure",runId:"pre-fix",hypothesisId:"C",location:"server/index.js:handleComposeSendRoute:policy",msg:"[DEBUG] compose/send policy evaluated",data:{employeeId:Number(employeeId||0),userId:Number(user?.id||0),userEmail:String(user?.email||""),userRole:String(user?.role||""),managerId:Number(user?.manager_id||0),requiresManagerApproval:Boolean(requiresManagerApproval)},ts:Date.now()})}).catch(()=>{});
-    // #endregion
 
     if (requiresManagerApproval && !user?.manager_id) {
       return res.status(400).json({
@@ -659,9 +649,6 @@ app.get("/api/auth/me", authenticateRequest, async (req, res) => {
 });
 
 app.get("/api/bootstrap", authenticateRequest, async (req, res) => {
-  // #region debug-point C:bootstrap-entry
-  fetch("http://127.0.0.1:7777/event",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionId:"approval-fetch-failure",runId:"pre-fix",hypothesisId:"C",location:"server/index.js:/api/bootstrap:entry",msg:"[DEBUG] bootstrap requested",data:{userId:Number(req.user?.id||0),userEmail:String(req.user?.email||""),role:String(req.user?.role||"")},ts:Date.now()})}).catch(()=>{});
-  // #endregion
   const payload = await listBootstrapData(req.user.id);
   try {
     payload.emailAccounts = await getEmailAccounts(req.user.id);
@@ -670,9 +657,6 @@ app.get("/api/bootstrap", authenticateRequest, async (req, res) => {
   try { payload.projects = await getProjects(); } catch (e) { payload.projects = []; }
   try { payload.unclassifiedCount = await getUnclassifiedCount(); } catch (e) { payload.unclassifiedCount = 0; }
   try { payload.taskStats = await getTaskStats(req.user?.id); } catch (e) { payload.taskStats = {}; }
-  // #region debug-point C:bootstrap-result
-  fetch("http://127.0.0.1:7777/event",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionId:"approval-fetch-failure",runId:"pre-fix",hypothesisId:"C",location:"server/index.js:/api/bootstrap:result",msg:"[DEBUG] bootstrap payload generated",data:{userId:Number(req.user?.id||0),emailCount:Number(payload?.emails?.length||0),folderCount:Number(payload?.folders?.length||0),attachmentCount:Number(payload?.attachments?.length||0)},ts:Date.now()})}).catch(()=>{});
-  // #endregion
   return res.json(payload);
 });
 
@@ -1114,80 +1098,88 @@ app.post("/api/ai/analyze", authenticateRequest, async (req, res) => {
     if (!email) return res.status(404).json({ error: "Email not found" });
 
     const activeProjects = await getActiveProjects();
-    const projectContext = activeProjects.length > 0
-      ? `\nActive projects in company: ${activeProjects.join(", ")}. Match email to one if applicable.`
-      : "";
-
     const body = (email.body || "").replace(/<[^>]+>/g, " ").trim().substring(0, 3000);
+    const fullText = `${email.subject || ""} ${body}`.toLowerCase();
+    let category = "GENERAL";
+    if (/(customs|clearance|broker|الجمارك|تخليص|بيان جمركي)/i.test(fullText)) category = "CUSTOMS";
+    else if (/(tender|bid|rfq|rfp|مناقصة|عطاء|عرض فني|عرض مالي)/i.test(fullText)) category = "TENDER";
+    else if (/(payment|invoice|remittance|swift|iban|فاتورة|دفعة|تحويل بنكي|سداد)/i.test(fullText)) category = "PAYMENT";
 
-    const prompt = `You are an expert Data Engineer for an engineering firm. Analyze this email and return ONLY a valid JSON object.
+    const priority = /(urgent|asap|immediately|critical|deadline|عاجل|فوري|نهائي)/i.test(fullText)
+      ? "High"
+      : /(optional|later|when possible|عند الإمكان)/i.test(fullText)
+        ? "Low"
+        : "Medium";
 
-Email Subject: ${email.subject || ""}
-From: ${email.sender_email || ""}
-To: ${email.recipient_email || ""}
-Date: ${email.sent_at || email.received_at || ""}
-Body: ${body}
-${projectContext}
+    const fallbackTask = category === "GENERAL"
+      ? []
+      : [{
+          task_description:
+            category === "CUSTOMS"
+              ? `Review customs and clearance requirements for "${email.subject || "this email"}".`
+              : category === "TENDER"
+                ? `Review tender submission and response requirements for "${email.subject || "this email"}".`
+                : `Review payment request and finance follow-up for "${email.subject || "this email"}".`,
+          due_date: null,
+          task_type: category.toLowerCase(),
+          category,
+          checklist:
+            category === "CUSTOMS"
+              ? ["Review customs documents", "Confirm broker/clearance status"]
+              : category === "TENDER"
+                ? ["Review submission requirements", "Confirm deadline and deliverables"]
+                : ["Validate invoice/payment data", "Confirm finance status"],
+          assigned_to_email: "",
+          assigned_to_name: "",
+          assigned_department: category === "PAYMENT" ? "finance" : category === "TENDER" ? "sales" : category === "CUSTOMS" ? "customs" : "",
+          priority,
+          confidence: "medium"
+        }];
 
-Return this JSON schema:
-{
-  "sender_email": "${email.sender_email || ""}",
-  "receiver_email": "${email.recipient_email || ""}",
-  "project_id": "PROJ-XXXX or null",
-  "email_category": "Technical Request|Quotation Request|Project Update|Complaint|General",
-  "summary": "One sentence summary in Arabic",
-  "ai_tasks": [{"task_description": "...", "due_date": "YYYY-MM-DD or null"}],
-  "priority": "High|Medium|Low"
-}`;
+    let candidateAssignees = [];
+    try {
+      const employees = await listEmployees(req.user.id);
+      candidateAssignees = (employees || [])
+        .filter((employee) => employee.is_active !== false)
+        .slice(0, 20)
+        .map((employee) => ({
+          name: employee.name || "",
+          email: employee.email || "",
+          role: employee.role || "",
+          department: employee.department || ""
+        }));
+    } catch {
+      candidateAssignees = [];
+    }
 
-    let analysis = null;
-
-    const openaiKey = process.env.OPENAI_API_KEY;
-    if (openaiKey) {
-      try {
-        const response = await fetch("https://api.openai.com/v1/chat/completions", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${openaiKey}` },
-          body: JSON.stringify({
-            model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-            messages: [{ role: "user", content: prompt }],
-            temperature: 0.3,
-            max_tokens: 800,
-          }),
-        });
-        const data = await response.json();
-        const content = data.choices?.[0]?.message?.content || "";
-        const jsonMatch = content.match(/\{[\s\S]*\}/);
-        if (jsonMatch) analysis = JSON.parse(jsonMatch[0]);
-      } catch (aiErr) {
-        console.error("OpenAI API error:", aiErr.message);
+    const analysis = await analyzeInboundTaskExtractionWithLlm(
+      {
+        subject: email.subject || "",
+        body,
+        senderEmail: email.sender_email || "",
+        recipientEmail: email.recipient_email || "",
+        ccList: email.cc_list || "",
+        receivedAt: email.sent_at || email.received_at || "",
+        activeProjects,
+        candidateAssignees
+      },
+      {
+        sender_email: email.sender_email || "",
+        receiver_email: email.recipient_email || "",
+        project_id: null,
+        email_category: category,
+        summary: `تحليل رسالة بخصوص "${(email.subject || "").substring(0, 80)}".`,
+        priority,
+        routing: {
+          suggested_assigned_to_email: "",
+          suggested_assigned_to_name: "",
+          suggested_department: fallbackTask[0]?.assigned_department || "",
+          reason: "Rule-based fallback"
+        },
+        ai_tasks: fallbackTask,
+        provider: "rules"
       }
-    }
-
-    if (!analysis) {
-      const fullText = `${email.subject || ""} ${body}`.toLowerCase();
-      const projectPatterns = [/(?:project|proj)[\s:\-#]*([A-Z0-9\-\/]+)/i, /\b([A-Z]{2,4}[\-\/]\d{3,6})\b/];
-      let projectId = null;
-      for (const p of projectPatterns) { const m = (email.subject || "").match(p); if (m) { projectId = m[1]; break; } }
-
-      let category = "General";
-      const cats = { "Technical Request": ["technical","specification","design","calculation"], "Quotation Request": ["quotation","price","cost","budget"], "Project Update": ["update","progress","status","report"], "Complaint": ["complaint","issue","problem","delay"] };
-      let maxS = 0;
-      for (const [c, kws] of Object.entries(cats)) { const s = kws.filter(k => fullText.includes(k)).length; if (s > maxS) { maxS = s; category = c; } }
-
-      let priority = "Medium";
-      const highKw = ["urgent","asap","immediately","critical","عاجل","فوري"];
-      const lowKw = ["when possible","optional","later","عند الإمكان"];
-      if (highKw.some(k => fullText.includes(k))) priority = "High";
-      else if (lowKw.some(k => fullText.includes(k))) priority = "Low";
-
-      analysis = {
-        sender_email: email.sender_email, receiver_email: email.recipient_email,
-        project_id: projectId, email_category: category,
-        summary: `بريد إلكتروني ${category} بخصوص "${(email.subject || "").substring(0, 50)}"`,
-        ai_tasks: [], priority,
-      };
-    }
+    );
 
     const saved = await saveAiAnalysis(email_id, analysis, req.user.id);
     return res.json({ analysis: saved, cached: false });
@@ -1271,6 +1263,20 @@ app.get("/api/admin/archives", authenticateRequest, requireAdminAccess, async (_
     return res.json({ archives });
   } catch (error) {
     return res.status(400).json({ error: error.message });
+  }
+});
+
+app.get("/api/admin/archive-explorer", authenticateRequest, requireAdminAccess, async (req, res) => {
+  try {
+    const result = await listAdminArchiveExplorer({
+      project_code: req.query?.project_code || "",
+      serial_number: req.query?.serial_number || "",
+      thread_id: req.query?.thread_id || "",
+      limit: req.query?.limit || 50
+    });
+    return res.json(result);
+  } catch (error) {
+    return res.status(400).json({ error: error.message || "Unable to load archive explorer data." });
   }
 });
 
@@ -1358,6 +1364,65 @@ app.post("/api/admin/mail-tests/run", authenticateRequest, requireAdminAccess, a
     return res.json({ ok: true, summary, results });
   } catch (error) {
     return res.status(400).json({ error: error.message || "Unable to run admin mail tests." });
+  }
+});
+
+app.post("/api/admin/ai-backfill/reanalyze", authenticateRequest, requireAdminAccess, async (req, res) => {
+  try {
+    const job = await startAiBackfillReanalysisJob({
+      actorUserId: req.user.id,
+      limit: req.body?.limit || null,
+      includeSent: Boolean(req.body?.includeSent),
+      force: req.body?.force !== false
+    });
+    return res.json({ ok: true, job });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || "AI backfill re-analysis failed." });
+  }
+});
+
+app.get("/api/admin/ai-backfill/reanalyze", authenticateRequest, requireAdminAccess, async (req, res) => {
+  try {
+    const jobs = listAiBackfillJobs(req.query?.limit || 20);
+    return res.json({ ok: true, jobs });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || "Unable to load AI backfill jobs." });
+  }
+});
+
+app.get("/api/admin/ai-backfill/reanalyze/:jobId", authenticateRequest, requireAdminAccess, async (req, res) => {
+  try {
+    const job = getAiBackfillJobStatus(req.params.jobId);
+    if (!job) {
+      return res.status(404).json({ error: "AI backfill job not found." });
+    }
+    return res.json({ ok: true, job });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || "Unable to load AI backfill status." });
+  }
+});
+
+app.post("/api/admin/ai-backfill/reanalyze/:jobId/cancel", authenticateRequest, requireAdminAccess, async (req, res) => {
+  try {
+    const job = cancelAiBackfillJob(req.params.jobId);
+    if (!job) {
+      return res.status(404).json({ error: "AI backfill job not found." });
+    }
+    return res.json({ ok: true, job });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || "Unable to cancel AI backfill job." });
+  }
+});
+
+app.post("/api/admin/ai-backfill/reanalyze/:jobId/retry-failed", authenticateRequest, requireAdminAccess, async (req, res) => {
+  try {
+    const job = await retryFailedAiBackfillItems(req.params.jobId, {
+      actorUserId: req.user.id,
+      force: req.body?.force !== false
+    });
+    return res.json({ ok: true, job });
+  } catch (error) {
+    return res.status(400).json({ error: error.message || "Unable to retry failed AI backfill items." });
   }
 });
 // #endregion
@@ -1652,19 +1717,10 @@ app.post("/api/settings/apply", authenticateRequest, async (req, res) => {
 
 app.post("/api/settings/run-cycle", authenticateRequest, async (req, res) => {
   try {
-    // #region debug-point mail-sync-missing:api-run-cycle-entry
-    fetch("http://127.0.0.1:7777/event",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionId:"mail-sync-missing",runId:"pre-fix",hypothesisId:"H2",location:"server/index.js:/api/settings/run-cycle:entry",msg:"[DEBUG] api run-cycle entered",data:{userId:Number(req.user?.id||0),userEmail:String(req.user?.email||""),role:String(req.user?.role||"")},ts:Date.now()})}).catch(()=>{});
-    // #endregion
     const result = await runCycle(req.user.id);
     const status = getMailServiceStatus(req.user.id);
-    // #region debug-point mail-sync-missing:api-run-cycle-success
-    fetch("http://127.0.0.1:7777/event",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionId:"mail-sync-missing",runId:"pre-fix",hypothesisId:"H1",location:"server/index.js:/api/settings/run-cycle:success",msg:"[DEBUG] api run-cycle completed",data:{userId:Number(req.user?.id||0),userEmail:String(req.user?.email||""),sent:Number(result?.sent||0),received:Number(result?.received||0),skipped:Number(result?.skipped||0),queued:Number(result?.queued||0),lastError:String(status?.lastError||""),lastRunSummary:String(status?.lastRunSummary||"")},ts:Date.now()})}).catch(()=>{});
-    // #endregion
     return res.json({ result, status });
   } catch (error) {
-    // #region debug-point mail-sync-missing:api-run-cycle-error
-    fetch("http://127.0.0.1:7777/event",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionId:"mail-sync-missing",runId:"pre-fix",hypothesisId:"H4",location:"server/index.js:/api/settings/run-cycle:error",msg:"[DEBUG] api run-cycle failed",data:{userId:Number(req.user?.id||0),userEmail:String(req.user?.email||""),message:String(error?.message||error)},ts:Date.now()})}).catch(()=>{});
-    // #endregion
     return res.status(400).json({ error: error.message || "Unable to run send/receive cycle." });
   }
 });
@@ -1696,9 +1752,29 @@ app.get("/api/health", (_req, res) => {
 // Serve built frontend
 const distDir = path.resolve(process.cwd(), "dist");
 if (fs.existsSync(distDir)) {
-  app.use(express.static(distDir));
+  const distAssetsDir = path.join(distDir, "assets");
+  if (fs.existsSync(distAssetsDir)) {
+    app.use("/assets", express.static(distAssetsDir, {
+      maxAge: "1h"
+    }));
+  }
+  app.use(express.static(distDir, {
+    index: false,
+    setHeaders(res, filePath) {
+      if (filePath.endsWith(".html")) {
+        res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+      }
+    }
+  }));
   app.get("*", (req, res, next) => {
-    if (req.path.startsWith("/api/") || req.path.startsWith("/uploads/")) return next();
+    if (
+      req.path.startsWith("/api/") ||
+      req.path.startsWith("/uploads/") ||
+      req.path.startsWith("/assets/")
+    ) {
+      return next();
+    }
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
     res.sendFile(path.join(distDir, "index.html"));
   });
 }

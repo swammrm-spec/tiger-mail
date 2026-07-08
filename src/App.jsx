@@ -877,13 +877,24 @@ function App() {
     email_content_archive: [],
     tracking_tasks: []
   });
+  const [archiveExplorerFocusEmailId, setArchiveExplorerFocusEmailId] = useState(null);
+  const [activeTrackingTaskActionKey, setActiveTrackingTaskActionKey] = useState("");
+  const [selectedArchiveTrackingTaskIds, setSelectedArchiveTrackingTaskIds] = useState([]);
+  const [bulkArchiveTrackingAssignedTo, setBulkArchiveTrackingAssignedTo] = useState("");
+  const [activeBulkTrackingAction, setActiveBulkTrackingAction] = useState("");
   const [archiveBackfillForm, setArchiveBackfillForm] = useState({ limit: 200, includeSent: false, force: true });
   const [archiveBackfillSummary, setArchiveBackfillSummary] = useState(null);
   const [archiveBackfillJob, setArchiveBackfillJob] = useState(null);
+  const [archiveBackfillHistory, setArchiveBackfillHistory] = useState([]);
+  const [isArchiveBackfillDetailsOpen, setIsArchiveBackfillDetailsOpen] = useState(false);
+  const [archiveBackfillDetailsJob, setArchiveBackfillDetailsJob] = useState(null);
+  const [archiveBackfillDetailsSearch, setArchiveBackfillDetailsSearch] = useState("");
+  const [archiveBackfillDetailsFailedOnly, setArchiveBackfillDetailsFailedOnly] = useState(false);
   const [analytics, setAnalytics] = useState(null);
   const [isSavingEmployee, setIsSavingEmployee] = useState(false);
   const [isLoadingTrail, setIsLoadingTrail] = useState(false);
   const [isLoadingArchiveExplorer, setIsLoadingArchiveExplorer] = useState(false);
+  const [isLoadingArchiveBackfillHistory, setIsLoadingArchiveBackfillHistory] = useState(false);
   const [isRunningArchiveBackfill, setIsRunningArchiveBackfill] = useState(false);
   const [isCancellingArchiveBackfill, setIsCancellingArchiveBackfill] = useState(false);
   const [isRetryingArchiveBackfill, setIsRetryingArchiveBackfill] = useState(false);
@@ -1611,6 +1622,7 @@ function App() {
       setArchiveBackfillJob(response.job || null);
       setArchiveBackfillSummary(response.job?.summary || null);
       setArchiveBackfillForm((prev) => ({ ...prev, ...effectiveOptions }));
+      syncArchiveBackfillHistoryJob(response.job || null);
     } catch (e) {
       setError(e.message);
       setIsRunningArchiveBackfill(false);
@@ -1623,6 +1635,7 @@ function App() {
       const job = response.job || null;
       setArchiveBackfillJob(job);
       setArchiveBackfillSummary(job?.summary || null);
+      syncArchiveBackfillHistoryJob(job);
 
       if (job?.status === "completed") {
         setIsRunningArchiveBackfill(false);
@@ -1634,6 +1647,7 @@ function App() {
         if (adminTab === "archives") {
           loadArchiveExplorer();
           loadArchives();
+          loadArchiveBackfillHistory();
         }
       } else if (job?.status === "cancelled") {
         setIsRunningArchiveBackfill(false);
@@ -1666,6 +1680,7 @@ function App() {
         method: "POST"
       });
       setArchiveBackfillJob(response.job || archiveBackfillJob);
+      syncArchiveBackfillHistoryJob(response.job || archiveBackfillJob);
       setSuccessMessage("Cancellation requested. The current job will stop after the current item.");
     } catch (e) {
       setError(e.message);
@@ -1686,6 +1701,7 @@ function App() {
       });
       setArchiveBackfillJob(response.job || null);
       setArchiveBackfillSummary(response.job?.summary || null);
+      syncArchiveBackfillHistoryJob(response.job || null);
       setSuccessMessage("Retry job started for failed items.");
     } catch (e) {
       setError(e.message);
@@ -1718,6 +1734,418 @@ function App() {
     }
     pollArchiveBackfillJob(archiveBackfillJob.job_id);
   }, [adminTab]);
+
+  function syncArchiveBackfillHistoryJob(job) {
+    if (!job?.job_id) return;
+    setArchiveBackfillHistory((prev) => {
+      const filtered = prev.filter((item) => item.job_id !== job.job_id);
+      return [job, ...filtered].sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime()).slice(0, 20);
+    });
+  }
+
+  async function loadArchiveBackfillHistory() {
+    setIsLoadingArchiveBackfillHistory(true);
+    try {
+      const response = await apiFetch("/api/admin/ai-backfill/reanalyze?limit=20");
+      setArchiveBackfillHistory(response.jobs || []);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setIsLoadingArchiveBackfillHistory(false);
+    }
+  }
+
+  useEffect(() => {
+    const validTaskIds = new Set(
+      (archiveExplorerData.tracking_tasks || [])
+        .map((row) => Number(row.task_id))
+        .filter((id) => Number.isInteger(id) && id > 0)
+    );
+    setSelectedArchiveTrackingTaskIds((prev) => prev.filter((id) => validTaskIds.has(id)));
+  }, [archiveExplorerData.tracking_tasks]);
+
+  function openArchiveBackfillHistoryJob(job) {
+    if (!job?.job_id) return;
+    setArchiveBackfillJob(job);
+    setArchiveBackfillSummary(job.summary || null);
+    setArchiveBackfillDetailsJob(job);
+    setArchiveBackfillDetailsSearch("");
+    setArchiveBackfillDetailsFailedOnly(false);
+    setIsArchiveBackfillDetailsOpen(true);
+    if (job.status === "queued" || job.status === "running") {
+      setIsRunningArchiveBackfill(true);
+    }
+  }
+
+  function openArchiveBackfillEmailById(emailId) {
+    const normalizedId = Number(emailId);
+    if (!Number.isInteger(normalizedId) || normalizedId <= 0) {
+      setError("Email ID is missing for this row.");
+      setSuccessMessage("");
+      return;
+    }
+    const targetEmail = data.emails.find((item) => item.id === normalizedId)
+      || archiveExplorerData.email_registry.find((item) => Number(item.email_id) === normalizedId)
+      || null;
+    setCurrentView("mail");
+    setSmartFolder(null);
+    if (targetEmail?.folder_name) {
+      setSelectedFolder(targetEmail.folder_name);
+    }
+    setSelectedEmailId(normalizedId);
+    setIsArchiveBackfillDetailsOpen(false);
+    setSuccessMessage(`Opened email ${normalizedId}.`);
+    setError("");
+  }
+
+  function focusArchiveTrackingTasksByEmailId(emailId) {
+    const normalizedId = Number(emailId);
+    if (!Number.isInteger(normalizedId) || normalizedId <= 0) {
+      setError("Email ID is missing for this row.");
+      setSuccessMessage("");
+      return;
+    }
+    setCurrentView("admin");
+    setAdminTab("archives");
+    setArchiveExplorerFocusEmailId(normalizedId);
+    setIsArchiveBackfillDetailsOpen(false);
+    loadArchiveExplorer();
+    setSuccessMessage(`Focused tracking tasks for email ${normalizedId}.`);
+    setError("");
+  }
+
+  async function refreshTaskViewsAfterArchiveAction() {
+    await loadArchiveExplorer();
+    if (smartFolder === "tasks" || smartFolder === "tasks-overdue" || smartFolder === "tasks-due-soon") {
+      await loadSmartFolder(smartFolder);
+    }
+  }
+
+  async function openTrackingTaskFromArchive(row) {
+    const taskId = Number(row?.existing_task_id);
+    if (!Number.isInteger(taskId) || taskId <= 0) {
+      setError("Task ID is missing for this row.");
+      setSuccessMessage("");
+      return;
+    }
+    setActiveTrackingTaskActionKey(`open:${taskId}`);
+    setError("");
+    setSuccessMessage("");
+    try {
+      setSmartFolder("tasks");
+      setSelectedFolder(null);
+      setCurrentView("mail");
+      await loadSmartFolder("tasks");
+      setSelectedEmailId(taskId);
+      setIsArchiveBackfillDetailsOpen(false);
+      setSuccessMessage(`Opened task ${taskId}.`);
+    } finally {
+      setActiveTrackingTaskActionKey("");
+    }
+  }
+
+  async function markArchiveTrackingTaskDone(row) {
+    const taskId = Number(row?.existing_task_id);
+    if (!Number.isInteger(taskId) || taskId <= 0) {
+      setError("Task ID is missing for this row.");
+      setSuccessMessage("");
+      return;
+    }
+    setActiveTrackingTaskActionKey(`done:${taskId}`);
+    setError("");
+    setSuccessMessage("");
+    try {
+      await apiFetch(`/api/tasks/${taskId}/complete`, { method: "POST" });
+      await refreshTaskViewsAfterArchiveAction();
+      setSuccessMessage(`Task ${taskId} marked as done.`);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setActiveTrackingTaskActionKey("");
+    }
+  }
+
+  async function assignArchiveTrackingTask(row, nextAssignedTo) {
+    const taskId = Number(row?.existing_task_id);
+    if (!Number.isInteger(taskId) || taskId <= 0) {
+      setError("Task ID is missing for this row.");
+      setSuccessMessage("");
+      return;
+    }
+    const normalizedAssignedTo = nextAssignedTo === "" ? null : Number(nextAssignedTo);
+    if (normalizedAssignedTo !== null && (!Number.isInteger(normalizedAssignedTo) || normalizedAssignedTo <= 0)) {
+      setError("Assigned user is invalid.");
+      setSuccessMessage("");
+      return;
+    }
+    setActiveTrackingTaskActionKey(`assign:${taskId}`);
+    setError("");
+    setSuccessMessage("");
+    try {
+      await apiFetch(`/api/tasks/${taskId}`, {
+        method: "PUT",
+        body: { assigned_to: normalizedAssignedTo }
+      });
+      await refreshTaskViewsAfterArchiveAction();
+      const assignedEmployee = employees.find((employee) => Number(employee.id) === normalizedAssignedTo);
+      setSuccessMessage(
+        normalizedAssignedTo
+          ? `Task ${taskId} assigned to ${assignedEmployee?.name || "selected employee"}.`
+          : `Task ${taskId} unassigned.`
+      );
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setActiveTrackingTaskActionKey("");
+    }
+  }
+
+  function openRelatedEmailFromTrackingTask(row) {
+    openArchiveBackfillEmailById(row?.email_id);
+  }
+
+  function toggleArchiveTrackingTaskSelection(taskId, isSelected) {
+    const normalizedTaskId = Number(taskId);
+    if (!Number.isInteger(normalizedTaskId) || normalizedTaskId <= 0) {
+      return;
+    }
+    setSelectedArchiveTrackingTaskIds((prev) => {
+      if (isSelected) {
+        return prev.includes(normalizedTaskId) ? prev : [...prev, normalizedTaskId];
+      }
+      return prev.filter((id) => id !== normalizedTaskId);
+    });
+  }
+
+  function toggleAllArchiveTrackingTaskSelections(rows, isSelected) {
+    const rowIds = (Array.isArray(rows) ? rows : [])
+      .map((row) => Number(row?.task_id))
+      .filter((id) => Number.isInteger(id) && id > 0);
+    if (!rowIds.length) {
+      setSelectedArchiveTrackingTaskIds([]);
+      return;
+    }
+    setSelectedArchiveTrackingTaskIds((prev) => {
+      if (isSelected) {
+        return Array.from(new Set([...prev, ...rowIds]));
+      }
+      return prev.filter((id) => !rowIds.includes(id));
+    });
+  }
+
+  async function markSelectedArchiveTrackingTasksDone() {
+    const selectedRows = archiveExplorerData.tracking_tasks.filter((row) => selectedArchiveTrackingTaskIds.includes(Number(row.task_id)));
+    const taskIds = Array.from(new Set(
+      selectedRows
+        .map((row) => Number(row.existing_task_id))
+        .filter((id) => Number.isInteger(id) && id > 0 && String(selectedRows.find((row) => Number(row.existing_task_id) === id)?.status || "").toLowerCase() !== "completed")
+    ));
+    if (!taskIds.length) {
+      setError("No eligible tasks selected.");
+      setSuccessMessage("");
+      return;
+    }
+    setActiveBulkTrackingAction("done");
+    setError("");
+    setSuccessMessage("");
+    try {
+      await Promise.all(taskIds.map((taskId) => apiFetch(`/api/tasks/${taskId}/complete`, { method: "POST" })));
+      await refreshTaskViewsAfterArchiveAction();
+      setSelectedArchiveTrackingTaskIds([]);
+      setSuccessMessage(`Marked ${taskIds.length} selected task(s) as done.`);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setActiveBulkTrackingAction("");
+    }
+  }
+
+  async function assignSelectedArchiveTrackingTasks() {
+    const normalizedAssignedTo = bulkArchiveTrackingAssignedTo === "" ? null : Number(bulkArchiveTrackingAssignedTo);
+    if (normalizedAssignedTo !== null && (!Number.isInteger(normalizedAssignedTo) || normalizedAssignedTo <= 0)) {
+      setError("Assigned user is invalid.");
+      setSuccessMessage("");
+      return;
+    }
+    const taskIds = Array.from(new Set(
+      archiveExplorerData.tracking_tasks
+        .filter((row) => selectedArchiveTrackingTaskIds.includes(Number(row.task_id)))
+        .map((row) => Number(row.existing_task_id))
+        .filter((id) => Number.isInteger(id) && id > 0)
+    ));
+    if (!taskIds.length) {
+      setError("No eligible tasks selected.");
+      setSuccessMessage("");
+      return;
+    }
+    setActiveBulkTrackingAction("assign");
+    setError("");
+    setSuccessMessage("");
+    try {
+      await Promise.all(taskIds.map((taskId) => apiFetch(`/api/tasks/${taskId}`, {
+        method: "PUT",
+        body: { assigned_to: normalizedAssignedTo }
+      })));
+      await refreshTaskViewsAfterArchiveAction();
+      setSelectedArchiveTrackingTaskIds([]);
+      const assignedEmployee = employees.find((employee) => Number(employee.id) === normalizedAssignedTo);
+      setSuccessMessage(
+        normalizedAssignedTo
+          ? `Assigned ${taskIds.length} selected task(s) to ${assignedEmployee?.name || "selected employee"}.`
+          : `Unassigned ${taskIds.length} selected task(s).`
+      );
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setActiveBulkTrackingAction("");
+    }
+  }
+
+  function exportSelectedArchiveTrackingTasks() {
+    const selectedRows = archiveExplorerData.tracking_tasks.filter((row) => selectedArchiveTrackingTaskIds.includes(Number(row.task_id)));
+    if (!selectedRows.length) {
+      setError("No selected tracking tasks to export.");
+      setSuccessMessage("");
+      return;
+    }
+    const escapeCsv = (value) => `"${String(value ?? "").replace(/"/g, '""')}"`;
+    const csv = [
+      ["Task ID", "Existing Task ID", "Email ID", "Title", "Task Type", "Status", "Priority", "Assigned To", "Project Code", "Serial Number", "Thread ID", "Due Date"].join(","),
+      ...selectedRows.map((row) => ([
+        escapeCsv(row.task_id),
+        escapeCsv(row.existing_task_id),
+        escapeCsv(row.email_id),
+        escapeCsv(row.source_task_title || row.email_subject || ""),
+        escapeCsv(row.task_type || ""),
+        escapeCsv(row.status || ""),
+        escapeCsv(row.priority || ""),
+        escapeCsv(row.assigned_to_name || ""),
+        escapeCsv(row.project_code || ""),
+        escapeCsv(row.serial_number || ""),
+        escapeCsv(row.thread_id || ""),
+        escapeCsv(row.due_date || "")
+      ].join(",")))
+    ].join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `tracking-tasks-selected-${Date.now()}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    setSuccessMessage(`Exported ${selectedRows.length} selected tracking task(s).`);
+    setError("");
+  }
+
+  function closeArchiveBackfillDetailsDrawer() {
+    setIsArchiveBackfillDetailsOpen(false);
+  }
+
+  function getArchiveBackfillDetailRows(job, search = "", failedOnly = false) {
+    let rows = Array.isArray(job?.summary?.items) ? job.summary.items : [];
+    if (failedOnly) {
+      rows = rows.filter((item) => item.status === "error");
+    }
+    const normalizedSearch = String(search || "").trim().toLowerCase();
+    if (!normalizedSearch) {
+      return rows;
+    }
+    return rows.filter((item) => {
+      const haystack = [
+        item.email_id,
+        item.subject,
+        item.status,
+        item.category,
+        item.error
+      ].map((value) => String(value || "").toLowerCase()).join(" ");
+      return haystack.includes(normalizedSearch);
+    });
+  }
+
+  async function retryFailedArchiveBackfillItemsForJob(jobId) {
+    if (!jobId) return;
+    setIsRetryingArchiveBackfill(true);
+    setIsRunningArchiveBackfill(true);
+    setError("");
+    setSuccessMessage("");
+    try {
+      const response = await apiFetch(`/api/admin/ai-backfill/reanalyze/${jobId}/retry-failed`, {
+        method: "POST",
+        body: { force: true }
+      });
+      setArchiveBackfillJob(response.job || null);
+      setArchiveBackfillSummary(response.job?.summary || null);
+      syncArchiveBackfillHistoryJob(response.job || null);
+      setSuccessMessage("Retry job started for failed items.");
+    } catch (e) {
+      setError(e.message);
+      setIsRunningArchiveBackfill(false);
+      setIsRetryingArchiveBackfill(false);
+    }
+  }
+
+  function exportArchiveBackfillSummary(job) {
+    if (!job?.job_id) return;
+    const payload = JSON.stringify(job, null, 2);
+    const blob = new Blob([payload], { type: "application/json;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `ai-backfill-summary-${job.job_id}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    setSuccessMessage(`Exported summary for job ${job.job_id}.`);
+  }
+
+  async function copyArchiveBackfillErrors(job, search = "", failedOnly = false) {
+    const rows = getArchiveBackfillDetailRows(job, search, failedOnly).filter((item) => item.status === "error");
+    if (!rows.length) {
+      setError("No error rows available to copy.");
+      setSuccessMessage("");
+      return;
+    }
+    const payload = rows.map((item) => {
+      return `Email ID: ${item.email_id || "-"} | Subject: ${item.subject || "-"} | Error: ${item.error || "-"}`;
+    }).join("\n");
+    await copyTextToClipboard(payload, `Copied ${rows.length} error row(s) to clipboard.`);
+  }
+
+  function exportArchiveBackfillDetailsCsv(job, search = "", failedOnly = false) {
+    const rows = getArchiveBackfillDetailRows(job, search, failedOnly);
+    if (!rows.length) {
+      setError("No detail rows available to export.");
+      setSuccessMessage("");
+      return;
+    }
+    const escapeCsv = (value) => `"${String(value ?? "").replace(/"/g, '""')}"`;
+    const csv = [
+      ["Email ID", "Subject", "Status", "Category", "Created", "Updated", "Skipped", "Error"].join(","),
+      ...rows.map((item) => ([
+        escapeCsv(item.email_id || ""),
+        escapeCsv(item.subject || ""),
+        escapeCsv(item.status || ""),
+        escapeCsv(item.category || ""),
+        escapeCsv(item.created || 0),
+        escapeCsv(item.updated || 0),
+        escapeCsv(item.skipped || 0),
+        escapeCsv(item.error || "")
+      ].join(",")))
+    ].join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `ai-backfill-details-${job?.job_id || "job"}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    setSuccessMessage(`Exported ${rows.length} detail row(s) to CSV.`);
+  }
 
   async function loadSmartFolder(type) {
     try {
@@ -2132,7 +2560,7 @@ function App() {
       if (adminTab === "overview") loadAnalytics();
       if (adminTab === "employees") loadEmployees();
       if (adminTab === "trail") loadEmailTrailData();
-      if (adminTab === "archives") { loadArchives(); loadArchiveExplorer(); }
+      if (adminTab === "archives") { loadArchives(); loadArchiveExplorer(); loadArchiveBackfillHistory(); }
       if (adminTab === "approval") loadApprovalAnalytics();
       if (adminTab === "mail-tests" && !adminMailTests) runAdminMailTests();
     }
@@ -2822,7 +3250,7 @@ function App() {
     if (adminTab === "overview") loadAnalytics();
     if (adminTab === "employees") loadEmployees();
     if (adminTab === "trail") loadEmailTrailData();
-    if (adminTab === "archives") { loadArchives(); loadArchiveExplorer(); }
+    if (adminTab === "archives") { loadArchives(); loadArchiveExplorer(); loadArchiveBackfillHistory(); }
     if (adminTab === "approval") loadApprovalAnalytics();
     if (adminTab === "mail-tests") runAdminMailTests();
   }
@@ -4344,18 +4772,50 @@ function App() {
             archiveExplorerFilters={archiveExplorerFilters}
             setArchiveExplorerFilters={setArchiveExplorerFilters}
             archiveExplorerData={archiveExplorerData}
+            archiveExplorerFocusEmailId={archiveExplorerFocusEmailId}
+            setArchiveExplorerFocusEmailId={setArchiveExplorerFocusEmailId}
+            activeTrackingTaskActionKey={activeTrackingTaskActionKey}
+            selectedArchiveTrackingTaskIds={selectedArchiveTrackingTaskIds}
+            bulkArchiveTrackingAssignedTo={bulkArchiveTrackingAssignedTo}
+            setBulkArchiveTrackingAssignedTo={setBulkArchiveTrackingAssignedTo}
+            activeBulkTrackingAction={activeBulkTrackingAction}
             isLoadingArchiveExplorer={isLoadingArchiveExplorer}
             onLoadArchiveExplorer={loadArchiveExplorer}
             archiveBackfillForm={archiveBackfillForm}
             setArchiveBackfillForm={setArchiveBackfillForm}
             archiveBackfillJob={archiveBackfillJob}
+            archiveBackfillHistory={archiveBackfillHistory}
             archiveBackfillSummary={archiveBackfillSummary}
+            isArchiveBackfillDetailsOpen={isArchiveBackfillDetailsOpen}
+            archiveBackfillDetailsJob={archiveBackfillDetailsJob}
+            archiveBackfillDetailsSearch={archiveBackfillDetailsSearch}
+            setArchiveBackfillDetailsSearch={setArchiveBackfillDetailsSearch}
+            archiveBackfillDetailsFailedOnly={archiveBackfillDetailsFailedOnly}
+            setArchiveBackfillDetailsFailedOnly={setArchiveBackfillDetailsFailedOnly}
+            isLoadingArchiveBackfillHistory={isLoadingArchiveBackfillHistory}
             isRunningArchiveBackfill={isRunningArchiveBackfill}
             isCancellingArchiveBackfill={isCancellingArchiveBackfill}
             isRetryingArchiveBackfill={isRetryingArchiveBackfill}
             onRunArchiveBackfill={runArchiveBackfill}
             onCancelArchiveBackfill={cancelArchiveBackfillJob}
             onRetryFailedArchiveBackfill={retryFailedArchiveBackfillItems}
+            onOpenArchiveBackfillJob={openArchiveBackfillHistoryJob}
+            onRetryFailedArchiveBackfillForJob={retryFailedArchiveBackfillItemsForJob}
+            onExportArchiveBackfillSummary={exportArchiveBackfillSummary}
+            onCloseArchiveBackfillDetailsDrawer={closeArchiveBackfillDetailsDrawer}
+            onCopyArchiveBackfillErrors={copyArchiveBackfillErrors}
+            onExportArchiveBackfillDetailsCsv={exportArchiveBackfillDetailsCsv}
+            onOpenArchiveBackfillEmailById={openArchiveBackfillEmailById}
+            onFocusArchiveTrackingTasksByEmailId={focusArchiveTrackingTasksByEmailId}
+            onOpenTrackingTaskFromArchive={openTrackingTaskFromArchive}
+            onMarkArchiveTrackingTaskDone={markArchiveTrackingTaskDone}
+            onAssignArchiveTrackingTask={assignArchiveTrackingTask}
+            onOpenRelatedEmailFromTrackingTask={openRelatedEmailFromTrackingTask}
+            onToggleArchiveTrackingTaskSelection={toggleArchiveTrackingTaskSelection}
+            onToggleAllArchiveTrackingTaskSelections={toggleAllArchiveTrackingTaskSelections}
+            onMarkSelectedArchiveTrackingTasksDone={markSelectedArchiveTrackingTasksDone}
+            onAssignSelectedArchiveTrackingTasks={assignSelectedArchiveTrackingTasks}
+            onExportSelectedArchiveTrackingTasks={exportSelectedArchiveTrackingTasks}
             apiFetch={apiFetch}
           />
         </Suspense>

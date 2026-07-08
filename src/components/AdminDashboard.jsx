@@ -49,22 +49,62 @@ export default function AdminDashboard({
   archiveExplorerFilters,
   setArchiveExplorerFilters,
   archiveExplorerData,
+  archiveExplorerFocusEmailId,
+  setArchiveExplorerFocusEmailId,
+  activeTrackingTaskActionKey,
+  selectedArchiveTrackingTaskIds,
+  bulkArchiveTrackingAssignedTo,
+  setBulkArchiveTrackingAssignedTo,
+  activeBulkTrackingAction,
   isLoadingArchiveExplorer,
   onLoadArchiveExplorer,
   archiveBackfillForm,
   setArchiveBackfillForm,
   archiveBackfillJob,
+  archiveBackfillHistory,
   archiveBackfillSummary,
+  isArchiveBackfillDetailsOpen,
+  archiveBackfillDetailsJob,
+  archiveBackfillDetailsSearch,
+  setArchiveBackfillDetailsSearch,
+  archiveBackfillDetailsFailedOnly,
+  setArchiveBackfillDetailsFailedOnly,
+  isLoadingArchiveBackfillHistory,
   isRunningArchiveBackfill,
   isCancellingArchiveBackfill,
   isRetryingArchiveBackfill,
   onRunArchiveBackfill,
   onCancelArchiveBackfill,
-  onRetryFailedArchiveBackfill
+  onRetryFailedArchiveBackfill,
+  onOpenArchiveBackfillJob,
+  onRetryFailedArchiveBackfillForJob,
+  onExportArchiveBackfillSummary,
+  onCloseArchiveBackfillDetailsDrawer,
+  onCopyArchiveBackfillErrors,
+  onExportArchiveBackfillDetailsCsv,
+  onOpenArchiveBackfillEmailById,
+  onFocusArchiveTrackingTasksByEmailId,
+  onOpenTrackingTaskFromArchive,
+  onMarkArchiveTrackingTaskDone,
+  onAssignArchiveTrackingTask,
+  onOpenRelatedEmailFromTrackingTask,
+  onToggleArchiveTrackingTaskSelection,
+  onToggleAllArchiveTrackingTaskSelections,
+  onMarkSelectedArchiveTrackingTasksDone,
+  onAssignSelectedArchiveTrackingTasks,
+  onExportSelectedArchiveTrackingTasks
 }) {
   const registryRows = archiveExplorerData?.email_registry || [];
   const contentRows = archiveExplorerData?.email_content_archive || [];
-  const trackingRows = archiveExplorerData?.tracking_tasks || [];
+  const allTrackingRows = archiveExplorerData?.tracking_tasks || [];
+  const trackingRows = archiveExplorerFocusEmailId
+    ? allTrackingRows.filter((row) => Number(row.email_id || row.email_db_id) === Number(archiveExplorerFocusEmailId))
+    : allTrackingRows;
+  const assignableEmployees = Array.isArray(employees) ? employees : [];
+  const selectedTrackingTaskSet = new Set((selectedArchiveTrackingTaskIds || []).map((id) => Number(id)));
+  const visibleTrackingTaskIds = trackingRows.map((row) => Number(row.task_id)).filter((id) => Number.isInteger(id) && id > 0);
+  const selectedVisibleTrackingTaskCount = visibleTrackingTaskIds.filter((id) => selectedTrackingTaskSet.has(id)).length;
+  const areAllVisibleTrackingTasksSelected = visibleTrackingTaskIds.length > 0 && selectedVisibleTrackingTaskCount === visibleTrackingTaskIds.length;
 
   function updateArchiveExplorerFilter(key, value) {
     setArchiveExplorerFilters({ ...archiveExplorerFilters, [key]: value });
@@ -118,11 +158,137 @@ export default function AdminDashboard({
   const archiveBackfillPercent = Math.max(0, Math.min(100, Number(archiveBackfillProgress?.percent || 0)));
   const hasFailedItems = Array.isArray(archiveBackfillSummary?.items)
     && archiveBackfillSummary.items.some((item) => item.status === "error");
+  const backfillHistoryRows = Array.isArray(archiveBackfillHistory) ? archiveBackfillHistory : [];
+  const detailRows = Array.isArray(archiveBackfillDetailsJob?.summary?.items)
+    ? archiveBackfillDetailsJob.summary.items.filter((item) => {
+        if (archiveBackfillDetailsFailedOnly && item.status !== "error") {
+          return false;
+        }
+        const normalizedSearch = String(archiveBackfillDetailsSearch || "").trim().toLowerCase();
+        if (!normalizedSearch) {
+          return true;
+        }
+        const haystack = [
+          item.email_id,
+          item.subject,
+          item.status,
+          item.category,
+          item.error
+        ].map((value) => String(value || "").toLowerCase()).join(" ");
+        return haystack.includes(normalizedSearch);
+      })
+    : [];
 
   return (
     <div className="o365-admin">
       {canAccessAdmin ? (
         <>
+          {isArchiveBackfillDetailsOpen && archiveBackfillDetailsJob ? (
+            <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.28)", zIndex: 1500, display: "flex", justifyContent: "flex-end" }}>
+              <div style={{ width: "min(760px, 92vw)", height: "100vh", background: "#fff", boxShadow: "-6px 0 24px rgba(0,0,0,0.15)", display: "flex", flexDirection: "column" }}>
+                <div style={{ padding: "16px 20px", borderBottom: "1px solid #e1e1e1", display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
+                  <div>
+                    <div style={{ fontSize: 18, fontWeight: 700 }}>Job Details</div>
+                    <div style={{ fontSize: 12, color: "#666", marginTop: 4 }}>
+                      {archiveBackfillDetailsJob.job_id} | {archiveBackfillDetailsJob.status} | {formatDateTime(archiveBackfillDetailsJob.created_at)}
+                    </div>
+                  </div>
+                  <button onClick={onCloseArchiveBackfillDetailsDrawer} style={{ fontSize: 12, padding: "6px 12px", background: "#fff", color: "#333", border: "1px solid #ddd", borderRadius: 4, cursor: "pointer" }}>
+                    Close
+                  </button>
+                </div>
+                <div style={{ padding: 20, overflow: "auto", display: "grid", gap: 16 }}>
+                  <div style={{ border: "1px solid #e1e1e1", borderRadius: 8, background: "#fff" }}>
+                    <div style={{ padding: "10px 12px", borderBottom: "1px solid #eee", background: "#f8f9fa", fontSize: 13, fontWeight: 600 }}>
+                      Used Filters
+                    </div>
+                    <div style={{ padding: 12, fontSize: 12, color: "#555", display: "grid", gap: 6 }}>
+                      <div>Limit: {archiveBackfillDetailsJob.options?.limit ?? "-"}</div>
+                      <div>Include Sent: {String(Boolean(archiveBackfillDetailsJob.options?.includeSent || archiveBackfillDetailsJob.options?.include_sent)).toUpperCase()}</div>
+                      <div>Force: {String(Boolean(archiveBackfillDetailsJob.options?.force)).toUpperCase()}</div>
+                      <div>Retry Failed Only: {String(Boolean(archiveBackfillDetailsJob.options?.retry_failed_only)).toUpperCase()}</div>
+                      <div>Source Job: {archiveBackfillDetailsJob.options?.source_job_id || "-"}</div>
+                    </div>
+                  </div>
+
+                  <div style={{ border: "1px solid #e1e1e1", borderRadius: 8, background: "#fff" }}>
+                    <div style={{ padding: "10px 12px", borderBottom: "1px solid #eee", background: "#f8f9fa", fontSize: 13, fontWeight: 600 }}>
+                      Detail Filters
+                    </div>
+                    <div style={{ padding: 12, display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
+                      <div style={{ flex: "1 1 260px" }}>
+                        <label style={{ fontSize: 11, display: "block", color: "#666" }}>Search</label>
+                        <input
+                          value={archiveBackfillDetailsSearch}
+                          onChange={(e) => setArchiveBackfillDetailsSearch(e.target.value)}
+                          placeholder="Search by email id, subject, status, category, or error"
+                          style={{ width: "100%", fontSize: 12 }}
+                        />
+                      </div>
+                      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "#444" }}>
+                        <input
+                          type="checkbox"
+                          checked={Boolean(archiveBackfillDetailsFailedOnly)}
+                          onChange={(e) => setArchiveBackfillDetailsFailedOnly(e.target.checked)}
+                        />
+                        Failed Only
+                      </label>
+                      <button
+                        onClick={() => onCopyArchiveBackfillErrors(archiveBackfillDetailsJob, archiveBackfillDetailsSearch, archiveBackfillDetailsFailedOnly)}
+                        style={{ fontSize: 12, padding: "6px 10px", background: "#fff", color: "#333", border: "1px solid #ddd", borderRadius: 4, cursor: "pointer" }}
+                      >
+                        Copy Errors
+                      </button>
+                      <button
+                        onClick={() => onExportArchiveBackfillDetailsCsv(archiveBackfillDetailsJob, archiveBackfillDetailsSearch, archiveBackfillDetailsFailedOnly)}
+                        style={{ fontSize: 12, padding: "6px 10px", background: "#fff", color: "#333", border: "1px solid #ddd", borderRadius: 4, cursor: "pointer" }}
+                      >
+                        Download CSV
+                      </button>
+                    </div>
+                  </div>
+
+                  <div style={{ border: "1px solid #e1e1e1", borderRadius: 8, background: "#fff" }}>
+                    <div style={{ padding: "10px 12px", borderBottom: "1px solid #eee", background: "#f8f9fa", fontSize: 13, fontWeight: 600 }}>
+                      Detail Rows ({detailRows.length})
+                    </div>
+                    <div style={{ maxHeight: "55vh", overflow: "auto", padding: 12 }}>
+                      {!detailRows.length ? (
+                        <div style={{ fontSize: 12, color: "#666" }}>No rows match the current filters.</div>
+                      ) : detailRows.map((item, index) => (
+                        <div key={`${item.email_id || "row"}-${index}`} style={{ padding: "10px 0", borderBottom: "1px solid #f0f0f0", fontSize: 12 }}>
+                          <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                            <strong>{item.subject || `Email ${item.email_id || "-"}`}</strong>
+                            <span style={{ color: item.status === "error" ? "#d83b01" : "#666" }}>{item.status || "-"}</span>
+                          </div>
+                          <div style={{ color: "#666", marginTop: 4 }}>
+                            Email ID: {item.email_id || "-"} | Category: {item.category || "-"} | Created: {Number(item.created || 0)} | Updated: {Number(item.updated || 0)} | Skipped: {Number(item.skipped || 0)}
+                          </div>
+                          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+                            <button
+                              onClick={() => onOpenArchiveBackfillEmailById(item.email_id)}
+                              disabled={!item.email_id}
+                              style={{ fontSize: 12, padding: "6px 10px", background: "#fff", color: "#333", border: "1px solid #ddd", borderRadius: 4, cursor: item.email_id ? "pointer" : "not-allowed", opacity: item.email_id ? 1 : 0.6 }}
+                            >
+                              Open Email
+                            </button>
+                            <button
+                              onClick={() => onFocusArchiveTrackingTasksByEmailId(item.email_id)}
+                              disabled={!item.email_id}
+                              style={{ fontSize: 12, padding: "6px 10px", background: "#fff", color: "#333", border: "1px solid #ddd", borderRadius: 4, cursor: item.email_id ? "pointer" : "not-allowed", opacity: item.email_id ? 1 : 0.6 }}
+                            >
+                              Go to Tracking Tasks
+                            </button>
+                          </div>
+                          {item.error ? <div style={{ marginTop: 6, color: "#d83b01", whiteSpace: "pre-wrap" }}>{item.error}</div> : null}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : null}
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
             <h2>Admin Dashboard</h2>
             <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
@@ -617,6 +783,55 @@ export default function AdminDashboard({
                       </div>
                     </div>
                   ) : null}
+                  <div style={{ marginTop: 12, border: "1px solid #e1e1e1", borderRadius: 8, background: "#fff" }}>
+                    <div style={{ padding: "10px 12px", borderBottom: "1px solid #eee", background: "#f8f9fa", fontSize: 13, fontWeight: 600 }}>
+                      Job History ({backfillHistoryRows.length})
+                    </div>
+                    <div style={{ maxHeight: 260, overflow: "auto", padding: 12 }}>
+                      {isLoadingArchiveBackfillHistory ? (
+                        <div style={{ fontSize: 12, color: "#666" }}>Loading job history...</div>
+                      ) : !backfillHistoryRows.length ? (
+                        <div style={{ fontSize: 12, color: "#666" }}>No backfill jobs yet.</div>
+                      ) : backfillHistoryRows.map((job) => {
+                        const jobHasFailedItems = Array.isArray(job.summary?.items) && job.summary.items.some((item) => item.status === "error");
+                        const isSelectedJob = archiveBackfillJob?.job_id === job.job_id;
+                        return (
+                          <div key={job.job_id} style={{ padding: "10px 0", borderBottom: "1px solid #f0f0f0", fontSize: 12 }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginBottom: 4 }}>
+                              <strong>{job.job_id}</strong>
+                              <span style={{ color: job.status === "failed" ? "#d83b01" : job.status === "completed" ? "#107c10" : "#666" }}>
+                                {job.status}
+                              </span>
+                            </div>
+                            <div style={{ color: "#666", marginBottom: 6 }}>
+                              {formatDateTime(job.created_at)} | Scanned: {Number(job.summary?.scanned || 0)} | Processed: {Number(job.summary?.processed || 0)} | Errors: {Number(job.summary?.errors || 0)}
+                            </div>
+                            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                              <button
+                                onClick={() => onOpenArchiveBackfillJob(job)}
+                                style={{ fontSize: 12, padding: "6px 10px", background: isSelectedJob ? "var(--c-primary)" : "#fff", color: isSelectedJob ? "#fff" : "#333", border: "1px solid #ddd", borderRadius: 4, cursor: "pointer" }}
+                              >
+                                Open
+                              </button>
+                              <button
+                                onClick={() => onRetryFailedArchiveBackfillForJob(job.job_id)}
+                                disabled={isRunningArchiveBackfill || !jobHasFailedItems}
+                                style={{ fontSize: 12, padding: "6px 10px", background: "#1a73e8", color: "#fff", border: "none", borderRadius: 4, cursor: isRunningArchiveBackfill || !jobHasFailedItems ? "not-allowed" : "pointer", opacity: isRunningArchiveBackfill || !jobHasFailedItems ? 0.6 : 1 }}
+                              >
+                                Retry Failed
+                              </button>
+                              <button
+                                onClick={() => onExportArchiveBackfillSummary(job)}
+                                style={{ fontSize: 12, padding: "6px 10px", background: "#fff", color: "#333", border: "1px solid #ddd", borderRadius: 4, cursor: "pointer" }}
+                              >
+                                Export Summary
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
                 </div>
               </div>
               <div className="o365-settings-section" style={{ marginTop: 16 }}>
@@ -675,6 +890,17 @@ export default function AdminDashboard({
                     <div className="o365-admin-card"><strong>{Number(archiveExplorerData?.totals?.tracking_tasks || 0)}</strong><span>Tracking Tasks</span></div>
                     <div className="o365-admin-card"><strong>{Number(registryRows.length + contentRows.length + trackingRows.length || 0)}</strong><span>Loaded Rows</span></div>
                   </div>
+                  {archiveExplorerFocusEmailId ? (
+                    <div style={{ marginBottom: 12, padding: "10px 12px", border: "1px solid #d0e3ff", background: "#f5f9ff", borderRadius: 8, display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", fontSize: 12 }}>
+                      <span>Focused on tracking tasks for email ID {archiveExplorerFocusEmailId}.</span>
+                      <button
+                        onClick={() => setArchiveExplorerFocusEmailId(null)}
+                        style={{ fontSize: 12, padding: "6px 10px", background: "#fff", color: "#333", border: "1px solid #ddd", borderRadius: 4, cursor: "pointer" }}
+                      >
+                        Clear Focus
+                      </button>
+                    </div>
+                  ) : null}
 
                   <div style={{ display: "grid", gap: 16 }}>
                     <div style={{ border: "1px solid #e1e1e1", borderRadius: 8, overflow: "hidden", background: "#fff" }}>
@@ -729,9 +955,74 @@ export default function AdminDashboard({
                       <div style={{ padding: "10px 12px", borderBottom: "1px solid #eee", background: "#f8f9fa", fontSize: 13, fontWeight: 600 }}>
                         tracking_tasks ({trackingRows.length})
                       </div>
+                      <div style={{ padding: "10px 12px", borderBottom: "1px solid #eee", background: "#fff", display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                        <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "#444" }}>
+                          <input
+                            type="checkbox"
+                            checked={areAllVisibleTrackingTasksSelected}
+                            onChange={(e) => onToggleAllArchiveTrackingTaskSelections(trackingRows, e.target.checked)}
+                            disabled={!trackingRows.length || Boolean(activeTrackingTaskActionKey) || Boolean(activeBulkTrackingAction)}
+                          />
+                          Select All Visible
+                        </label>
+                        <span style={{ fontSize: 12, color: "#666" }}>
+                          Selected: {selectedVisibleTrackingTaskCount} / {trackingRows.length}
+                        </span>
+                        <button
+                          onClick={onMarkSelectedArchiveTrackingTasksDone}
+                          disabled={!selectedTrackingTaskSet.size || Boolean(activeTrackingTaskActionKey) || Boolean(activeBulkTrackingAction)}
+                          style={{ fontSize: 12, padding: "6px 10px", background: "#107c10", color: "#fff", border: "none", borderRadius: 4, cursor: !selectedTrackingTaskSet.size || activeTrackingTaskActionKey || activeBulkTrackingAction ? "not-allowed" : "pointer", opacity: !selectedTrackingTaskSet.size || activeTrackingTaskActionKey || activeBulkTrackingAction ? 0.6 : 1 }}
+                        >
+                          {activeBulkTrackingAction === "done" ? "Saving..." : "Mark Selected Done"}
+                        </button>
+                        <select
+                          value={bulkArchiveTrackingAssignedTo}
+                          onChange={(e) => setBulkArchiveTrackingAssignedTo(e.target.value)}
+                          disabled={Boolean(activeTrackingTaskActionKey) || Boolean(activeBulkTrackingAction)}
+                          style={{ minWidth: 180, fontSize: 12, padding: "6px 8px", border: "1px solid #d1d1d1", borderRadius: 4, background: "#fff", cursor: activeTrackingTaskActionKey || activeBulkTrackingAction ? "not-allowed" : "pointer", opacity: activeTrackingTaskActionKey || activeBulkTrackingAction ? 0.6 : 1 }}
+                        >
+                          <option value="">{activeBulkTrackingAction === "assign" ? "Assigning..." : "Assign Selected"}</option>
+                          {assignableEmployees.map((employee) => (
+                            <option key={employee.id} value={employee.id}>
+                              {employee.name || employee.email}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          onClick={onAssignSelectedArchiveTrackingTasks}
+                          disabled={!selectedTrackingTaskSet.size || Boolean(activeTrackingTaskActionKey) || Boolean(activeBulkTrackingAction)}
+                          style={{ fontSize: 12, padding: "6px 10px", background: "#1a73e8", color: "#fff", border: "none", borderRadius: 4, cursor: !selectedTrackingTaskSet.size || activeTrackingTaskActionKey || activeBulkTrackingAction ? "not-allowed" : "pointer", opacity: !selectedTrackingTaskSet.size || activeTrackingTaskActionKey || activeBulkTrackingAction ? 0.6 : 1 }}
+                        >
+                          Apply Assign
+                        </button>
+                        <button
+                          onClick={onExportSelectedArchiveTrackingTasks}
+                          disabled={!selectedTrackingTaskSet.size || Boolean(activeTrackingTaskActionKey) || Boolean(activeBulkTrackingAction)}
+                          style={{ fontSize: 12, padding: "6px 10px", background: "#fff", color: "#333", border: "1px solid #ddd", borderRadius: 4, cursor: !selectedTrackingTaskSet.size || activeTrackingTaskActionKey || activeBulkTrackingAction ? "not-allowed" : "pointer", opacity: !selectedTrackingTaskSet.size || activeTrackingTaskActionKey || activeBulkTrackingAction ? 0.6 : 1 }}
+                        >
+                          Export Selected
+                        </button>
+                      </div>
                       <div style={{ maxHeight: 320, overflow: "auto" }}>
                         {!trackingRows.length ? <div style={{ padding: 12, fontSize: 12, color: "#666" }}>No tracking tasks found.</div> : trackingRows.map((row) => (
                           <div key={row.task_id} style={{ padding: 12, borderBottom: "1px solid #f0f0f0", fontSize: 12 }}>
+                            {(() => {
+                              const hasExistingTask = Number(row.existing_task_id) > 0;
+                              const isOpeningTask = activeTrackingTaskActionKey === `open:${row.existing_task_id}`;
+                              const isMarkingDone = activeTrackingTaskActionKey === `done:${row.existing_task_id}`;
+                              const isAssigningTask = activeTrackingTaskActionKey === `assign:${row.existing_task_id}`;
+                              const isSelected = selectedTrackingTaskSet.has(Number(row.task_id));
+                              return (
+                                <>
+                            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                              <input
+                                type="checkbox"
+                                checked={isSelected}
+                                onChange={(e) => onToggleArchiveTrackingTaskSelection(row.task_id, e.target.checked)}
+                                disabled={Boolean(activeTrackingTaskActionKey) || Boolean(activeBulkTrackingAction)}
+                              />
+                              <span style={{ fontSize: 11, color: "#666" }}>Select</span>
+                            </div>
                             <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginBottom: 4 }}>
                               <strong>{row.source_task_title || row.email_subject || `Task ${row.task_id}`}</strong>
                               <span style={{ color: "#666" }}>{formatDateTime(row.updated_at)}</span>
@@ -745,8 +1036,47 @@ export default function AdminDashboard({
                             <div style={{ color: "#888", marginTop: 4 }}>
                               Assigned to: {row.assigned_to_name || "-"} | Alerts: {Number(row.alert_count || 0)} | AI tasks: {getAiTaskCount(row.ai_tasks)}
                             </div>
+                            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginTop: 8 }}>
+                              <button
+                                onClick={() => onOpenTrackingTaskFromArchive(row)}
+                                disabled={!hasExistingTask || Boolean(activeTrackingTaskActionKey)}
+                                style={{ fontSize: 12, padding: "6px 10px", background: "#fff", color: "#333", border: "1px solid #ddd", borderRadius: 4, cursor: !hasExistingTask || activeTrackingTaskActionKey ? "not-allowed" : "pointer", opacity: !hasExistingTask || activeTrackingTaskActionKey ? 0.6 : 1 }}
+                              >
+                                {isOpeningTask ? "Opening..." : "Open Task"}
+                              </button>
+                              <button
+                                onClick={() => onMarkArchiveTrackingTaskDone(row)}
+                                disabled={!hasExistingTask || Boolean(activeTrackingTaskActionKey) || String(row.status || "").toLowerCase() === "completed"}
+                                style={{ fontSize: 12, padding: "6px 10px", background: "#107c10", color: "#fff", border: "none", borderRadius: 4, cursor: !hasExistingTask || activeTrackingTaskActionKey || String(row.status || "").toLowerCase() === "completed" ? "not-allowed" : "pointer", opacity: !hasExistingTask || activeTrackingTaskActionKey || String(row.status || "").toLowerCase() === "completed" ? 0.6 : 1 }}
+                              >
+                                {isMarkingDone ? "Saving..." : "Mark Done"}
+                              </button>
+                              <select
+                                value={row.assigned_to ?? ""}
+                                onChange={(e) => onAssignArchiveTrackingTask(row, e.target.value)}
+                                disabled={!hasExistingTask || Boolean(activeTrackingTaskActionKey)}
+                                style={{ minWidth: 180, fontSize: 12, padding: "6px 8px", border: "1px solid #d1d1d1", borderRadius: 4, background: "#fff", cursor: !hasExistingTask || activeTrackingTaskActionKey ? "not-allowed" : "pointer", opacity: !hasExistingTask || activeTrackingTaskActionKey ? 0.6 : 1 }}
+                              >
+                                <option value="">{isAssigningTask ? "Assigning..." : "Assign To"}</option>
+                                {assignableEmployees.map((employee) => (
+                                  <option key={employee.id} value={employee.id}>
+                                    {employee.name || employee.email}
+                                  </option>
+                                ))}
+                              </select>
+                              <button
+                                onClick={() => onOpenRelatedEmailFromTrackingTask(row)}
+                                disabled={!row.email_id}
+                                style={{ fontSize: 12, padding: "6px 10px", background: "#fff", color: "#333", border: "1px solid #ddd", borderRadius: 4, cursor: row.email_id ? "pointer" : "not-allowed", opacity: row.email_id ? 1 : 0.6 }}
+                              >
+                                Open Related Email
+                              </button>
+                            </div>
                             {row.source_task_description ? <div style={{ marginTop: 6, color: "#444" }}>{row.source_task_description}</div> : null}
                             {row.ai_summary ? <div style={{ marginTop: 6, padding: "6px 8px", background: "#fafafa", borderRadius: 4, color: "#444" }}>{row.ai_summary}</div> : null}
+                                </>
+                              );
+                            })()}
                           </div>
                         ))}
                       </div>

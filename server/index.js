@@ -1749,13 +1749,16 @@ app.get("/api/health", (_req, res) => {
   });
 });
 
-// Serve built frontend
+// Serve built frontend (production only — in dev mode use Vite at port 5173)
+const isProduction = process.env.NODE_ENV === "production" || process.env.SERVE_DIST === "true";
+if (isProduction) {
 const distDir = path.resolve(process.cwd(), "dist");
 if (fs.existsSync(distDir)) {
   const distAssetsDir = path.join(distDir, "assets");
   if (fs.existsSync(distAssetsDir)) {
     app.use("/assets", express.static(distAssetsDir, {
-      maxAge: "1h"
+      immutable: true,
+      maxAge: "1y"
     }));
   }
   app.use(express.static(distDir, {
@@ -1778,6 +1781,7 @@ if (fs.existsSync(distDir)) {
     res.sendFile(path.join(distDir, "index.html"));
   });
 }
+} // end isProduction
 
 app.use((_req, res) => {
   return res.status(404).json({ error: "Not found" });

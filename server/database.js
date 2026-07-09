@@ -1361,6 +1361,30 @@ async function runSchema() {
 
   try {
     await query(`
+      CREATE TABLE IF NOT EXISTS attachment_analysis (
+        id SERIAL PRIMARY KEY,
+        email_id INTEGER REFERENCES emails(id) ON DELETE CASCADE,
+        file_name TEXT NOT NULL,
+        document_type TEXT DEFAULT 'other',
+        document_type_ar TEXT DEFAULT 'مستند أخرى',
+        summary TEXT DEFAULT '',
+        key_entities JSONB DEFAULT '{}',
+        extracted_data JSONB DEFAULT '{}',
+        requires_action BOOLEAN DEFAULT FALSE,
+        action_description TEXT DEFAULT '',
+        urgency TEXT DEFAULT 'low',
+        confidence TEXT DEFAULT 'medium',
+        language TEXT DEFAULT 'en',
+        pages_estimate INTEGER DEFAULT 1,
+        provider TEXT DEFAULT 'rules',
+        analyzed_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await query(`CREATE INDEX IF NOT EXISTS idx_attachment_analysis_email ON attachment_analysis(email_id)`);
+  } catch (e) { /* attachment_analysis table optional */ }
+
+  try {
+    await query(`
       CREATE TABLE IF NOT EXISTS email_threads (
         id SERIAL PRIMARY KEY,
         thread_id TEXT NOT NULL,

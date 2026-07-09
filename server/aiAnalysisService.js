@@ -1,3 +1,6 @@
+import fs from "fs";
+import path from "path";
+
 function normalizeRiskLevel(level = "") {
   const normalized = String(level || "").trim().toLowerCase();
   if (["low", "medium", "high", "critical"].includes(normalized)) {
@@ -1976,5 +1979,288 @@ export {
   extractStructuredContractClauses,
   generateReplyDraftWithHistory,
   generateResponsePolicyGuard,
-  extractTextWithVisionOcr
+  extractTextWithVisionOcr,
+  analyzeAttachment,
+  analyzeEmailWithAttachments
 };
+
+// ============================================================
+// ATTACHMENT ANALYSIS MODULE
+// ============================================================
+
+function buildAttachmentAnalysisPrompt({ attachmentName, mimeType, extractedText, emailSubject = "", emailBody = "" }) {
+  return [
+    "You are a document analysis engine for a business email system.",
+    "Analyze the following attachment and extract structured information.",
+    "Return strict JSON only.",
+    "JSON schema:",
+    "{",
+    '  "document_type": "contract|invoice|quotation|report|letter|form|certificate|specification|other",',
+    '  "document_type_ar": "contract Arabic name or document type in Arabic",',
+    '  "summary": "brief summary of the document in Arabic (2-3 sentences)",',
+    '  "key_entities": {',
+    '    "amounts": ["any monetary amounts found"],',
+    '    "dates": ["any dates found"],',
+    '    "companies": ["company names mentioned"],',
+    '    "persons": ["person names mentioned"],',
+    '    "reference_numbers": ["any reference or serial numbers"]',
+    "  },",
+    '  "extracted_data": {',
+    '    "project_name": "if a project is mentioned",',
+    '    "project_code": "if a project code is mentioned",',
+    '    "total_amount": "the main monetary amount if any",',
+    '    "currency": "currency of the amount",',
+    '    "deadline": "any deadline or due date mentioned",',
+    '    "status": "status of the document if mentioned"',
+    "  },",
+    '  "requires_action": true/false,',
+    '  "action_description": "what action is needed if any",',
+    '  "urgency": "low|medium|high|critical",',
+    '  "confidence": "high|medium|low",',
+    '  "language": "ar|en|mixed",',
+    '  "pages_estimate": 1',
+    "}",
+    "Rules:",
+    "- Extract only information clearly present in the document.",
+    "- Use Arabic for summaries and document_type_ar.",
+    "- If an amount is found, normalize it (remove commas, specify currency).",
+    "- If no project is mentioned, leave project fields empty.",
+    "- Be precise with dates (format: YYYY-MM-DD).",
+    "",
+    `Attachment: ${attachmentName}`,
+    `MIME type: ${mimeType}`,
+    emailSubject ? `Email subject: ${emailSubject}` : "",
+    emailBody ? `Email context (first 500 chars): ${emailBody.substring(0, 500)}` : "",
+    "",
+    "Document content:",
+    extractedText.substring(0, 8000) || "(No text could be extracted)"
+  ].filter(Boolean).join("\n");
+}
+
+function buildAttachmentRulesFallback({ attachmentName, mimeType, extractedText }) {
+  const text = String(extractedText || "").toLowerCase();
+  const name = String(attachmentName || "").toLowerCase();
+
+  let documentType = "other";
+  if (/(contract|عقد|اتفاقية|contract)/i.test(text + name)) documentType = "contract";
+  else if (/(invoice|فاتورة|فواتير|bill)/i.test(text + name)) documentType = "invoice";
+  else if (/(quotation|عرض سعر|تقديم عرض|quote)/i.test(text + name)) documentType = "quotation";
+  else if (/(report|تقرير|relief)/i.test(text + name)) documentType = "report";
+  else if (/(certificate|شهادة|証明)/i.test(text + name)) documentType = "certificate";
+  else if (/(specification|مواصفات|datasheet)/i.test(text + name)) documentType = "specification";
+
+  const amounts = [];
+  const amountRegex = /(\d[\d,]*\.?\d*)\s*(USD|EUR|SAR|AED|EGP|LE|جنيه|دولار|يورو|درهم|ريال|\$|€)/gi;
+  let match;
+  while ((match = amountRegex.exec(text)) !== null) {
+    amounts.push(match[0].trim());
+  }
+
+  const dates = [];
+  const dateRegex = /(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})|(\d{4}[\/\-]\d{1,2}[\/\-]\d{1,2})/g;
+  while ((match = dateRegex.exec(text)) !== null) {
+    dates.push(match[0]);
+  }
+
+  const companies = [];
+  const companyRegex = /(company|شركة|مؤسسة|corporation|ltd|co\.)/gi;
+  while ((match = companyRegex.exec(text)) !== null) {
+    const start = Math.max(0, match.index - 30);
+    const end = Math.min(text.length, match.index + match[0].length + 30);
+    companies.push(text.substring(start, end).trim());
+  }
+
+  const projectMatch = text.match(/project[:\s]+([^\n,.]{3,50})/i) || text.match(/مشروع[:\s]+([^\n,.]{3,50})/);
+
+  const requiresAction = /(يجب|يُطلب|required|action|due|deadline|urgently|عاجل)/i.test(text);
+
+  return {
+    document_type: documentType,
+    document_type_ar: {
+      contract: "عقد", invoice: "فاتورة", quotation: "عرض سعر",
+      report: "تقرير", certificate: "شهادة", specification: "مواصفات", other: "مستند أخرى"
+    }[documentType] || "مستند أخرى",
+    summary: extractedText ? extractedText.substring(0, 200).trim() + "..." : "لم يتم استخراج نص",
+    key_entities: { amounts, dates, companies: companies.slice(0, 5), persons: [], reference_numbers: [] },
+    extracted_data: {
+      project_name: projectMatch?.[1]?.trim() || "",
+      project_code: "",
+      total_amount: amounts[0] || "",
+      currency: amounts[0]?.match(/(USD|EUR|SAR|AED|EGP|LE|\$|€)/i)?.[0] || "",
+      deadline: dates[0] || "",
+      status: ""
+    },
+    requires_action: requiresAction,
+    action_description: requiresAction ? "يتطلب مراجعة" : "",
+    urgency: amounts.length > 0 ? "medium" : "low",
+    confidence: "medium",
+    language: /[\u0600-\u06FF]/.test(text) ? "ar" : "en",
+    pages_estimate: 1,
+    provider: "rules"
+  };
+}
+
+function normalizeAttachmentAnalysisPayload(payload = {}, fallback = {}) {
+  const keyEntities = payload.key_entities || fallback.key_entities || {};
+  const extractedData = payload.extracted_data || fallback.extracted_data || {};
+  return {
+    document_type: String(payload.document_type || fallback.document_type || "other").trim(),
+    document_type_ar: String(payload.document_type_ar || fallback.document_type_ar || "مستند أخرى").trim(),
+    summary: String(payload.summary || fallback.summary || "").trim(),
+    key_entities: {
+      amounts: Array.isArray(keyEntities.amounts) ? keyEntities.amounts : [],
+      dates: Array.isArray(keyEntities.dates) ? keyEntities.dates : [],
+      companies: Array.isArray(keyEntities.companies) ? keyEntities.companies : [],
+      persons: Array.isArray(keyEntities.persons) ? keyEntities.persons : [],
+      reference_numbers: Array.isArray(keyEntities.reference_numbers) ? keyEntities.reference_numbers : []
+    },
+    extracted_data: {
+      project_name: String(extractedData.project_name || "").trim(),
+      project_code: String(extractedData.project_code || "").trim(),
+      total_amount: String(extractedData.total_amount || "").trim(),
+      currency: String(extractedData.currency || "").trim(),
+      deadline: String(extractedData.deadline || "").trim(),
+      status: String(extractedData.status || "").trim()
+    },
+    requires_action: Boolean(payload.requires_action ?? fallback.requires_action ?? false),
+    action_description: String(payload.action_description || fallback.action_description || "").trim(),
+    urgency: String(payload.urgency || fallback.urgency || "low").trim(),
+    confidence: String(payload.confidence || fallback.confidence || "medium").trim(),
+    language: String(payload.language || fallback.language || "en").trim(),
+    pages_estimate: Number(payload.pages_estimate || fallback.pages_estimate || 1),
+    provider: String(payload.provider || fallback.provider || "rules").trim()
+  };
+}
+
+async function callOpenAiForAttachment(prompt) {
+  const config = getOpenAiConfig();
+  if (!config) throw new Error("OpenAI not configured");
+
+  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${config.apiKey}`
+    },
+    body: JSON.stringify({
+      model: config.model || "gpt-4o-mini",
+      messages: [
+        { role: "system", content: "You are a document analysis engine. Return JSON only, no markdown." },
+        { role: "user", content: prompt }
+      ],
+      temperature: 0.1,
+      max_tokens: 2000
+    })
+  });
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`OpenAI API error: ${err}`);
+  }
+
+  const data = await response.json();
+  const content = data.choices?.[0]?.message?.content || "";
+  return { ...parseLlmJson(content), provider: "openai" };
+}
+
+async function callGeminiForAttachment(prompt) {
+  const config = getGeminiConfig();
+  if (!config) throw new Error("Gemini not configured");
+
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${config.model || "gemini-2.0-flash"}:generateContent?key=${config.apiKey}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.1, maxOutputTokens: 2000 }
+      })
+    }
+  );
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Gemini API error: ${err}`);
+  }
+
+  const data = await response.json();
+  const text = data.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("\n") || "";
+  return { ...parseLlmJson(text), provider: "gemini" };
+}
+
+async function analyzeAttachment({ filePath, attachmentName, mimeType, emailSubject, emailBody }) {
+  const openAiConfig = getOpenAiConfig();
+  const geminiConfig = getGeminiConfig();
+
+  let extractedText = "";
+  try {
+    const ext = require("path").extname(attachmentName || "").toLowerCase();
+    if (ext === ".pdf") {
+      const PDFParse = (await import("pdf-parse")).default;
+      const buffer = await fs.promises.readFile(filePath);
+      const parser = new PDFParse({ data: buffer });
+      const result = await parser.getText();
+      extractedText = result?.text || "";
+      try { await parser.destroy(); } catch {}
+    } else if (ext === ".docx") {
+      const mammoth = await import("mammoth");
+      const result = await mammoth.extractRawText({ path: filePath });
+      extractedText = result?.value || "";
+    } else if ([".txt", ".csv", ".json", ".xml", ".html"].includes(ext)) {
+      extractedText = await fs.promises.readFile(filePath, "utf8");
+    } else if ([".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff"].includes(ext)) {
+      try {
+        const { createWorker } = await import("tesseract.js");
+        const worker = await createWorker("eng+ara");
+        const result = await worker.recognize(filePath);
+        extractedText = result?.data?.text || "";
+        await worker.terminate();
+      } catch { extractedText = ""; }
+    }
+  } catch { extractedText = ""; }
+
+  const fallback = buildAttachmentRulesFallback({ attachmentName, mimeType, extractedText });
+
+  if (!openAiConfig && !geminiConfig) {
+    return normalizeAttachmentAnalysisPayload(fallback, fallback);
+  }
+
+  try {
+    const prompt = buildAttachmentAnalysisPrompt({ attachmentName, mimeType, extractedText, emailSubject, emailBody });
+    const payload = openAiConfig
+      ? await callOpenAiForAttachment(prompt)
+      : await callGeminiForAttachment(prompt);
+    return normalizeAttachmentAnalysisPayload(payload, fallback);
+  } catch (error) {
+    console.error("[ATTACHMENT-AI] LLM analysis failed, using rules fallback:", error.message);
+    return normalizeAttachmentAnalysisPayload(fallback, fallback);
+  }
+}
+
+async function analyzeEmailWithAttachments(emailId, attachments = [], emailSubject = "", emailBody = "") {
+  const results = [];
+  for (const attachment of attachments) {
+    const filePath = attachment.file_path || attachment.path || "";
+    if (!filePath) continue;
+
+    try {
+      const analysis = await analyzeAttachment({
+        filePath,
+        attachmentName: attachment.file_name || attachment.originalname || "unknown",
+        mimeType: attachment.mime_type || "application/octet-stream",
+        emailSubject,
+        emailBody
+      });
+
+      results.push({
+        email_id: emailId,
+        file_name: attachment.file_name || attachment.originalname || "unknown",
+        ...analysis
+      });
+    } catch (error) {
+      console.error(`[ATTACHMENT-AI] Failed to analyze ${attachment.file_name}:`, error.message);
+    }
+  }
+  return results;
+}

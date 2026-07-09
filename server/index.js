@@ -135,7 +135,7 @@ import {
   parseTelegramApprovalUpdate,
   answerTelegramCallback
 } from "./telegramApprovalBot.js";
-import { analyzeInboundTaskExtractionWithLlm, analyzeEmailBrain, generateReplyDraftWithHistory, generateResponsePolicyGuard } from "./aiAnalysisService.js";
+import { analyzeInboundTaskExtractionWithLlm, analyzeEmailBrain, generateReplyDraftWithHistory, generateResponsePolicyGuard, analyzeAttachment, analyzeEmailWithAttachments } from "./aiAnalysisService.js";
 import {
   ensureNotificationsTable,
   getNotifications,
@@ -1530,6 +1530,48 @@ app.get("/api/ai/brain/:emailId", authenticateRequest, async (req, res) => {
     if (!analysis) return res.status(404).json({ error: "No brain analysis found" });
 
     return res.json({ analysis });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/ai/analyze-attachment", authenticateRequest, async (req, res) => {
+  try {
+    const { email_id, attachment_id } = req.body;
+    if (!email_id) return res.status(400).json({ error: "email_id required" });
+
+    const email = await getEmailById(email_id);
+    if (!email) return res.status(404).json({ error: "Email not found" });
+
+    const attachments = await getEmailAttachments(email_id);
+    const targetAttachments = attachment_id
+      ? attachments.filter(a => a.id === attachment_id)
+      : attachments;
+
+    if (targetAttachments.length === 0) return res.status(404).json({ error: "No attachments found" });
+
+    const body = (email.body || "").replace(/<[^>]+>/g, " ").trim().substring(0, 2000);
+    const results = await analyzeEmailWithAttachments(email_id, targetAttachments, email.subject, body);
+
+    return res.json({ results, count: results.length });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/ai/attachment-analysis/:emailId", authenticateRequest, async (req, res) => {
+  try {
+    const emailId = Number(req.params.emailId);
+    if (!emailId) return res.status(400).json({ error: "Invalid email ID" });
+
+    const attachments = await getEmailAttachments(emailId);
+    if (attachments.length === 0) return res.json({ results: [] });
+
+    const email = await getEmailById(emailId);
+    const body = (email?.body || "").replace(/<[^>]+>/g, " ").trim().substring(0, 2000);
+    const results = await analyzeEmailWithAttachments(emailId, attachments, email?.subject, body);
+
+    return res.json({ results, count: results.length });
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }

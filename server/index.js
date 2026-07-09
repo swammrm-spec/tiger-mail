@@ -733,6 +733,7 @@ app.get("/api/bootstrap", authenticateRequest, async (req, res) => {
   try { payload.projects = await getProjects(); } catch (e) { payload.projects = []; }
   try { payload.unclassifiedCount = await getUnclassifiedCount(); } catch (e) { payload.unclassifiedCount = 0; }
   try { payload.taskStats = await getTaskStats(req.user?.id); } catch (e) { payload.taskStats = {}; }
+  try { payload.tasks = await getTasks({}); } catch (e) { payload.tasks = []; }
   return res.json(payload);
 });
 

@@ -3732,3 +3732,255 @@ input:focus, select:focus, textarea:focus {
   transition: background 0.15s;
 }
 .btn-secondary:hover { background: #f5f5f5; }
+
+/* ===== REMINDER POPUP (Outlook-style) ===== */
+.reminder-popup {
+  position: fixed;
+  width: 400px;
+  background: #1e1e1e;
+  border-radius: 8px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+  z-index: 99999;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid #333;
+  animation: reminderSlideIn 0.3s ease;
+  user-select: none;
+}
+
+.reminder-popup.minimized {
+  width: 300px;
+}
+
+@keyframes reminderSlideIn {
+  from { opacity: 0; transform: translateY(-20px) scale(0.95); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.reminder-titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  background: #2d2d2d;
+  cursor: move;
+  border-bottom: 1px solid #444;
+}
+
+.reminder-titlebar-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.reminder-titlebar-left svg { color: #ffc107; }
+
+.reminder-titlebar-right {
+  display: flex;
+  gap: 2px;
+}
+
+.reminder-titlebar-btn {
+  width: 28px;
+  height: 24px;
+  border: none;
+  background: transparent;
+  color: #aaa;
+  cursor: pointer;
+  border-radius: 4px;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s;
+}
+.reminder-titlebar-btn:hover { background: #444; color: #fff; }
+.reminder-titlebar-btn.close:hover { background: #c62828; color: #fff; }
+
+.reminder-preview {
+  display: flex;
+  gap: 14px;
+  padding: 16px;
+  background: #252525;
+  border-bottom: 1px solid #333;
+}
+
+.reminder-preview-icon {
+  width: 44px;
+  height: 44px;
+  border-radius: 10px;
+  background: #333;
+  color: #ffc107;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.reminder-preview-content { flex: 1; min-width: 0; }
+
+.reminder-preview-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #fff;
+  margin-bottom: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.reminder-preview-time {
+  font-size: 12px;
+  color: #aaa;
+  margin-bottom: 2px;
+}
+
+.reminder-preview-location {
+  font-size: 11px;
+  color: #4fc3f7;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.reminder-preview-project {
+  font-size: 11px;
+  color: #81c784;
+  margin-top: 2px;
+}
+
+.reminder-list {
+  max-height: 240px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.reminder-list::-webkit-scrollbar { width: 6px; }
+.reminder-list::-webkit-scrollbar-track { background: #1e1e1e; }
+.reminder-list::-webkit-scrollbar-thumb { background: #555; border-radius: 3px; }
+
+.reminder-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  cursor: pointer;
+  transition: background 0.1s;
+  border-bottom: 1px solid #2a2a2a;
+}
+
+.reminder-item:hover { background: #2a2a2a; }
+.reminder-item.selected { background: #0d47a1; }
+.reminder-item.selected .reminder-item-title { color: #fff; }
+.reminder-item.overdue { background: #3e1a1a; }
+.reminder-item.overdue.selected { background: #b71c1c; }
+
+.reminder-item-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background: #333;
+  color: #ffc107;
+}
+.reminder-item.overdue .reminder-item-icon { background: #5c1a1a; color: #ef5350; }
+
+.reminder-item-content { flex: 1; min-width: 0; }
+
+.reminder-item-title {
+  font-size: 12px;
+  color: #ddd;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.reminder-item-time {
+  font-size: 11px;
+  color: #888;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.reminder-item-time.overdue { color: #ef5350; font-weight: 600; }
+
+.reminder-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  background: #252525;
+  border-top: 1px solid #333;
+  gap: 10px;
+}
+
+.reminder-footer-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.reminder-hint {
+  font-size: 11px;
+  color: #888;
+  white-space: nowrap;
+}
+
+.reminder-snooze-group {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.reminder-snooze-select select {
+  padding: 5px 8px;
+  background: #333;
+  color: #ddd;
+  border: 1px solid #555;
+  border-radius: 4px;
+  font-size: 11px;
+  cursor: pointer;
+  outline: none;
+}
+.reminder-snooze-select select:focus { border-color: #ffc107; }
+
+.reminder-footer-right {
+  display: flex;
+  gap: 6px;
+}
+
+.reminder-btn {
+  padding: 6px 14px;
+  border: none;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+
+.reminder-btn.snooze {
+  background: #ffc107;
+  color: #1e1e1e;
+}
+.reminder-btn.snooze:hover { background: #ffca28; }
+
+.reminder-btn.dismiss {
+  background: #444;
+  color: #ddd;
+}
+.reminder-btn.dismiss:hover { background: #555; }
+
+.reminder-btn.dismiss-all {
+  background: #c62828;
+  color: #fff;
+}
+.reminder-btn.dismiss-all:hover { background: #d32f2f; }

@@ -19,6 +19,7 @@ const MailComposeView = lazy(() => import("./components/MailComposeView"));
 const MailReaderPane = lazy(() => import("./components/MailReaderPane"));
 const NotificationPanel = lazy(() => import("./components/NotificationPanel"));
 const TaskDashboard = lazy(() => import("./components/TaskDashboard"));
+const ReminderPopup = lazy(() => import("./components/ReminderPopup"));
 
 const savedFiltersStorageKey = "emailarray_saved_filters";
 const lastUserStorageKey = "emailarray_last_user";
@@ -746,6 +747,9 @@ function App() {
   const [taskStats, setTaskStats] = useState({});
   const [activeAccountId, setActiveAccountId] = useState(null);
   const [showAccountSwitcher, setShowAccountSwitcher] = useState(false);
+  const [snoozedReminders, setSnoozedReminders] = useState({});
+  const [dismissedReminders, setDismissedReminders] = useState({});
+  const [showReminderPopup, setShowReminderPopup] = useState(false);
   const [showAddAccountForm, setShowAddAccountForm] = useState(false);
   const [newAccountForm, setNewAccountForm] = useState({
     email_address: "",
@@ -2807,6 +2811,30 @@ function App() {
   }, [currentView]);
   useEffect(() => { if (currentView === "settings" && token) loadMailServiceStatus(); }, [currentView, token]);
   useEffect(() => { if (currentView === "settings" && token && (currentUser || lastKnownUser)) loadDeviceCacheInfo(currentUser || lastKnownUser); }, [currentView, token, currentUser, lastKnownUser, data.emails.length, data.attachments.length, data.folders.length]);
+
+  // Reminder popup check - checks every 30 seconds for upcoming events/tasks
+  useEffect(() => {
+    if (!token) return;
+    const checkReminders = () => {
+      const now = new Date();
+      const hasUpcoming = (data.calendar || []).some(evt => {
+        if (!evt.start) return false;
+        const diff = (new Date(evt.start).getTime() - now.getTime()) / 60000;
+        return diff <= 15 && diff >= -1440;
+      });
+      const hasOverdueTasks = (data.tasks || []).some(t => {
+        if (!t.due_date || t.status === "completed") return false;
+        const diff = (new Date(t.due_date).getTime() - now.getTime()) / 60000;
+        return diff <= 15 && diff >= -1440 * 7;
+      });
+      if (hasUpcoming || hasOverdueTasks) {
+        setShowReminderPopup(true);
+      }
+    };
+    checkReminders();
+    const interval = setInterval(checkReminders, 30000);
+    return () => clearInterval(interval);
+  }, [token, data.calendar, data.tasks]);
 
   // Auto-refresh emails every 60 seconds + browser notification for new emails
   useEffect(() => {
@@ -5270,6 +5298,30 @@ function App() {
           </div>
         </div>
       ) : null}
+
+      {/* Reminder Popup */}
+      {showReminderPopup && token && (
+        <Suspense fallback={null}>
+          <ReminderPopup
+            calendarEvents={data.calendar || []}
+            tasks={data.tasks || []}
+            onDismiss={(id) => {
+              setDismissedReminders(prev => ({ ...prev, [id]: Date.now() }));
+            }}
+            onSnooze={(id, minutes) => {
+              setSnoozedReminders(prev => ({ ...prev, [id]: Date.now() + minutes * 60000 }));
+            }}
+            onOpenEvent={(evt) => {
+              setShowReminderPopup(false);
+              setCurrentView("calendar");
+            }}
+            onOpenTask={(task) => {
+              setShowReminderPopup(false);
+              setCurrentView("tasks");
+            }}
+          />
+        </Suspense>
+      )}
     </div>
   );
 }

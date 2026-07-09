@@ -11,6 +11,7 @@
 - [seed-production-minimum.sql](file:///d:/Emailarray/Outlook/deployment/seed-production-minimum.sql)
 - [backup-postgres.ps1](file:///d:/Emailarray/Outlook/deployment/backup-postgres.ps1)
 - [restore-postgres.ps1](file:///d:/Emailarray/Outlook/deployment/restore-postgres.ps1)
+- [production-cutover-runbook.md](file:///d:/Emailarray/Outlook/deployment/production-cutover-runbook.md)
 
 ## ترتيب التنفيذ
 

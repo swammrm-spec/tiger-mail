@@ -50,21 +50,34 @@ export async function createNotification(userId, { type, category, title, messag
 }
 
 export async function getNotifications(userId, { limit = 50, unreadOnly = false, category } = {}) {
-  let where = "WHERE n.user_id = $1";
+  let where = "WHERE user_id = $1";
   const params = [userId];
   let idx = 2;
-  if (unreadOnly) { where += ` AND n.read = FALSE`; }
-  if (category) { where += ` AND n.category = $${idx}`; params.push(category); idx++; }
-  where += ` ORDER BY n.created_at DESC LIMIT $${idx}`;
+  if (unreadOnly) { where += ` AND read = FALSE`; }
+  if (category) { where += ` AND category = $${idx}`; params.push(category); idx++; }
+  where += ` ORDER BY created_at DESC LIMIT $${idx}`;
   params.push(limit);
   const result = await query(
-    `SELECT n.*, e.subject AS email_subject, t.title AS task_title, p.project_code
-     FROM notifications n
-     LEFT JOIN emails e ON e.id = n.email_id
-     LEFT JOIN tasks t ON t.id = n.task_id
-     LEFT JOIN projects p ON p.id = n.project_id
-     ${where}`, params
+    `SELECT * FROM notifications ${where}`, params
   );
+  const rows = result.rows;
+  const emailIds = [...new Set(rows.map(n => n.email_id).filter(Boolean))];
+  const taskIds = [...new Set(rows.map(n => n.task_id).filter(Boolean))];
+  const projectIds = [...new Set(rows.map(n => n.project_id).filter(Boolean))];
+  const [allEmails, allTasks, allProjects] = await Promise.all([
+    emailIds.length ? query(`SELECT id, subject FROM emails`) : Promise.resolve({ rows: [] }),
+    taskIds.length ? query(`SELECT id, title FROM tasks`) : Promise.resolve({ rows: [] }),
+    projectIds.length ? query(`SELECT id, project_code FROM projects`) : Promise.resolve({ rows: [] })
+  ]);
+  const emailMap = Object.fromEntries(allEmails.rows.filter(e => emailIds.includes(e.id)).map(e => [e.id, e]));
+  const taskMap = Object.fromEntries(allTasks.rows.filter(t => taskIds.includes(t.id)).map(t => [t.id, t]));
+  const projectMap = Object.fromEntries(allProjects.rows.filter(p => projectIds.includes(p.id)).map(p => [p.id, p]));
+  return rows.map(n => ({
+    ...n,
+    email_subject: emailMap[n.email_id]?.subject || null,
+    task_title: taskMap[n.task_id]?.title || null,
+    project_code: projectMap[n.project_id]?.project_code || null
+  }));
   return result.rows;
 }
 
@@ -95,73 +108,74 @@ export async function markEmailReplied(emailId) {
 
 async function getOverdueTasks() {
   const result = await query(
-    `SELECT t.*, p.project_code, p.project_name, u.name AS assigned_to_name, u.email AS assigned_to_email
-     FROM tasks t
-     LEFT JOIN projects p ON p.id = t.project_id
-     LEFT JOIN users u ON u.id = t.assigned_to
-     WHERE t.status = 'pending'
-       AND t.due_date IS NOT NULL
-     ORDER BY t.due_date ASC`
+    `SELECT * FROM tasks WHERE status = 'pending' AND due_date IS NOT NULL ORDER BY due_date ASC`
   );
   const now = new Date();
-  return result.rows.filter(t => new Date(t.due_date) < now && (!t.overdue_notified || (t.overdue_notified_at && (now - new Date(t.overdue_notified_at)) > 24*60*60*1000)));
+  const overdue = result.rows.filter(t => new Date(t.due_date) < now && (!t.overdue_notified || (t.overdue_notified_at && (now - new Date(t.overdue_notified_at)) > 24*60*60*1000)));
+  const userIds = [...new Set(overdue.map(t => t.assigned_to).filter(Boolean))];
+  const projectIds = [...new Set(overdue.map(t => t.project_id).filter(Boolean))];
+  const [users, projects] = await Promise.all([
+    userIds.length ? query(`SELECT id, name, email FROM users`) : Promise.resolve({ rows: [] }),
+    projectIds.length ? query(`SELECT id, project_code, project_name FROM projects`) : Promise.resolve({ rows: [] })
+  ]);
+  const userMap = Object.fromEntries(users.rows.filter(u => userIds.includes(u.id)).map(u => [u.id, u]));
+  const projectMap = Object.fromEntries(projects.rows.filter(p => projectIds.includes(p.id)).map(p => [p.id, p]));
+  return overdue.map(t => ({
+    ...t,
+    assigned_to_name: userMap[t.assigned_to]?.name || null,
+    assigned_to_email: userMap[t.assigned_to]?.email || null,
+    project_code: projectMap[t.project_id]?.project_code || null,
+    project_name: projectMap[t.project_id]?.project_name || null
+  }));
 }
 
 async function getUpcomingDeadlineTasks(hoursAhead = 24) {
   const result = await query(
-    `SELECT t.*, p.project_code, p.project_name, u.name AS assigned_to_name, u.email AS assigned_to_email
-     FROM tasks t
-     LEFT JOIN projects p ON p.id = t.project_id
-     LEFT JOIN users u ON u.id = t.assigned_to
-     WHERE t.status = 'pending'
-       AND t.due_date IS NOT NULL
-     ORDER BY t.due_date ASC`,
-    []
+    `SELECT * FROM tasks WHERE status = 'pending' AND due_date IS NOT NULL ORDER BY due_date ASC`
   );
   const now = new Date();
   const ahead = new Date(now.getTime() + hoursAhead * 60 * 60 * 1000);
-  return result.rows.filter(t => {
+  const upcoming = result.rows.filter(t => {
     const d = new Date(t.due_date);
     return d > now && d <= ahead && (!t.deadline_reminder_sent || (t.deadline_reminder_at && (now - new Date(t.deadline_reminder_at)) > 12*60*60*1000));
   });
+  const userIds = [...new Set(upcoming.map(t => t.assigned_to).filter(Boolean))];
+  const projectIds = [...new Set(upcoming.map(t => t.project_id).filter(Boolean))];
+  const [users, projects] = await Promise.all([
+    userIds.length ? query(`SELECT id, name, email FROM users`) : Promise.resolve({ rows: [] }),
+    projectIds.length ? query(`SELECT id, project_code, project_name FROM projects`) : Promise.resolve({ rows: [] })
+  ]);
+  const userMap = Object.fromEntries(users.rows.filter(u => userIds.includes(u.id)).map(u => [u.id, u]));
+  const projectMap = Object.fromEntries(projects.rows.filter(p => projectIds.includes(p.id)).map(p => [p.id, p]));
+  return upcoming.map(t => ({
+    ...t,
+    assigned_to_name: userMap[t.assigned_to]?.name || null,
+    assigned_to_email: userMap[t.assigned_to]?.email || null,
+    project_code: projectMap[t.project_id]?.project_code || null,
+    project_name: projectMap[t.project_id]?.project_name || null
+  }));
 }
 
 async function getUnansweredEmails() {
   const result = await query(
-    `SELECT e.*, u.name AS employee_name, u.email AS employee_email, u.id AS employee_user_id
-     FROM emails e
-     LEFT JOIN users u ON LOWER(e.from_email) = LOWER(u.email)
-     WHERE e.needs_reply = TRUE
-       AND e.replied_at IS NULL
-       AND e.direction = 'incoming'
-       AND e.reply_deadline IS NOT NULL
-     ORDER BY e.reply_deadline ASC`
+    `SELECT * FROM emails WHERE needs_reply = TRUE AND replied_at IS NULL AND direction = 'incoming' AND reply_deadline IS NOT NULL ORDER BY reply_deadline ASC`
   );
   const now = new Date();
-  const overdue = result.rows.filter(e => {
+  return result.rows.filter(e => {
     const d = new Date(e.reply_deadline);
     return d < now && (!e.last_reminder_at || (now - new Date(e.last_reminder_at)) > 24*60*60*1000);
   });
-  return overdue;
 }
 
 async function getStaleAwaitingReplyEmails(daysThreshold = 7) {
   const result = await query(
-    `SELECT e.*, u.name AS employee_name, u.email AS employee_email, u.id AS employee_user_id
-     FROM emails e
-     LEFT JOIN users u ON LOWER(e.from_email) = LOWER(u.email)
-     WHERE e.direction = 'incoming'
-       AND e.replied_at IS NULL
-       AND e.archived = TRUE
-     ORDER BY e.archived_at ASC
-     LIMIT 50`
+    `SELECT * FROM emails WHERE direction = 'incoming' AND replied_at IS NULL AND archived = TRUE ORDER BY archived_at ASC LIMIT 50`
   );
   const threshold = new Date(Date.now() - daysThreshold * 24 * 60 * 60 * 1000);
-  const stale = result.rows.filter(e => {
+  return result.rows.filter(e => {
     const archivedAt = e.archived_at ? new Date(e.archived_at) : null;
     return archivedAt && archivedAt < threshold && (!e.last_reminder_at || (new Date() - new Date(e.last_reminder_at)) > 48*60*60*1000);
   });
-  return stale;
 }
 
 export async function runProactiveAlertCycle() {

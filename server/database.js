@@ -4831,16 +4831,19 @@ async function syncTrackingTaskRecord(taskOrId) {
     return updated.rows[0] || null;
   }
 
+  const maxResult = await query(`SELECT COALESCE(MAX(task_id), 0) + 1 AS next_id FROM tracking_tasks`);
+  const nextId = maxResult.rows[0].next_id;
   const inserted = await query(
     `
       INSERT INTO tracking_tasks (
-        existing_task_id, email_db_id, email_id, assigned_to, task_type,
+        task_id, existing_task_id, email_db_id, email_id, assigned_to, task_type,
         priority, due_date, status, is_alerted, alert_count, updated_at
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
       RETURNING *
     `,
     [
+      nextId,
       task.id,
       registry?.email_db_id || null,
       task.email_id || null,
@@ -4880,10 +4883,12 @@ async function backfillArchiveTrackingData() {
 }
 
 async function createTask(taskData) {
+  const maxResult = await query(`SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM tasks`);
+  const nextId = maxResult.rows[0].next_id;
   const result = await query(
-    `INSERT INTO tasks (email_id, project_id, assigned_to, created_by, title, description, task_type, status, priority, due_date)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
-    [taskData.email_id || null, taskData.project_id || null, taskData.assigned_to || null,
+    `INSERT INTO tasks (id, email_id, project_id, assigned_to, created_by, title, description, task_type, status, priority, due_date)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+    [nextId, taskData.email_id || null, taskData.project_id || null, taskData.assigned_to || null,
      taskData.created_by || null, taskData.title, taskData.description || "",
      taskData.task_type || "general", taskData.status || "pending",
      taskData.priority || "medium", taskData.due_date || null]
@@ -4896,38 +4901,58 @@ async function getTasks(filters = {}) {
   let where = "WHERE 1=1";
   const params = [];
   let idx = 1;
-  if (filters.status) { where += ` AND t.status = $${idx}`; params.push(filters.status); idx++; }
-  if (filters.project_id) { where += ` AND t.project_id = $${idx}`; params.push(filters.project_id); idx++; }
-  if (filters.assigned_to) { where += ` AND t.assigned_to = $${idx}`; params.push(filters.assigned_to); idx++; }
-  if (filters.due_before) { where += ` AND t.due_date <= $${idx}`; params.push(filters.due_before); idx++; }
-  if (filters.due_after) { where += ` AND t.due_date >= $${idx}`; params.push(filters.due_after); idx++; }
+  if (filters.status) { where += ` AND status = $${idx}`; params.push(filters.status); idx++; }
+  if (filters.project_id) { where += ` AND project_id = $${idx}`; params.push(filters.project_id); idx++; }
+  if (filters.assigned_to) { where += ` AND assigned_to = $${idx}`; params.push(filters.assigned_to); idx++; }
+  if (filters.due_before) { where += ` AND due_date <= $${idx}`; params.push(filters.due_before); idx++; }
+  if (filters.due_after) { where += ` AND due_date >= $${idx}`; params.push(filters.due_after); idx++; }
 
   const result = await query(
-    `SELECT t.*, p.project_code, p.project_name, e.subject AS email_subject, e.serial AS email_serial,
-            u.name AS assigned_to_name
-     FROM tasks t
-     LEFT JOIN projects p ON p.id = t.project_id
-     LEFT JOIN emails e ON e.id = t.email_id
-     LEFT JOIN users u ON u.id = t.assigned_to
-     ${where}
-     ORDER BY t.due_date ASC NULLS LAST, t.created_at DESC`,
+    `SELECT * FROM tasks ${where} ORDER BY due_date ASC NULLS LAST, created_at DESC`,
     params
   );
-  return result.rows;
+
+  const projectIds = [...new Set(result.rows.map(r => r.project_id).filter(Boolean))];
+  const userIds = [...new Set(result.rows.map(r => r.assigned_to).filter(Boolean))];
+  const emailIds = [...new Set(result.rows.map(r => r.email_id).filter(Boolean))];
+
+  const [allProjects, allUsers, allEmails] = await Promise.all([
+    projectIds.length ? query(`SELECT id, project_code, project_name FROM projects`) : Promise.resolve({ rows: [] }),
+    userIds.length ? query(`SELECT id, name FROM users`) : Promise.resolve({ rows: [] }),
+    emailIds.length ? query(`SELECT id, subject, serial FROM emails`) : Promise.resolve({ rows: [] })
+  ]);
+
+  const projectMap = Object.fromEntries(allProjects.rows.filter(p => projectIds.includes(p.id)).map(p => [p.id, p]));
+  const userMap = Object.fromEntries(allUsers.rows.filter(u => userIds.includes(u.id)).map(u => [u.id, u]));
+  const emailMap = Object.fromEntries(allEmails.rows.filter(e => emailIds.includes(e.id)).map(e => [e.id, e]));
+
+  return result.rows.map(t => ({
+    ...t,
+    project_code: projectMap[t.project_id]?.project_code || null,
+    project_name: projectMap[t.project_id]?.project_name || null,
+    assigned_to_name: userMap[t.assigned_to]?.name || null,
+    email_subject: emailMap[t.email_id]?.subject || null,
+    email_serial: emailMap[t.email_id]?.serial || null
+  }));
 }
 
 async function getTaskById(id) {
-  const result = await query(
-    `SELECT t.*, p.project_code, p.project_name, e.subject AS email_subject, e.serial AS email_serial,
-            u.name AS assigned_to_name
-     FROM tasks t
-     LEFT JOIN projects p ON p.id = t.project_id
-     LEFT JOIN emails e ON e.id = t.email_id
-     LEFT JOIN users u ON u.id = t.assigned_to
-     WHERE t.id = $1`,
-    [id]
-  );
-  return result.rows[0] || null;
+  const result = await query(`SELECT * FROM tasks WHERE id = $1`, [id]);
+  if (!result.rows[0]) return null;
+  const t = result.rows[0];
+  const extras = await Promise.all([
+    t.project_id ? query(`SELECT project_code, project_name FROM projects WHERE id = $1`, [t.project_id]) : Promise.resolve({ rows: [] }),
+    t.assigned_to ? query(`SELECT name FROM users WHERE id = $1`, [t.assigned_to]) : Promise.resolve({ rows: [] }),
+    t.email_id ? query(`SELECT subject, serial FROM emails WHERE id = $1`, [t.email_id]) : Promise.resolve({ rows: [] })
+  ]);
+  return {
+    ...t,
+    project_code: extras[0].rows[0]?.project_code || null,
+    project_name: extras[0].rows[0]?.project_name || null,
+    assigned_to_name: extras[1].rows[0]?.name || null,
+    email_subject: extras[2].rows[0]?.subject || null,
+    email_serial: extras[2].rows[0]?.serial || null
+  };
 }
 
 async function updateTask(id, taskData) {
@@ -4983,17 +5008,20 @@ async function getTaskStats(userId = null) {
     params.push(userId);
   }
   const result = await query(
-    `SELECT
-       COUNT(*)::int AS total,
-       COUNT(*) FILTER (WHERE status = 'pending')::int AS pending,
-       COUNT(*) FILTER (WHERE status = 'in_progress')::int AS in_progress,
-       COUNT(*) FILTER (WHERE status = 'completed')::int AS completed,
-       COUNT(*) FILTER (WHERE due_date < NOW() AND status = 'pending')::int AS overdue,
-       COUNT(*) FILTER (WHERE due_date BETWEEN NOW() AND NOW() + INTERVAL '48 hours' AND status = 'pending')::int AS due_soon
-     FROM tasks ${userFilter}`,
+    `SELECT * FROM tasks ${userFilter}`,
     params
   );
-  return result.rows[0] || {};
+  const now = new Date();
+  const in48h = new Date(now.getTime() + 48 * 60 * 60 * 1000);
+  const rows = result.rows;
+  return {
+    total: rows.length,
+    pending: rows.filter(r => r.status === "pending").length,
+    in_progress: rows.filter(r => r.status === "in_progress").length,
+    completed: rows.filter(r => r.status === "completed").length,
+    overdue: rows.filter(r => r.status === "pending" && r.due_date && new Date(r.due_date) < now).length,
+    due_soon: rows.filter(r => r.status === "pending" && r.due_date && new Date(r.due_date) >= now && new Date(r.due_date) <= in48h).length
+  };
 }
 
 async function getUnclassifiedCount() {

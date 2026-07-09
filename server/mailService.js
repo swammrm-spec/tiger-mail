@@ -716,8 +716,7 @@ async function importImapMessagesForFolder(client, box, messages = [], folderPla
     const sentAt = folderPlan.folderKind === "sent"
       ? parsed.date?.toISOString?.() || new Date().toISOString()
       : null;
-    await archiveIncomingParsedEmail({
-      parsed,
+    await saveParsedInboundEmailToArchive(parsed, {
       attachments,
       externalId,
       ownerUserId,
@@ -3370,6 +3369,30 @@ async function archiveIncomingParsedEmail({
   return archivedEmail;
 }
 
+async function saveParsedInboundEmailToArchive(parsed, context = {}) {
+  if (!parsed) {
+    throw new Error("Parsed inbound email is required.");
+  }
+
+  const attachments = Array.isArray(context.attachments)
+    ? context.attachments
+    : await saveParsedAttachments(parsed);
+
+  return archiveIncomingParsedEmail({
+    parsed,
+    attachments,
+    externalId: context.externalId,
+    ownerUserId: context.ownerUserId || null,
+    provider: context.provider || "imap",
+    sourceFolder: context.sourceFolder || "Inbox",
+    targetFolderName: context.targetFolderName || "Inbox",
+    messageStatus: context.messageStatus || "Received",
+    isRead: Boolean(context.isRead),
+    sentAt: context.sentAt || null,
+    forceOwnerUser: Boolean(context.forceOwnerUser)
+  });
+}
+
 async function verifyImapConnection(config) {
   const client = createImapClient(config);
   try {
@@ -3589,8 +3612,7 @@ async function receivePop3EmailsOnce(config, ownerUserId = null) {
       );
       // #endregion
 
-      await archiveIncomingParsedEmail({
-        parsed,
+      await saveParsedInboundEmailToArchive(parsed, {
         attachments,
         externalId,
         ownerUserId,
@@ -3780,8 +3802,7 @@ async function receiveGraphEmailsOnce(config, ownerUserId = null) {
         : [];
       const parsed = buildParsedMailFromGraphMessage(message, graphAttachments);
       const attachments = await saveParsedAttachments(parsed);
-      await archiveIncomingParsedEmail({
-        parsed,
+      await saveParsedInboundEmailToArchive(parsed, {
         attachments,
         externalId,
         ownerUserId,
@@ -4486,4 +4507,4 @@ function getMailServiceStatus(userId = null) {
   };
 }
 
-export { applyMailSettings, applyAllMailSettings, testMailSettings, getMailServiceStatus, runCycle, runFullMailSyncAllAccounts, receiveEmailsOnce, sendMailMessage, deliverApprovalEmail, retryQueuedEmailNow, repairLegacyEmailAttachments, runAiBackfillReanalysis, startAiBackfillReanalysisJob, getAiBackfillJobStatus, listAiBackfillJobs, cancelAiBackfillJob, retryFailedAiBackfillItems, stopScheduler, saveParsedAttachments, getSmtpTransporter };
+export { applyMailSettings, applyAllMailSettings, testMailSettings, getMailServiceStatus, runCycle, runFullMailSyncAllAccounts, receiveEmailsOnce, sendMailMessage, deliverApprovalEmail, retryQueuedEmailNow, repairLegacyEmailAttachments, runAiBackfillReanalysis, startAiBackfillReanalysisJob, getAiBackfillJobStatus, listAiBackfillJobs, cancelAiBackfillJob, retryFailedAiBackfillItems, stopScheduler, saveParsedAttachments, saveParsedInboundEmailToArchive, getSmtpTransporter };

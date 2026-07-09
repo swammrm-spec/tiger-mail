@@ -18,6 +18,7 @@ const AdminDashboard = lazy(() => import("./components/AdminDashboard"));
 const MailComposeView = lazy(() => import("./components/MailComposeView"));
 const MailReaderPane = lazy(() => import("./components/MailReaderPane"));
 const NotificationPanel = lazy(() => import("./components/NotificationPanel"));
+const TaskDashboard = lazy(() => import("./components/TaskDashboard"));
 
 const savedFiltersStorageKey = "emailarray_saved_filters";
 const lastUserStorageKey = "emailarray_last_user";
@@ -4534,7 +4535,7 @@ function App() {
             <button className={`o365-banner-tab ${currentView === "archive" ? "active" : ""}`} onClick={() => { setCurrentView("archive"); setArchiveSearch(""); setArchiveResults([]); loadArchiveStats(); }}><Bookmark size={15} /> Archive</button>
             <button className={`o365-banner-tab ${currentView === "calendar" ? "active" : ""}`} onClick={() => openCalendarView()}><CalendarDays size={15} /> Calendar</button>
             <button className={`o365-banner-tab`} title="Address book"><Users size={15} /> Address book</button>
-            <button className={`o365-banner-tab`} title="Tasks"><List size={15} /> Tasks</button>
+            <button className={`o365-banner-tab ${currentView === "tasks" ? "active" : ""}`} onClick={() => setCurrentView("tasks")}><List size={15} /> Tasks</button>
             <button className={`o365-banner-tab`} title="Notes"><FileText size={15} /> Notes</button>
             <button className={`o365-banner-tab`} title="Files"><Grid3X3 size={15} /> Files</button>
             {canAccessAdmin ? <button className={`o365-banner-tab ${currentView === "admin" ? "active" : ""}`} onClick={() => setCurrentView("admin")}><LayoutDashboard size={15} /> Admin</button> : null}
@@ -5047,6 +5048,12 @@ function App() {
       )}
 
       {currentView === "settings" && renderSettings()}
+
+      {currentView === "tasks" && (
+        <Suspense fallback={<div style={{ padding: 40, textAlign: "center", color: "#999" }}>Loading tasks...</div>}>
+          <TaskDashboard currentUser={currentUser} setCurrentView={setCurrentView} />
+        </Suspense>
+      )}
 
       {currentView === "admin" && (
         <Suspense fallback={<div className="o365-admin"><div className="o365-settings-section"><div className="o365-settings-body"><p style={{ fontSize: 12, color: "#666" }}>Loading admin dashboard...</p></div></div></div>}>

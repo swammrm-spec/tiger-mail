@@ -9,6 +9,8 @@
 - [create-database.sql](file:///d:/Emailarray/Outlook/deployment/create-database.sql)
 - [app-schema.sql](file:///d:/Emailarray/Outlook/deployment/app-schema.sql)
 - [seed-production-minimum.sql](file:///d:/Emailarray/Outlook/deployment/seed-production-minimum.sql)
+- [backup-postgres.ps1](file:///d:/Emailarray/Outlook/deployment/backup-postgres.ps1)
+- [restore-postgres.ps1](file:///d:/Emailarray/Outlook/deployment/restore-postgres.ps1)
 
 ## ترتيب التنفيذ
 
@@ -105,3 +107,4 @@ SERVE_DIST=true
 - استخدم `pg-mem` محليًا فقط عند الحاجة إلى تطوير سريع أو تشغيل بدون PostgreSQL
 - استخدم `PostgreSQL` في أي بيئة شبه إنتاجية أو إنتاجية
 - بعد أول تشغيل ناجح على PostgreSQL، اترك التطبيق يكمل أي bootstrap أو migration خفيفة مدمجة في `server/database.js`
+- استخدم [backup-postgres.ps1](file:///d:/Emailarray/Outlook/deployment/backup-postgres.ps1) قبل أي نشر إنتاجي أو restore

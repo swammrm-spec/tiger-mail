@@ -1766,6 +1766,178 @@ input:focus, select:focus, textarea:focus {
 }
 .o365-compose-guidance-list li + li { margin-top: 4px; }
 
+.o365-safe-rewrite-stats {
+  margin-top: 8px;
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--fg-secondary-text);
+}
+
+.o365-safe-rewrite-impact-list {
+  margin-top: 10px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 8px;
+}
+
+.o365-safe-rewrite-impact-chip {
+  border: 1px solid #cce4f7;
+  background: #fff;
+  border-radius: 4px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--fg-secondary-text);
+}
+
+.o365-safe-rewrite-impact-chip strong {
+  color: var(--c-primary);
+  font-size: 12px;
+}
+
+.o365-safe-rewrite-lock {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 4px;
+  border: 1px solid var(--bd);
+  background: #fff;
+  color: var(--fg-text);
+}
+
+.o365-safe-rewrite-lock.locked {
+  background: #fff5f5;
+  border-color: #f1aeb5;
+}
+
+.o365-safe-rewrite-lock.ready {
+  background: #f3fbf4;
+  border-color: #b7dfb9;
+}
+
+.o365-safe-rewrite-diff {
+  margin-top: 10px;
+  border: 1px solid var(--bd);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.78);
+}
+
+.o365-safe-rewrite-diff-head {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--bd-light);
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--fg-text);
+}
+
+.o365-safe-rewrite-diff-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.o365-safe-rewrite-diff-row {
+  padding: 10px;
+  border-top: 1px solid var(--bd-light);
+}
+
+.o365-safe-rewrite-diff-row:first-child {
+  border-top: none;
+}
+
+.o365-safe-rewrite-diff-row.added {
+  background: rgba(56, 142, 60, 0.06);
+}
+
+.o365-safe-rewrite-diff-row.removed {
+  background: rgba(211, 47, 47, 0.06);
+}
+
+.o365-safe-rewrite-diff-row.changed {
+  background: rgba(245, 124, 0, 0.08);
+}
+
+.o365-safe-rewrite-diff-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--fg-secondary-text);
+}
+
+.o365-safe-rewrite-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 72px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.o365-safe-rewrite-badge.added {
+  background: rgba(56, 142, 60, 0.12);
+  color: var(--green);
+}
+
+.o365-safe-rewrite-badge.removed {
+  background: rgba(211, 47, 47, 0.12);
+  color: var(--red);
+}
+
+.o365-safe-rewrite-badge.changed {
+  background: rgba(245, 124, 0, 0.14);
+  color: var(--orange);
+}
+
+.o365-safe-rewrite-diff-columns {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.o365-safe-rewrite-diff-column {
+  border: 1px solid var(--bd-light);
+  border-radius: 4px;
+  background: #fff;
+  padding: 8px;
+}
+
+.o365-safe-rewrite-diff-column.current {
+  box-shadow: inset 0 0 0 1px rgba(211, 47, 47, 0.04);
+}
+
+.o365-safe-rewrite-diff-column.next {
+  box-shadow: inset 0 0 0 1px rgba(56, 142, 60, 0.06);
+}
+
+.o365-safe-rewrite-diff-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--fg-secondary-text);
+  margin-bottom: 4px;
+}
+
+.o365-safe-rewrite-diff-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--fg-text);
+  font-size: 12px;
+  line-height: 1.45;
+  min-height: 20px;
+}
+
+.o365-safe-rewrite-diff-empty {
+  padding: 10px;
+  font-size: 12px;
+  color: var(--fg-secondary-text);
+}
+
 .o365-approval-panel,
 .o365-approval-history-panel {
   margin-top: 12px;

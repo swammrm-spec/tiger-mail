@@ -818,6 +818,8 @@ function App() {
     subject_key: "", approval_source_email_id: "", reply_source_email_id: "", reply_mode: "",
     manager_comments: "", ai_recommendations: "", draft_context_project_code: "",
     draft_context_project_name: "", draft_context_history_count: "", draft_context_references: "",
+    draft_context_memory_count: "", draft_context_memory_references: "",
+    draft_context_clause_count: "", draft_context_clause_references: "",
     folder_name: "Inbox", priority: "Normal", sensitivity: "Normal",
     read_receipt: false, delivery_receipt: false, recommendation: "", reminder_title: "", remind_at: ""
   });
@@ -967,6 +969,10 @@ function App() {
       draft_context_project_name: "",
       draft_context_history_count: "",
       draft_context_references: "",
+      draft_context_memory_count: "",
+      draft_context_memory_references: "",
+      draft_context_clause_count: "",
+      draft_context_clause_references: "",
       priority: settingsForm.priority || "Normal",
       sensitivity: settingsForm.sensitivity || "Normal",
       read_receipt: Boolean(settingsForm.read_receipt),
@@ -1068,8 +1074,8 @@ function App() {
       `Subject: ${selectedEmail.subject || ""}`, "", selectedEmail.body || selectedEmail.preview || ""
     ].filter(Boolean).join("\n");
     const replyAllCc = [selectedEmail.cc_list, selectedEmail.recipient_email].filter(Boolean).join(", ").split(",").map(v => v.trim()).filter((v, i, a) => v && v !== currentUser?.email && a.indexOf(v) === i).join(", ");
-    if (mode === "reply") { openComposeView({ recipient_name: selectedEmail.sender_name || "", recipient_email: selectedEmail.sender_email || "", subject, body: quotedBody, folder_name: "Drafts", priority: selectedEmail.priority || "Normal", project_id: selectedEmail.project_id || "", reply_source_email_id: selectedEmail.id, reply_mode: mode, draft_context_project_code: "", draft_context_project_name: "", draft_context_history_count: "", draft_context_references: "", ai_recommendations: "" }); setSuccessMessage("Reply opened successfully."); setError(""); return; }
-    if (mode === "replyAll") { openComposeView({ recipient_name: selectedEmail.sender_name || "", recipient_email: selectedEmail.sender_email || "", cc_list: replyAllCc, subject, body: quotedBody, folder_name: "Drafts", priority: selectedEmail.priority || "Normal", project_id: selectedEmail.project_id || "", reply_source_email_id: selectedEmail.id, reply_mode: mode, draft_context_project_code: "", draft_context_project_name: "", draft_context_history_count: "", draft_context_references: "", ai_recommendations: "" }); setSuccessMessage("Reply All opened with recipients filled."); setError(""); return; }
+    if (mode === "reply") { openComposeView({ recipient_name: selectedEmail.sender_name || "", recipient_email: selectedEmail.sender_email || "", subject, body: quotedBody, folder_name: "Drafts", priority: selectedEmail.priority || "Normal", project_id: selectedEmail.project_id || "", reply_source_email_id: selectedEmail.id, reply_mode: mode, draft_context_project_code: "", draft_context_project_name: "", draft_context_history_count: "", draft_context_references: "", draft_context_memory_count: "", draft_context_memory_references: "", draft_context_clause_count: "", draft_context_clause_references: "", ai_recommendations: "" }); setSuccessMessage("Reply opened successfully."); setError(""); return; }
+    if (mode === "replyAll") { openComposeView({ recipient_name: selectedEmail.sender_name || "", recipient_email: selectedEmail.sender_email || "", cc_list: replyAllCc, subject, body: quotedBody, folder_name: "Drafts", priority: selectedEmail.priority || "Normal", project_id: selectedEmail.project_id || "", reply_source_email_id: selectedEmail.id, reply_mode: mode, draft_context_project_code: "", draft_context_project_name: "", draft_context_history_count: "", draft_context_references: "", draft_context_memory_count: "", draft_context_memory_references: "", draft_context_clause_count: "", draft_context_clause_references: "", ai_recommendations: "" }); setSuccessMessage("Reply All opened with recipients filled."); setError(""); return; }
     openComposeView({ subject, body: quotedBody, folder_name: "Drafts", priority: selectedEmail.priority || "Normal" });
     setSuccessMessage("Forward opened with original message content."); setError("");
   }
@@ -1136,12 +1142,18 @@ function App() {
         draft_context_project_code: context.project_code || prev.draft_context_project_code || "",
         draft_context_project_name: context.project_name || prev.draft_context_project_name || "",
         draft_context_history_count: String(context.history_count || prev.draft_context_history_count || 0),
-        draft_context_references: Array.isArray(context.references) ? context.references.join("\n") : (prev.draft_context_references || "")
+        draft_context_references: Array.isArray(context.references) ? context.references.join("\n") : (prev.draft_context_references || ""),
+        draft_context_memory_count: String(context.contract_memory_count || prev.draft_context_memory_count || 0),
+        draft_context_memory_references: Array.isArray(context.contract_memory_references) ? context.contract_memory_references.join("\n") : (prev.draft_context_memory_references || ""),
+        draft_context_clause_count: String(context.contract_clause_count || prev.draft_context_clause_count || 0),
+        draft_context_clause_references: Array.isArray(context.contract_clause_references) ? context.contract_clause_references.join("\n") : (prev.draft_context_clause_references || "")
       }));
       if (!silent) {
+        const issueCount = Array.isArray(guard.issues) ? guard.issues.length : 0;
+        const conflictCount = Array.isArray(guard.conflicts) ? guard.conflicts.length : 0;
         setSuccessMessage(
-          Array.isArray(guard.issues) && guard.issues.length
-            ? `Policy Guard detected ${guard.issues.length} issue(s) to review.`
+          issueCount || conflictCount
+            ? `Policy Guard detected ${issueCount} issue(s) and ${conflictCount} clause conflict(s) to review.`
             : "Policy Guard did not detect contradictions in the current draft."
         );
       }
@@ -1184,6 +1196,8 @@ function App() {
       const guidance = [
         context.project_code ? `Project context: ${context.project_code}${context.project_name ? ` - ${context.project_name}` : ""}` : "",
         Number(context.history_count || 0) ? `Historical emails used: ${Number(context.history_count)}` : "Historical emails used: 0",
+        Number(context.contract_memory_count || 0) ? `Contract memory snippets used: ${Number(context.contract_memory_count)}` : "Contract memory snippets used: 0",
+        Number(context.contract_clause_count || 0) ? `Structured clauses used: ${Number(context.contract_clause_count)}` : "Structured clauses used: 0",
         ...(draft.guidance || [])
       ].filter(Boolean);
       setForm((prev) => ({
@@ -1195,7 +1209,11 @@ function App() {
         draft_context_project_code: context.project_code || "",
         draft_context_project_name: context.project_name || "",
         draft_context_history_count: String(context.history_count || 0),
-        draft_context_references: Array.isArray(context.references) ? context.references.join("\n") : ""
+        draft_context_references: Array.isArray(context.references) ? context.references.join("\n") : "",
+        draft_context_memory_count: String(context.contract_memory_count || 0),
+        draft_context_memory_references: Array.isArray(context.contract_memory_references) ? context.contract_memory_references.join("\n") : "",
+        draft_context_clause_count: String(context.contract_clause_count || 0),
+        draft_context_clause_references: Array.isArray(context.contract_clause_references) ? context.contract_clause_references.join("\n") : ""
       }));
       await runResponsePolicyGuard({
         subjectOverride: nextSubject,
@@ -1213,6 +1231,47 @@ function App() {
     } finally {
       setIsGeneratingReplyDraft(false);
     }
+  }
+
+  async function applyRepairSuggestion(suggestion) {
+    const safeSuggestion = String(suggestion?.suggested_text || "").trim();
+    if (!safeSuggestion) {
+      return;
+    }
+    const nextBody = mergeSuggestedReplyBody(form.body, safeSuggestion);
+    setForm((prev) => ({
+      ...prev,
+      body: nextBody
+    }));
+    setSuccessMessage("Applied safe repair suggestion to the draft.");
+    setError("");
+    await runResponsePolicyGuard({
+      bodyOverride: nextBody,
+      subjectOverride: form.subject || "",
+      projectIdOverride: form.project_id || "",
+      silent: true
+    }).catch(() => null);
+  }
+
+  async function applySafeRewrite() {
+    const rewrittenBody = String(responsePolicyGuard?.safe_rewrite?.rewritten_body || "").trim();
+    if (!rewrittenBody) {
+      setError("No safe rewrite is available for the current draft.");
+      return;
+    }
+    const nextBody = mergeSuggestedReplyBody(form.body, rewrittenBody);
+    setForm((prev) => ({
+      ...prev,
+      body: nextBody
+    }));
+    setSuccessMessage("Applied one-click safe rewrite to the draft.");
+    setError("");
+    await runResponsePolicyGuard({
+      bodyOverride: nextBody,
+      subjectOverride: form.subject || "",
+      projectIdOverride: form.project_id || "",
+      silent: true
+    }).catch(() => null);
   }
 
   async function handleRunResponsePolicyGuard() {
@@ -3045,8 +3104,12 @@ function App() {
     projectCode: String(form.draft_context_project_code || "").trim(),
     projectName: String(form.draft_context_project_name || "").trim(),
     historyCount: Number(form.draft_context_history_count || 0),
-    references: String(form.draft_context_references || "").split("\n").map(v => v.trim()).filter(Boolean)
-  }), [form.draft_context_history_count, form.draft_context_project_code, form.draft_context_project_name, form.draft_context_references]);
+    references: String(form.draft_context_references || "").split("\n").map(v => v.trim()).filter(Boolean),
+    contractMemoryCount: Number(form.draft_context_memory_count || 0),
+    contractMemoryReferences: String(form.draft_context_memory_references || "").split("\n").map(v => v.trim()).filter(Boolean),
+    contractClauseCount: Number(form.draft_context_clause_count || 0),
+    contractClauseReferences: String(form.draft_context_clause_references || "").split("\n").map(v => v.trim()).filter(Boolean)
+  }), [form.draft_context_clause_count, form.draft_context_clause_references, form.draft_context_history_count, form.draft_context_memory_count, form.draft_context_memory_references, form.draft_context_project_code, form.draft_context_project_name, form.draft_context_references]);
   const isResponsePolicyGuardStale = useMemo(
     () => isResponsePolicyGuardStaleForDraft(form.subject, form.body),
     [responsePolicyGuard, form.subject, form.body]
@@ -3284,6 +3347,8 @@ function App() {
     }
     const resolvedForm = commitComposeInput(form);
     const activeAccount = emailAccounts.find(a => a.id === activeAccountId) || emailAccounts[0];
+    const currentUserId = Number(currentUser?.id || 0);
+    let safeRewriteApprovalLockToUse = null;
     if (activeAccount?.signature_text && resolvedForm.body && !resolvedForm.body.includes(activeAccount.signature_text)) {
       resolvedForm.body = resolvedForm.body + "\n\n" + activeAccount.signature_text;
     }
@@ -3311,9 +3376,33 @@ function App() {
           return;
         }
       }
+      const approvalLock = guardToUse?.approval_lock || null;
+      const isApprovalLockBlocking = Boolean(
+        approvalLock?.required
+        && Number(approvalLock?.approver_id || 0)
+        && Number(approvalLock?.approver_id || 0) !== currentUserId
+      );
+      if (isApprovalLockBlocking) {
+        const safeRewriteBody = String(guardToUse?.safe_rewrite?.rewritten_body || "").trim();
+        if (!approvalLock?.can_submit_for_approval || !approvalLock?.approver_id) {
+          setError(approvalLock?.summary || "This sensitive safe rewrite requires an assigned approver before it can be submitted.");
+          setIsSendingEmail(false);
+          return;
+        }
+        if (!safeRewriteBody) {
+          setError("No approved safe rewrite body is available for submission.");
+          setIsSendingEmail(false);
+          return;
+        }
+        resolvedForm.body = mergeSuggestedReplyBody(resolvedForm.body, safeRewriteBody);
+        if (activeAccount?.signature_text && resolvedForm.body && !resolvedForm.body.includes(activeAccount.signature_text)) {
+          resolvedForm.body = resolvedForm.body + "\n\n" + activeAccount.signature_text;
+        }
+        safeRewriteApprovalLockToUse = approvalLock;
+      }
       const hasSevereRisk = ["high", "critical"].includes(String(guardToUse?.severity || "").toLowerCase())
         || String(guardToUse?.verdict || "").toLowerCase() === "blocked";
-      if (hasSevereRisk) {
+      if (hasSevereRisk && !safeRewriteApprovalLockToUse) {
         const proceed = window.confirm(
           `${guardToUse?.summary || "Policy Guard detected significant risks in this reply."}\n\nDo you want to send anyway?`
         );
@@ -3330,6 +3419,10 @@ function App() {
     files.forEach(f => payload.append("attachments", f));
     if (currentUser?.id) payload.append("user_id", currentUser.id);
     if (activeAccountId) payload.append("account_id", activeAccountId);
+    if (safeRewriteApprovalLockToUse?.required && safeRewriteApprovalLockToUse?.approver_id) {
+      payload.append("force_manager_approval", "true");
+      payload.append("forced_manager_id", String(safeRewriteApprovalLockToUse.approver_id));
+    }
     try {
       const approvalSourceId = Number(resolvedForm.approval_source_email_id || 0);
       const targetUrl = approvalSourceId ? `/api/approvals/${approvalSourceId}/resubmit` : "/api/mail/send";
@@ -3339,9 +3432,13 @@ function App() {
         await loadBootstrap();
         loadRecentContacts();
         setSuccessMessage(
-          response.serial
-            ? `Email ${response.serial} submitted for manager approval.`
-            : "Email submitted for manager approval."
+          safeRewriteApprovalLockToUse
+            ? (response.serial
+              ? `Sensitive safe rewrite ${response.serial} submitted for approval before apply/send.`
+              : "Sensitive safe rewrite submitted for approval before apply/send.")
+            : (response.serial
+              ? `Email ${response.serial} submitted for manager approval.`
+              : "Email submitted for manager approval.")
         );
         return;
       }
@@ -4386,6 +4483,8 @@ function App() {
           isCheckingResponsePolicyGuard={isCheckingResponsePolicyGuard}
           isResponsePolicyGuardStale={isResponsePolicyGuardStale}
           handleRunResponsePolicyGuard={handleRunResponsePolicyGuard}
+          handleApplyRepairSuggestion={applyRepairSuggestion}
+          handleApplySafeRewrite={applySafeRewrite}
           handleSubmit={handleSubmit}
           showFrom={showFrom}
           renderChipEmailInput={renderChipEmailInput}

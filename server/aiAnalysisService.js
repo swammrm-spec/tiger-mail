@@ -149,6 +149,119 @@ function getGeminiConfig() {
   };
 }
 
+function normalizeOcrText(value = "") {
+  return String(value || "")
+    .replace(/\r/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+function buildVisionOcrPrompt(fileName = "") {
+  return [
+    "Extract the full readable text from this contract-related document or image.",
+    "Focus on clauses, prices, payment terms, dates, obligations, penalties, warranties, scope, and legal wording.",
+    "Return plain text only.",
+    `File name: ${fileName || "attachment"}`
+  ].join("\n");
+}
+
+async function extractTextWithVisionOcr({ fileBuffer, mimeType = "", fileName = "" } = {}) {
+  if (!fileBuffer || !Buffer.isBuffer(fileBuffer) || !fileBuffer.length) {
+    return "";
+  }
+
+  const normalizedMime = String(mimeType || "").trim().toLowerCase() || "application/octet-stream";
+  const openAiConfig = getOpenAiConfig();
+  const geminiConfig = getGeminiConfig();
+  const prompt = buildVisionOcrPrompt(fileName);
+
+  if (geminiConfig) {
+    try {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(geminiConfig.model)}:generateContent?key=${encodeURIComponent(geminiConfig.apiKey)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            generationConfig: {
+              temperature: 0.1,
+              maxOutputTokens: 4096
+            },
+            contents: [
+              {
+                role: "user",
+                parts: [
+                  { text: prompt },
+                  {
+                    inlineData: {
+                      mimeType: normalizedMime,
+                      data: fileBuffer.toString("base64")
+                    }
+                  }
+                ]
+              }
+            ]
+          })
+        }
+      );
+      const json = await response.json().catch(() => ({}));
+      if (response.ok) {
+        const text = json?.candidates?.[0]?.content?.parts?.map((part) => part?.text || "").join("\n") || "";
+        const normalized = normalizeOcrText(text);
+        if (normalized) {
+          return normalized;
+        }
+      }
+    } catch {
+      // Fall through to other OCR paths.
+    }
+  }
+
+  if (openAiConfig && normalizedMime.startsWith("image/")) {
+    try {
+      const response = await fetch(`${openAiConfig.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${openAiConfig.apiKey}`
+        },
+        body: JSON.stringify({
+          model: openAiConfig.model,
+          temperature: 0.1,
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "text", text: prompt },
+                {
+                  type: "image_url",
+                  image_url: {
+                    url: `data:${normalizedMime};base64,${fileBuffer.toString("base64")}`
+                  }
+                }
+              ]
+            }
+          ]
+        })
+      });
+      const json = await response.json().catch(() => ({}));
+      if (response.ok) {
+        const content = json?.choices?.[0]?.message?.content || "";
+        const normalized = normalizeOcrText(typeof content === "string" ? content : "");
+        if (normalized) {
+          return normalized;
+        }
+      }
+    } catch {
+      // Ignore OpenAI OCR fallback errors.
+    }
+  }
+
+  return "";
+}
+
 function buildAnalysisPrompt({ subject, body, recipientEmail, ccList }) {
   return [
     "You are a professional email compliance and approval assistant for an enterprise Outlook-like approval system.",
@@ -687,6 +800,234 @@ async function analyzeEmailBrain(context) {
   }
 }
 
+function normalizeContractClauseType(value = "", fallback = "general") {
+  const normalized = String(value || fallback || "general").trim().toLowerCase();
+  if (["payment_terms", "delivery_deadlines", "penalties", "warranties", "scope_of_work", "general"].includes(normalized)) {
+    return normalized;
+  }
+  return "general";
+}
+
+function normalizeStructuredClauseConfidence(value = "", fallback = "medium") {
+  const normalized = String(value || fallback || "medium").trim().toLowerCase();
+  if (["high", "medium", "low"].includes(normalized)) {
+    return normalized;
+  }
+  return fallback;
+}
+
+function normalizeStructuredContractClausesPayload(payload = {}, fallback = {}) {
+  const fallbackClauses = Array.isArray(fallback?.clauses) ? fallback.clauses : [];
+  const source = Array.isArray(payload?.clauses) ? payload.clauses : fallbackClauses;
+  return {
+    clauses: source
+      .map((item, index) => {
+        const fallbackItem = fallbackClauses[index] || {};
+        return {
+          clause_type: normalizeContractClauseType(item?.clause_type, fallbackItem?.clause_type || "general"),
+          clause_title: String(item?.clause_title || fallbackItem?.clause_title || "").trim(),
+          clause_value: String(item?.clause_value || fallbackItem?.clause_value || "").trim(),
+          normalized_value: String(item?.normalized_value || fallbackItem?.normalized_value || "").trim(),
+          confidence: normalizeStructuredClauseConfidence(item?.confidence, fallbackItem?.confidence || "medium")
+        };
+      })
+      .filter((item) => item.clause_value)
+      .slice(0, 8),
+    provider: String(payload?.provider || fallback?.provider || "rules").trim() || "rules"
+  };
+}
+
+function buildStructuredContractClausePrompt({
+  snippet = "",
+  title = "",
+  memoryType = "",
+  referenceKey = "",
+  sourceFileName = ""
+} = {}) {
+  return [
+    "You are a contract clause structuring engine.",
+    "Convert the provided contract snippet into structured clauses.",
+    "Return strict JSON only.",
+    "JSON schema:",
+    "{",
+    '  "clauses": [{',
+    '    "clause_type": "payment_terms|delivery_deadlines|penalties|warranties|scope_of_work|general",',
+    '    "clause_title": "short title",',
+    '    "clause_value": "the exact clause meaning in concise text",',
+    '    "normalized_value": "normalized summary suitable for search/policy checks",',
+    '    "confidence": "high|medium|low"',
+    "  }],",
+    '  "provider": "openai|gemini|rules"',
+    "}",
+    "Rules:",
+    "- Extract only clauses supported by the snippet.",
+    "- Prefer the requested business clause types over generic output.",
+    "- If the snippet contains one clause only, return one item.",
+    "- Keep clause_value concise but specific.",
+    "",
+    `Title: ${title || "-"}`,
+    `Memory type hint: ${memoryType || "-"}`,
+    `Reference: ${referenceKey || "-"}`,
+    `Source file: ${sourceFileName || "-"}`,
+    "Snippet:",
+    snippet || ""
+  ].join("\n");
+}
+
+function buildRulesFallbackStructuredContractClauses({
+  snippet = "",
+  title = "",
+  memoryType = ""
+} = {}) {
+  const text = String(snippet || "").trim();
+  const lower = text.toLowerCase();
+  const clauses = [];
+
+  const pushClause = (clauseType, clauseTitle, clauseValue, normalizedValue, confidence = "medium") => {
+    if (!clauseValue) return;
+    clauses.push({
+      clause_type: normalizeContractClauseType(clauseType),
+      clause_title: clauseTitle,
+      clause_value: clauseValue.trim(),
+      normalized_value: normalizedValue.trim(),
+      confidence: normalizeStructuredClauseConfidence(confidence)
+    });
+  };
+
+  if (/(payment|paid|advance|net\s*\d+|due upon|invoice|remittance|دفعة|دفعات|سداد|فاتورة|تحويل|استحقاق)/i.test(lower) || memoryType === "payment_terms") {
+    pushClause(
+      "payment_terms",
+      "Payment Terms",
+      text,
+      text.replace(/\s+/g, " ").slice(0, 240),
+      memoryType === "payment_terms" ? "high" : "medium"
+    );
+  }
+  if (/(delivery|deliver|within\s+\d+\s+(day|days|week|weeks)|deadline|no later than|موعد تسليم|تسليم|خلال\s+\d+|مهلة|جدول زمني)/i.test(lower) || memoryType === "sla") {
+    pushClause(
+      "delivery_deadlines",
+      "Delivery Deadline",
+      text,
+      text.replace(/\s+/g, " ").slice(0, 240),
+      memoryType === "sla" ? "high" : "medium"
+    );
+  }
+  if (/(penalt|liquidated damages|fine|breach|غرامة|جزاء|تعويض|مخالفة)/i.test(lower) || /penalt/i.test(title || "")) {
+    pushClause(
+      "penalties",
+      "Penalty Clause",
+      text,
+      text.replace(/\s+/g, " ").slice(0, 240),
+      "medium"
+    );
+  }
+  if (/(warrant|guarantee|defect liability|support period|ضمان|كفالة|صلاحية|فترة دعم)/i.test(lower) || memoryType === "legal") {
+    pushClause(
+      "warranties",
+      "Warranty Clause",
+      text,
+      text.replace(/\s+/g, " ").slice(0, 240),
+      memoryType === "legal" ? "medium" : "low"
+    );
+  }
+  if (/(scope of work|statement of work|deliverables|includes|shall provide|نطاق العمل|يشمل|المخرجات|الأعمال المطلوبة|المواصفات)/i.test(lower) || memoryType === "scope") {
+    pushClause(
+      "scope_of_work",
+      "Scope Of Work",
+      text,
+      text.replace(/\s+/g, " ").slice(0, 240),
+      memoryType === "scope" ? "high" : "medium"
+    );
+  }
+
+  if (!clauses.length && text) {
+    pushClause(
+      memoryType === "contract" ? "general" : memoryType,
+      title || "General Contract Clause",
+      text,
+      text.replace(/\s+/g, " ").slice(0, 240),
+      "low"
+    );
+  }
+
+  return normalizeStructuredContractClausesPayload({
+    clauses,
+    provider: "rules"
+  });
+}
+
+async function extractStructuredContractClauses(context = {}) {
+  const openAiConfig = getOpenAiConfig();
+  const geminiConfig = getGeminiConfig();
+  const fallback = buildRulesFallbackStructuredContractClauses(context);
+
+  if (!openAiConfig && !geminiConfig) {
+    return fallback;
+  }
+
+  const prompt = buildStructuredContractClausePrompt(context);
+  try {
+    let payload = null;
+    if (openAiConfig) {
+      const response = await fetch(`${openAiConfig.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${openAiConfig.apiKey}`
+        },
+        body: JSON.stringify({
+          model: openAiConfig.model,
+          temperature: 0.1,
+          response_format: { type: "json_object" },
+          messages: [
+            { role: "system", content: "You extract structured contract clauses. Return only JSON." },
+            { role: "user", content: prompt }
+          ]
+        })
+      });
+      const json = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(json?.error?.message || "OpenAI structured clause extraction failed.");
+      }
+      payload = {
+        ...parseLlmJson(json?.choices?.[0]?.message?.content || ""),
+        provider: "openai"
+      };
+    } else {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(geminiConfig.model)}:generateContent?key=${encodeURIComponent(geminiConfig.apiKey)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            generationConfig: {
+              temperature: 0.1,
+              responseMimeType: "application/json"
+            },
+            contents: [
+              {
+                role: "user",
+                parts: [{ text: prompt }]
+              }
+            ]
+          })
+        }
+      );
+      const json = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(json?.error?.message || "Gemini structured clause extraction failed.");
+      }
+      payload = {
+        ...parseLlmJson(json?.candidates?.[0]?.content?.parts?.map((part) => part?.text || "").join("\n") || ""),
+        provider: "gemini"
+      };
+    }
+    return normalizeStructuredContractClausesPayload(payload, fallback);
+  } catch {
+    return fallback;
+  }
+}
+
 function normalizeDraftReplyPayload(payload = {}, fallback = {}) {
   const guidanceSource = Array.isArray(payload?.guidance)
     ? payload.guidance
@@ -713,6 +1054,7 @@ function buildHistoricalReplyPrompt({
   sourceEmail = {},
   historyEmails = [],
   contractMemoryEntries = [],
+  structuredContractClauses = [],
   project = null,
   requestedSubject = "",
   existingDraftBody = "",
@@ -746,6 +1088,18 @@ function buildHistoricalReplyPrompt({
       ].join("\n");
     }).join("\n\n----------------\n\n")
     : "No structured contract memory snippets were found.";
+  const clauseSection = structuredContractClauses.length
+    ? structuredContractClauses.map((item, index) => {
+      return [
+        `Clause #${index + 1}`,
+        `Type: ${item.clause_type || "general"}`,
+        `Title: ${item.clause_title || "-"}`,
+        `Value: ${item.clause_value || "-"}`,
+        `Normalized: ${item.normalized_value || "-"}`,
+        `Reference: ${item.reference_key || "-"}`
+      ].join("\n");
+    }).join("\n\n----------------\n\n")
+    : "No structured contract clauses were found.";
 
   return [
     "You are an enterprise email drafting assistant for a project-based Outlook workflow.",
@@ -762,8 +1116,9 @@ function buildHistoricalReplyPrompt({
     "}",
     "Rules:",
     "- Use the same working language as the incoming email unless the historical context strongly indicates a different language.",
-    "- Do not invent facts, approvals, prices, deadlines, or commitments that are not supported by the current email, historical correspondence, or contract memory snippets.",
-    "- If the historical context or contract memory contains previous commitments, preserve continuity and tone.",
+    "- Do not invent facts, approvals, prices, deadlines, or commitments that are not supported by the current email, historical correspondence, structured clauses, or contract memory snippets.",
+    "- Use structured contract clauses as the primary contractual source whenever available.",
+    "- If the historical context, structured clauses, or contract memory contains previous commitments, preserve continuity and tone.",
     "- If the current draft body contains user notes, incorporate them without duplicating the quoted original message.",
     "- Keep the reply concise, professional, and operational.",
     "- reply_body must NOT include markdown fences or explanations.",
@@ -788,7 +1143,10 @@ function buildHistoricalReplyPrompt({
     historySection,
     "",
     "Structured contract memory:",
-    contractMemorySection
+    contractMemorySection,
+    "",
+    "Structured contract clauses:",
+    clauseSection
   ].join("\n");
 }
 
@@ -797,6 +1155,7 @@ function buildRulesFallbackReplyDraft({
   project = null,
   historyEmails = [],
   contractMemoryEntries = [],
+  structuredContractClauses = [],
   requestedSubject = ""
 } = {}) {
   const subject = String(
@@ -804,7 +1163,7 @@ function buildRulesFallbackReplyDraft({
     || sourceEmail?.subject
     || "RE: Follow-up"
   ).trim();
-  const primaryReference = contractMemoryEntries[0]?.reference_key || historyEmails[0]?.serial_number || historyEmails[0]?.subject || "";
+  const primaryReference = structuredContractClauses[0]?.reference_key || contractMemoryEntries[0]?.reference_key || historyEmails[0]?.serial_number || historyEmails[0]?.subject || "";
   const likelyArabic = /[\u0600-\u06FF]/.test(`${sourceEmail?.subject || ""}\n${sourceEmail?.body || ""}`);
   const replyBody = likelyArabic
     ? [
@@ -834,9 +1193,11 @@ function buildRulesFallbackReplyDraft({
     guidance: [
       project?.project_code ? `Linked to project ${project.project_code}` : "Generated from current email context",
       historyEmails.length ? `Used ${historyEmails.length} historical project email(s)` : "No historical project emails were available",
-      contractMemoryEntries.length ? `Used ${contractMemoryEntries.length} contract memory snippet(s)` : "No contract memory snippets were available"
+      contractMemoryEntries.length ? `Used ${contractMemoryEntries.length} contract memory snippet(s)` : "No contract memory snippets were available",
+      structuredContractClauses.length ? `Used ${structuredContractClauses.length} structured contract clause(s)` : "No structured contract clauses were available"
     ],
     historical_references: [
+      ...structuredContractClauses.map((item) => item.reference_key || item.clause_title || "").filter(Boolean),
       ...contractMemoryEntries.map((item) => item.reference_key || item.title || "").filter(Boolean),
       ...historyEmails.map((item) => item.serial_number || item.subject || "").filter(Boolean)
     ].slice(0, 8),
@@ -948,6 +1309,294 @@ function normalizePolicyIssues(value = [], fallback = []) {
     .filter((item) => item.title || item.details);
 }
 
+function normalizeClauseConflictType(value = "", fallback = "general_conflict") {
+  const normalized = String(value || fallback || "general_conflict").trim().toLowerCase();
+  if (["deadline_conflict", "payment_mismatch", "scope_expansion", "unsupported_warranty", "general_conflict"].includes(normalized)) {
+    return normalized;
+  }
+  return fallback;
+}
+
+function normalizePolicyConflicts(value = [], fallback = []) {
+  const source = Array.isArray(value) ? value : Array.isArray(fallback) ? fallback : [];
+  return source
+    .map((item) => ({
+      conflict_type: normalizeClauseConflictType(item?.conflict_type, "general_conflict"),
+      clause_type: String(item?.clause_type || "general").trim() || "general",
+      severity: normalizePolicySeverity(item?.severity, "medium"),
+      title: String(item?.title || "").trim(),
+      details: String(item?.details || "").trim(),
+      reference_key: String(item?.reference_key || "").trim(),
+      expected_value: String(item?.expected_value || "").trim(),
+      draft_evidence: String(item?.draft_evidence || "").trim()
+    }))
+    .filter((item) => item.title || item.details || item.expected_value || item.draft_evidence);
+}
+
+function normalizeRepairSuggestions(value = [], fallback = []) {
+  const source = Array.isArray(value) ? value : Array.isArray(fallback) ? fallback : [];
+  return source
+    .map((item) => ({
+      conflict_type: normalizeClauseConflictType(item?.conflict_type, "general_conflict"),
+      title: String(item?.title || "").trim(),
+      suggested_text: String(item?.suggested_text || "").trim(),
+      rationale: String(item?.rationale || "").trim(),
+      reference_key: String(item?.reference_key || "").trim()
+    }))
+    .filter((item) => item.suggested_text);
+}
+
+function normalizeSafeRewrite(value = {}, fallback = {}) {
+  return {
+    title: String(value?.title || fallback?.title || "").trim(),
+    rewritten_body: String(value?.rewritten_body || fallback?.rewritten_body || "").trim(),
+    rationale: String(value?.rationale || fallback?.rationale || "").trim()
+  };
+}
+
+function extractPercentTokens(text = "") {
+  const matches = String(text || "").match(/\b\d{1,3}\s?%/g);
+  return matches ? [...new Set(matches.map((item) => item.replace(/\s+/g, "")))] : [];
+}
+
+function extractCurrencyTokens(text = "") {
+  const matches = String(text || "").match(/(?:usd|jod|eur|sar|aed|\$|€|دولار|دينار|ريال|درهم)\s?\d[\d,\.]*|\b\d[\d,\.]*\s?(?:usd|jod|eur|sar|aed|دولار|دينار|ريال|درهم)\b/gi);
+  return matches ? [...new Set(matches.map((item) => item.replace(/\s+/g, " ").trim().toLowerCase()))] : [];
+}
+
+function extractDurationTokens(text = "") {
+  const matches = String(text || "").match(/\b\d+\s?(?:day|days|week|weeks|month|months|year|years|يوم|أيام|اسبوع|أسبوع|أسابيع|شهر|أشهر|سنة|سنوات)\b/gi);
+  return matches ? [...new Set(matches.map((item) => item.replace(/\s+/g, " ").trim().toLowerCase()))] : [];
+}
+
+function collectClauseComparableTokens(text = "") {
+  return [
+    ...extractDraftDates(text),
+    ...extractPercentTokens(text),
+    ...extractCurrencyTokens(text),
+    ...extractDurationTokens(text)
+  ];
+}
+
+function overlapCount(left = [], right = []) {
+  const rightSet = new Set((right || []).map((item) => String(item || "").toLowerCase()));
+  return (left || []).filter((item) => rightSet.has(String(item || "").toLowerCase())).length;
+}
+
+function buildClauseConflictIssue(conflict = {}) {
+  const typeMap = {
+    deadline_conflict: "deadline",
+    payment_mismatch: "pricing",
+    scope_expansion: "scope",
+    unsupported_warranty: "legal",
+    general_conflict: "general"
+  };
+  return {
+    type: typeMap[conflict.conflict_type] || "general",
+    title: conflict.title || "Clause conflict detected",
+    severity: normalizePolicySeverity(conflict.severity, "medium"),
+    details: conflict.details || "Contract conflict requires review.",
+    supported_by_history: false,
+    historical_reference: conflict.reference_key || ""
+  };
+}
+
+function buildRepairSuggestionFromConflict(conflict = {}) {
+  const reference = conflict.reference_key ? ` بحسب المرجع ${conflict.reference_key}` : "";
+  const expected = conflict.expected_value ? ` ${conflict.expected_value}` : "";
+  const byType = {
+    deadline_conflict: {
+      title: "صياغة بديلة لموعد التسليم",
+      suggested_text: `نشير إلى أن الجدول الزمني المعتمد حاليًا${reference} هو:${expected} وعليه سنلتزم بما هو معتمد تعاقديًا أو نرفع أي تعديل مقترح للمراجعة والاعتماد قبل تأكيده.`,
+      rationale: "يزيل الموعد غير المدعوم ويعيد الرد إلى المدة أو التاريخ المعتمد."
+    },
+    payment_mismatch: {
+      title: "صياغة بديلة لشروط الدفع",
+      suggested_text: `لغايات الدقة التعاقدية، تبقى شروط الدفع المعتمدة${reference} كما يلي:${expected} وأي تعديل مالي أو نسبة دفعات إضافية يحتاج إلى مراجعة واعتماد رسمي قبل تأكيده.`,
+      rationale: "يمنع تثبيت شروط دفع جديدة ويعيد الرد إلى الشرط المالي القائم."
+    },
+    scope_expansion: {
+      title: "صياغة بديلة لنطاق العمل",
+      suggested_text: `نؤكد أن نطاق العمل الحالي${reference} يقتصر على:${expected} وأي أعمال إضافية أو توسعة في النطاق سيتم التعامل معها كطلب منفصل بعد المراجعة الفنية والتجارية اللازمة.`,
+      rationale: "يمنع توسيع النطاق مجانًا أو ضمنيًا بدون سند تعاقدي."
+    },
+    unsupported_warranty: {
+      title: "صياغة بديلة للضمان",
+      suggested_text: `فيما يتعلق بالضمان أو الدعم، نعتمد فقط ما هو منصوص عليه${reference}${expected ? ` وهو:${expected}` : ""}، وأي تمديد أو التزام إضافي يحتاج إلى اعتماد تعاقدي صريح قبل تأكيده.`,
+      rationale: "يسحب وعد الضمان غير المدعوم ويعيده إلى النص المعتمد."
+    },
+    general_conflict: {
+      title: "صياغة بديلة آمنة",
+      suggested_text: `حرصًا على الالتزام بالتعاقد الحالي${reference}، سنعتمد ما هو منصوص عليه حاليًا${expected ? ` وهو:${expected}` : ""}، وأي تغيير مقترح سيتم تأكيده بعد المراجعة والاعتماد الرسمي.`,
+      rationale: "يوفر صياغة حذرة عند وجود تعارض عام غير مصنف."
+    }
+  };
+  return {
+    conflict_type: conflict.conflict_type || "general_conflict",
+    title: byType[conflict.conflict_type || "general_conflict"]?.title || byType.general_conflict.title,
+    suggested_text: byType[conflict.conflict_type || "general_conflict"]?.suggested_text || byType.general_conflict.suggested_text,
+    rationale: byType[conflict.conflict_type || "general_conflict"]?.rationale || byType.general_conflict.rationale,
+    reference_key: conflict.reference_key || ""
+  };
+}
+
+function buildRepairSuggestionsFromConflicts(conflicts = []) {
+  return normalizeRepairSuggestions(
+    (Array.isArray(conflicts) ? conflicts : []).map((conflict) => buildRepairSuggestionFromConflict(conflict)),
+    []
+  ).slice(0, 6);
+}
+
+function splitDraftReplySections(draftBody = "") {
+  const text = String(draftBody || "");
+  const marker = "----- Original Message -----";
+  const markerIndex = text.indexOf(marker);
+  const editableBody = markerIndex === -1 ? text.trim() : text.slice(0, markerIndex).trim();
+  const quotedBlock = markerIndex === -1 ? "" : text.slice(markerIndex).trim();
+  return { editableBody, quotedBlock };
+}
+
+function buildFallbackSafeRewrite({
+  draftSubject = "",
+  draftBody = "",
+  repairSuggestions = [],
+  project = null
+} = {}) {
+  const { editableBody } = splitDraftReplySections(draftBody);
+  const lines = editableBody
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const greeting = lines.find((line) => /^(dear|hello|hi|السادة|السيد|الأخوة|تحية)/i.test(line)) || "";
+  const closingCandidates = lines.filter((line) => /^(best regards|regards|sincerely|thanks|مع الشكر|وتفضلوا|وتفضلوا بقبول|تحياتي)/i.test(line));
+  const closing = closingCandidates[closingCandidates.length - 1] || "";
+  const uniqueRepairs = [...new Set((repairSuggestions || []).map((item) => String(item?.suggested_text || "").trim()).filter(Boolean))];
+  const rewrittenBody = [
+    greeting,
+    uniqueRepairs.join("\n\n") || editableBody,
+    closing
+  ].filter(Boolean).join("\n\n").trim();
+
+  return normalizeSafeRewrite({
+    title: project?.project_code ? `Safe rewrite for ${project.project_code}` : "Safe rewrite",
+    rewritten_body: rewrittenBody,
+    rationale: uniqueRepairs.length
+      ? "يجمع هذا النص كل اقتراحات الإصلاح المتوافقة في مسودة واحدة أكثر أمانًا واتساقًا مع العقد."
+      : "لم تكن هناك اقتراحات إصلاح كافية لإعادة كتابة المسودة تلقائيًا."
+  });
+}
+
+function detectClauseConflicts({
+  structuredContractClauses = [],
+  historyEmails = [],
+  draftSubject = "",
+  draftBody = ""
+} = {}) {
+  const draftText = `${draftSubject || ""}\n${draftBody || ""}`;
+  const normalizedDraft = draftText.toLowerCase();
+  const historyText = historyEmails
+    .map((item) => `${item.subject || ""}\n${item.ai_summary || ""}\n${item.body_excerpt || ""}`)
+    .join("\n")
+    .toLowerCase();
+  const draftDateTokens = extractDraftDates(draftText);
+  const draftPaymentTokens = [...extractPercentTokens(draftText), ...extractCurrencyTokens(draftText)];
+  const draftDurationTokens = extractDurationTokens(draftText);
+  const conflicts = [];
+
+  for (const clause of structuredContractClauses || []) {
+    const clauseType = String(clause?.clause_type || "general").toLowerCase();
+    const clauseText = `${clause?.clause_title || ""}\n${clause?.clause_value || ""}\n${clause?.normalized_value || ""}`;
+    const clauseTokens = collectClauseComparableTokens(clauseText);
+    const referenceKey = clause?.reference_key || "";
+
+    if (clauseType === "delivery_deadlines" && (draftDateTokens.length || draftDurationTokens.length || containsAny(normalizedDraft, ["deliver by", "delivery by", "موعد التسليم", "سيتم التسليم", "within", "خلال"]))) {
+      const draftTokens = [...draftDateTokens, ...draftDurationTokens];
+      const clauseOverlap = overlapCount(draftTokens, clauseTokens);
+      const historyOverlap = overlapCount(draftTokens, collectClauseComparableTokens(historyText));
+      if (draftTokens.length && !clauseOverlap && !historyOverlap) {
+        conflicts.push({
+          conflict_type: "deadline_conflict",
+          clause_type: clauseType,
+          severity: "high",
+          title: "تعارض في موعد التسليم",
+          details: "مسودة الرد تقترح موعدًا أو مدة تسليم تختلف عن البند التعاقدي الحالي ولا يظهر لها دعم واضح في المراسلات اللاحقة.",
+          reference_key: referenceKey,
+          expected_value: clause.normalized_value || clause.clause_value || "",
+          draft_evidence: draftTokens.join(", ")
+        });
+      }
+    }
+
+    if (clauseType === "payment_terms" && (draftPaymentTokens.length || containsAny(normalizedDraft, ["payment", "invoice", "advance", "دفعة", "دفعات", "سداد", "فاتورة"]))) {
+      const clauseOverlap = overlapCount(draftPaymentTokens, clauseTokens);
+      const historyOverlap = overlapCount(draftPaymentTokens, collectClauseComparableTokens(historyText));
+      if (draftPaymentTokens.length && !clauseOverlap && !historyOverlap) {
+        conflicts.push({
+          conflict_type: "payment_mismatch",
+          clause_type: clauseType,
+          severity: "high",
+          title: "اختلاف في شروط الدفع",
+          details: "المسودة تحتوي على نسب أو مبالغ أو شروط دفع لا تتطابق مع البند التعاقدي الحالي ولا مع المراسلات اللاحقة.",
+          reference_key: referenceKey,
+          expected_value: clause.normalized_value || clause.clause_value || "",
+          draft_evidence: draftPaymentTokens.join(", ")
+        });
+      }
+    }
+
+    if (clauseType === "scope_of_work" && containsAny(normalizedDraft, ["additional", "extra", "also include", "in addition", "free of charge", "إضافة", "إضافي", "يشمل أيضًا", "بدون تكلفة", "مجاني"])) {
+      const clauseLower = clauseText.toLowerCase();
+      const historySupportsExpansion = containsAny(historyText, ["additional", "extra", "change request", "variation", "إضافة", "إضافي", "أعمال إضافية", "تغيير نطاق"]);
+      if (!historySupportsExpansion && !containsAny(clauseLower, ["additional", "extra", "variation", "إضافة", "إضافي"])) {
+        conflicts.push({
+          conflict_type: "scope_expansion",
+          clause_type: clauseType,
+          severity: "high",
+          title: "توسعة نطاق غير مدعومة",
+          details: "مسودة الرد توسّع نطاق العمل أو تضيف التزامًا إضافيًا لا يظهر في البند الحالي ولا في المراسلات اللاحقة.",
+          reference_key: referenceKey,
+          expected_value: clause.normalized_value || clause.clause_value || "",
+          draft_evidence: draftText.slice(0, 220).trim()
+        });
+      }
+    }
+
+    if (clauseType === "warranties" && containsAny(normalizedDraft, ["warranty", "guarantee", "support period", "extended support", "ضمان", "كفالة", "تمديد الضمان", "فترة دعم"])) {
+      const draftWarrantyTokens = [...draftDurationTokens, ...extractPercentTokens(draftText)];
+      const clauseOverlap = overlapCount(draftWarrantyTokens, clauseTokens);
+      const historySupportsWarranty = containsAny(historyText, ["warranty", "guarantee", "support period", "ضمان", "كفالة", "فترة دعم"]);
+      if ((!draftWarrantyTokens.length && !historySupportsWarranty) || (draftWarrantyTokens.length && !clauseOverlap && !historySupportsWarranty)) {
+        conflicts.push({
+          conflict_type: "unsupported_warranty",
+          clause_type: clauseType,
+          severity: "critical",
+          title: "ضمان غير مدعوم تعاقديًا",
+          details: "المسودة تقدّم ضمانًا أو فترة دعم لا تتطابق مع البند الحالي ولا يوجد ما يدعمها بوضوح في المراسلات اللاحقة.",
+          reference_key: referenceKey,
+          expected_value: clause.normalized_value || clause.clause_value || "",
+          draft_evidence: draftText.slice(0, 220).trim()
+        });
+      }
+    }
+  }
+
+  if (!structuredContractClauses.some((item) => String(item?.clause_type || "").toLowerCase() === "warranties")
+    && containsAny(normalizedDraft, ["warranty", "guarantee", "support period", "ضمان", "كفالة", "فترة دعم"])) {
+    conflicts.push({
+      conflict_type: "unsupported_warranty",
+      clause_type: "warranties",
+      severity: "critical",
+      title: "ضمان مذكور دون بند تعاقدي",
+      details: "المسودة تحتوي على ضمان أو فترة دعم، لكن لا يوجد بند ضمان منظم ضمن العقد الحالي يمكن الاستناد إليه.",
+      reference_key: structuredContractClauses[0]?.reference_key || "",
+      expected_value: "",
+      draft_evidence: draftText.slice(0, 220).trim()
+    });
+  }
+
+  return normalizePolicyConflicts(conflicts, []);
+}
+
 function normalizeResponsePolicyGuardPayload(payload = {}, fallback = {}) {
   const supportedPointsSource = Array.isArray(payload?.supported_points)
     ? payload.supported_points
@@ -959,12 +1608,18 @@ function normalizeResponsePolicyGuardPayload(payload = {}, fallback = {}) {
     : Array.isArray(fallback?.checked_references)
       ? fallback.checked_references
       : [];
+  const fallbackConflicts = Array.isArray(fallback?.conflicts) ? fallback.conflicts : [];
+  const fallbackRepairSuggestions = Array.isArray(fallback?.repair_suggestions) ? fallback.repair_suggestions : [];
+  const fallbackSafeRewrite = fallback?.safe_rewrite || {};
 
   return {
     verdict: normalizePolicyVerdict(payload?.verdict, fallback?.verdict || "clear"),
     severity: normalizePolicySeverity(payload?.severity, fallback?.severity || "low"),
     summary: String(payload?.summary || fallback?.summary || "").trim(),
     issues: normalizePolicyIssues(payload?.issues, fallback?.issues),
+    conflicts: normalizePolicyConflicts(payload?.conflicts, fallbackConflicts),
+    repair_suggestions: normalizeRepairSuggestions(payload?.repair_suggestions, fallbackRepairSuggestions),
+    safe_rewrite: normalizeSafeRewrite(payload?.safe_rewrite, fallbackSafeRewrite),
     supported_points: supportedPointsSource.map((item) => String(item || "").trim()).filter(Boolean).slice(0, 8),
     checked_references: checkedReferencesSource.map((item) => String(item || "").trim()).filter(Boolean).slice(0, 10),
     provider: String(payload?.provider || fallback?.provider || "rules").trim() || "rules"
@@ -976,6 +1631,7 @@ function buildResponsePolicyGuardPrompt({
   project = null,
   historyEmails = [],
   contractMemoryEntries = [],
+  structuredContractClauses = [],
   draftSubject = "",
   draftBody = ""
 } = {}) {
@@ -1000,11 +1656,21 @@ function buildResponsePolicyGuardPrompt({
       `Snippet: ${item.snippet || "-"}`
     ].join("\n")).join("\n\n----------------\n\n")
     : "No structured contract memory snippets were found.";
+  const clauseSection = structuredContractClauses.length
+    ? structuredContractClauses.map((item, index) => [
+      `Clause #${index + 1}`,
+      `Type: ${item.clause_type || "general"}`,
+      `Title: ${item.clause_title || "-"}`,
+      `Value: ${item.clause_value || "-"}`,
+      `Normalized: ${item.normalized_value || "-"}`,
+      `Reference: ${item.reference_key || "-"}`
+    ].join("\n")).join("\n\n----------------\n\n")
+    : "No structured contract clauses were found.";
 
   return [
     "You are a Response Policy Guard for an enterprise email system.",
-    "Review the proposed reply draft against the historical project correspondence and structured contract memory.",
-    "Identify contradictions, unsupported promises, pricing exposure, deadline changes, legal commitments, approval claims, and mismatches against contractual snippets.",
+    "Review the proposed reply draft against the historical project correspondence, structured contract memory, and structured contract clauses.",
+    "Identify contradictions, unsupported promises, pricing exposure, deadline changes, legal commitments, approval claims, and mismatches against contractual clauses.",
     "Return strict JSON only.",
     "JSON schema:",
     "{",
@@ -1019,16 +1685,42 @@ function buildResponsePolicyGuardPrompt({
     '    "supported_by_history": true/false,',
     '    "historical_reference": "serial/subject or empty"',
     "  }],",
+    '  "conflicts": [{',
+    '    "conflict_type": "deadline_conflict|payment_mismatch|scope_expansion|unsupported_warranty|general_conflict",',
+    '    "clause_type": "payment_terms|delivery_deadlines|penalties|warranties|scope_of_work|general",',
+    '    "severity": "low|medium|high|critical",',
+    '    "title": "short conflict title",',
+    '    "details": "clear Arabic explanation",',
+    '    "reference_key": "contract clause reference or empty",',
+    '    "expected_value": "what the current clause expects",',
+    '    "draft_evidence": "what in the draft triggered the conflict"',
+    "  }],",
+    '  "repair_suggestions": [{',
+    '    "conflict_type": "deadline_conflict|payment_mismatch|scope_expansion|unsupported_warranty|general_conflict",',
+    '    "title": "short repair title",',
+    '    "suggested_text": "safe alternative wording ready to paste into the reply",',
+    '    "rationale": "why this wording is safer",',
+    '    "reference_key": "contract clause reference or empty"',
+    "  }],",
+    '  "safe_rewrite": {',
+    '    "title": "short label for the rewritten draft",',
+    '    "rewritten_body": "full safe replacement for the editable draft body only",',
+    '    "rationale": "why the full rewrite is safer"',
+    "  },",
     '  "supported_points": ["claims in the draft that are supported by history"],',
     '  "checked_references": ["serials or subjects used for validation"],',
     '  "provider": "openai|gemini|rules"',
     "}",
     "Rules:",
     "- Focus on unsupported promises, delivery commitments, approvals, legal guarantees, price/discount statements, payment confirmations, deadline commitments, and scope changes.",
+    "- Compare the draft clause-by-clause against the current contract clauses and any supporting later correspondence.",
+    "- Use the explicit conflict types when applicable: deadline_conflict, payment_mismatch, scope_expansion, unsupported_warranty.",
+    "- When conflicts exist, provide repair_suggestions with contract-safe wording that removes or softens the conflicting promise.",
+    "- When there are multiple compatible repair suggestions, also return safe_rewrite as one cohesive replacement for the editable draft body.",
     "- If the draft introduces a strong promise without historical support, severity should be high or critical.",
     "- If the draft contradicts an earlier rejection, limitation, or unresolved issue, verdict should be review_required or blocked.",
     "- Use Arabic in summary/details when possible.",
-    "- Do not invent references; only cite references present in the provided history or contract memory.",
+    "- Do not invent references; only cite references present in the provided history, structured clauses, or contract memory.",
     "",
     `Project: ${project?.project_code || "Unknown"} | ${project?.project_name || ""}`,
     "Current source email:",
@@ -1045,7 +1737,10 @@ function buildResponsePolicyGuardPrompt({
     historySection,
     "",
     "Structured contract memory:",
-    contractMemorySection
+    contractMemorySection,
+    "",
+    "Structured contract clauses:",
+    clauseSection
   ].join("\n");
 }
 
@@ -1064,6 +1759,7 @@ function buildRulesFallbackResponsePolicyGuard({
   project = null,
   historyEmails = [],
   contractMemoryEntries = [],
+  structuredContractClauses = [],
   draftSubject = "",
   draftBody = ""
 } = {}) {
@@ -1076,13 +1772,31 @@ function buildRulesFallbackResponsePolicyGuard({
     .map((item) => `${item.title || ""}\n${item.snippet || ""}\n${item.reference_key || ""}`)
     .join("\n")
     .toLowerCase();
-  const evidenceText = `${historyText}\n${contractMemoryText}`;
+  const structuredClauseText = structuredContractClauses
+    .map((item) => `${item.clause_type || ""}\n${item.clause_title || ""}\n${item.clause_value || ""}\n${item.normalized_value || ""}\n${item.reference_key || ""}`)
+    .join("\n")
+    .toLowerCase();
+  const evidenceText = `${historyText}\n${contractMemoryText}\n${structuredClauseText}`;
   const references = [
+    ...structuredContractClauses.map((item) => item.reference_key || item.clause_title || "").filter(Boolean),
     ...contractMemoryEntries.map((item) => item.reference_key || item.title || "").filter(Boolean),
     ...historyEmails.map((item) => item.serial_number || item.subject || "").filter(Boolean)
   ].slice(0, 8);
   const issues = [];
   const supportedPoints = [];
+  const conflicts = detectClauseConflicts({
+    structuredContractClauses,
+    historyEmails,
+    draftSubject,
+    draftBody
+  });
+  const repairSuggestions = buildRepairSuggestionsFromConflicts(conflicts);
+  const safeRewrite = buildFallbackSafeRewrite({
+    draftSubject,
+    draftBody,
+    repairSuggestions,
+    project
+  });
 
   const strongCommitmentPatterns = ["guarantee", "guaranteed", "commit", "committed", "we confirm", "confirmed", "نضمن", "التزام", "نؤكد", "ملتزمون"];
   if (containsAny(draftText, strongCommitmentPatterns) && !containsAny(evidenceText, strongCommitmentPatterns)) {
@@ -1148,6 +1862,10 @@ function buildRulesFallbackResponsePolicyGuard({
     });
   }
 
+  for (const conflict of conflicts) {
+    issues.push(buildClauseConflictIssue(conflict));
+  }
+
   const verdict = issues.some((item) => item.severity === "critical")
     ? "blocked"
     : issues.some((item) => item.severity === "high" || item.severity === "medium")
@@ -1165,9 +1883,12 @@ function buildRulesFallbackResponsePolicyGuard({
     verdict,
     severity,
     summary: issues.length
-      ? `تم رصد ${issues.length} نقطة تحتاج مراجعة قبل اعتماد الرد.`
+      ? `تم رصد ${issues.length} نقطة تحتاج مراجعة قبل اعتماد الرد${conflicts.length ? `، منها ${conflicts.length} تعارضات تعاقدية مباشرة` : ""}.`
       : `لم يتم رصد تعارضات واضحة في مسودة الرد الحالية${project?.project_code ? ` ضمن المشروع ${project.project_code}` : ""}.`,
     issues,
+    conflicts,
+    repair_suggestions: repairSuggestions,
+    safe_rewrite: safeRewrite,
     supported_points: supportedPoints,
     checked_references: references,
     provider: "rules"
@@ -1252,6 +1973,8 @@ export {
   analyzeInboundTaskExtractionWithLlm,
   analyzeEmailBrain,
   normalizeEmailBrainPayload,
+  extractStructuredContractClauses,
   generateReplyDraftWithHistory,
-  generateResponsePolicyGuard
+  generateResponsePolicyGuard,
+  extractTextWithVisionOcr
 };

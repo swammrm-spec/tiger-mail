@@ -1,10 +1,13 @@
 import fs from "fs";
 import path from "path";
 import bcrypt from "bcryptjs";
+import mammoth from "mammoth";
+import { PDFParse } from "pdf-parse";
+import { createWorker } from "tesseract.js";
 import * as XLSX from "xlsx";
 import { Pool } from "pg";
 import { newDb } from "pg-mem";
-import { analyzeDraftWithLlm } from "./aiAnalysisService.js";
+import { analyzeDraftWithLlm, extractStructuredContractClauses, extractTextWithVisionOcr } from "./aiAnalysisService.js";
 
 const legacyRuntimeDir = path.resolve("runtime");
 const legacyUploadsDir = path.join(legacyRuntimeDir, "uploads");
@@ -79,7 +82,8 @@ const persistedTableQueries = {
   approval_logs: "SELECT * FROM approval_logs ORDER BY id ASC",
   approval_action_tokens: "SELECT * FROM approval_action_tokens ORDER BY id ASC",
   recent_contacts: "SELECT * FROM recent_contacts ORDER BY id ASC",
-  contract_memory: "SELECT * FROM contract_memory ORDER BY id ASC"
+  contract_memory: "SELECT * FROM contract_memory ORDER BY id ASC",
+  contract_clause_memory: "SELECT * FROM contract_clause_memory ORDER BY id ASC"
 };
 
 const serialSequences = [
@@ -102,7 +106,8 @@ const serialSequences = [
   { tableName: "approval_logs", sequenceName: "approval_logs_id_seq", pkColumn: "id" },
   { tableName: "approval_action_tokens", sequenceName: "approval_action_tokens_id_seq", pkColumn: "id" },
   { tableName: "recent_contacts", sequenceName: "recent_contacts_id_seq", pkColumn: "id" },
-  { tableName: "contract_memory", sequenceName: "contract_memory_id_seq", pkColumn: "id" }
+  { tableName: "contract_memory", sequenceName: "contract_memory_id_seq", pkColumn: "id" },
+  { tableName: "contract_clause_memory", sequenceName: "contract_clause_memory_id_seq", pkColumn: "id" }
 ];
 
 function ensureDirectory(dirPath) {
@@ -758,11 +763,50 @@ async function appendApprovalLog({
   );
 }
 
+async function addMissingEmailColumns() {
+  const cols = [
+    "recipient_name TEXT", "recipient_email TEXT", "cc_list TEXT", "bcc_list TEXT",
+    "queued_at TIMESTAMPTZ", "sent_at TIMESTAMPTZ",
+    "sensitivity TEXT DEFAULT 'Normal'", "read_receipt BOOLEAN DEFAULT FALSE",
+    "delivery_receipt BOOLEAN DEFAULT FALSE", "recalled BOOLEAN DEFAULT FALSE",
+    "recalled_at TIMESTAMPTZ", "employee_id INTEGER",
+    "serialized BOOLEAN DEFAULT FALSE", "serialized_at TIMESTAMPTZ",
+    "approval_status TEXT DEFAULT 'none'", "approved_by INTEGER",
+    "approved_at TIMESTAMPTZ", "rejection_reason TEXT DEFAULT ''",
+    "parent_id INTEGER", "thread_depth INTEGER DEFAULT 0",
+    "approval_root_id INTEGER", "version_number INTEGER DEFAULT 1",
+    "subject_key TEXT DEFAULT ''", "assigned_manager_id INTEGER",
+    "submitted_by INTEGER", "manager_comments TEXT DEFAULT ''",
+    "approval_requested_at TIMESTAMPTZ", "approval_decision_at TIMESTAMPTZ",
+    "last_action_at TIMESTAMPTZ", "body_html TEXT",
+    "ai_sentiment TEXT DEFAULT 'Unknown'", "ai_tone_score INTEGER DEFAULT 0",
+    "ai_recommendations TEXT DEFAULT ''", "ai_provider TEXT DEFAULT 'rules'",
+    "needs_revision BOOLEAN DEFAULT FALSE", "risk_level TEXT DEFAULT 'low'",
+    "risk_flags TEXT DEFAULT ''", "reminder_count INTEGER DEFAULT 0",
+    "last_reminder_at TIMESTAMPTZ", "last_reminder_slot TEXT DEFAULT ''",
+    "scheduled_at TIMESTAMPTZ", "snoozed_until TIMESTAMPTZ",
+    "project_id INTEGER", "email_key_id INTEGER",
+    "account_id INTEGER",
+    "ai_summary TEXT", "transaction_type TEXT", "urgency_level TEXT",
+    "needs_reply BOOLEAN DEFAULT FALSE", "reply_deadline TIMESTAMPTZ",
+    "replied_at TIMESTAMPTZ", "archived BOOLEAN DEFAULT FALSE",
+    "archived_at TIMESTAMPTZ"
+  ];
+  for (const col of cols) {
+    try { await query(`ALTER TABLE emails ADD COLUMN IF NOT EXISTS ${col}`); } catch (e) { /* already exists */ }
+  }
+  try { await query(`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS overdue_notified BOOLEAN DEFAULT FALSE`); } catch (e) {}
+  try { await query(`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS overdue_notified_at TIMESTAMPTZ`); } catch (e) {}
+  try { await query(`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS deadline_reminder_sent BOOLEAN DEFAULT FALSE`); } catch (e) {}
+  try { await query(`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS deadline_reminder_at TIMESTAMPTZ`); } catch (e) {}
+}
+
 async function initializeDatabase() {
   migrateLegacyRuntimeData();
   fs.mkdirSync(uploadsDir, { recursive: true });
   pool = createPool();
   await runSchema();
+  await addMissingEmailColumns();
   await restorePersistentState();
   await migrateLegacyDefaultAdminIdentity();
   await migrateRecentContactsFromHistory();
@@ -1551,6 +1595,33 @@ async function runSchema() {
     await query(`CREATE INDEX IF NOT EXISTS idx_contract_memory_attachment_id ON contract_memory(source_attachment_id)`);
     await query(`CREATE INDEX IF NOT EXISTS idx_contract_memory_type ON contract_memory(memory_type)`);
   } catch (e) { /* contract_memory table optional */ }
+
+  try {
+    await query(`
+      CREATE TABLE IF NOT EXISTS contract_clause_memory (
+        id BIGSERIAL PRIMARY KEY,
+        clause_key TEXT UNIQUE,
+        project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+        employee_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        source_memory_id BIGINT REFERENCES contract_memory(id) ON DELETE CASCADE,
+        source_email_id INTEGER REFERENCES emails(id) ON DELETE CASCADE,
+        source_attachment_id INTEGER REFERENCES attachments(id) ON DELETE CASCADE,
+        clause_type TEXT DEFAULT 'general',
+        clause_title TEXT DEFAULT '',
+        clause_value TEXT NOT NULL,
+        normalized_value TEXT DEFAULT '',
+        reference_key TEXT DEFAULT '',
+        confidence TEXT DEFAULT 'medium',
+        source_updated_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await query(`CREATE INDEX IF NOT EXISTS idx_contract_clause_memory_project_id ON contract_clause_memory(project_id)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_contract_clause_memory_employee_id ON contract_clause_memory(employee_id)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_contract_clause_memory_memory_id ON contract_clause_memory(source_memory_id)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_contract_clause_memory_type ON contract_clause_memory(clause_type)`);
+  } catch (e) { /* contract_clause_memory table optional */ }
 
   try {
     await query(`
@@ -4336,14 +4407,15 @@ async function rejectEmail(emailId, approverId, reason = "", ipAddress = "") {
   return updated;
 }
 
-async function reviseRejectedApproval(emailId, employeeId, draftUpdates = {}, files = [], ipAddress = "") {
+async function reviseRejectedApproval(emailId, employeeId, draftUpdates = {}, files = [], ipAddress = "", options = {}) {
   const rejected = await getApprovalEmailForEmployee(emailId, employeeId, ["rejected"]);
   if (!rejected) {
     throw new Error("Rejected email not found or not owned by the current employee.");
   }
 
   const owner = await getUserById(employeeId);
-  const assignedManagerId = owner?.manager_id || rejected.assigned_manager_id;
+  const overrideManagerId = Number(options.managerId || 0) || null;
+  const assignedManagerId = overrideManagerId || owner?.manager_id || rejected.assigned_manager_id;
   if (!assignedManagerId) {
     throw new Error("No manager is assigned to this employee.");
   }
@@ -4355,6 +4427,7 @@ async function reviseRejectedApproval(emailId, employeeId, draftUpdates = {}, fi
       recipientName: draftUpdates.recipient_name ?? rejected.recipient_name,
       recipientEmail: draftUpdates.recipient_email ?? rejected.recipient_email,
       ccList: draftUpdates.cc_list ?? rejected.cc_list,
+      bccList: draftUpdates.bcc_list ?? rejected.bcc_list,
       subject: draftUpdates.subject ?? rejected.subject,
       body: draftUpdates.body ?? rejected.body,
       priority: draftUpdates.priority ?? rejected.priority,
@@ -5168,7 +5241,25 @@ function buildContractMemorySnippets(text = "", maxSnippets = 3) {
 }
 
 function isSupportedAttachmentTextExtension(extension = "") {
-  return [".txt", ".md", ".csv", ".json", ".xml", ".html", ".htm", ".log", ".xlsx", ".xls"].includes(String(extension || "").toLowerCase());
+  return [".txt", ".md", ".csv", ".json", ".xml", ".html", ".htm", ".log", ".xlsx", ".xls", ".pdf", ".docx", ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"].includes(String(extension || "").toLowerCase());
+}
+
+function isImageAttachmentExtension(extension = "") {
+  return [".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"].includes(String(extension || "").toLowerCase());
+}
+
+function isVisualAttachmentExtension(extension = "") {
+  const normalized = String(extension || "").toLowerCase();
+  return normalized === ".pdf" || isImageAttachmentExtension(normalized);
+}
+
+function hasMeaningfulExtractedText(text = "", minimumLength = 120) {
+  const normalized = normalizeContractMemoryText(text);
+  if (normalized.length >= minimumLength) {
+    return true;
+  }
+  const wordCount = normalized.split(/\s+/).filter(Boolean).length;
+  return wordCount >= 24;
 }
 
 function extractTextFromSpreadsheet(filePath) {
@@ -5189,7 +5280,69 @@ function extractTextFromSpreadsheet(filePath) {
   }
 }
 
-function extractAttachmentTextForContractMemory(attachment = {}) {
+async function extractTextFromPdf(filePath) {
+  let parser = null;
+  try {
+    const buffer = await fs.promises.readFile(filePath);
+    parser = new PDFParse({ data: buffer });
+    const result = await parser.getText();
+    return result?.text || "";
+  } catch {
+    return "";
+  } finally {
+    if (parser && typeof parser.destroy === "function") {
+      try {
+        await parser.destroy();
+      } catch {
+        // Ignore parser cleanup errors.
+      }
+    }
+  }
+}
+
+async function extractTextFromDocx(filePath) {
+  try {
+    const result = await mammoth.extractRawText({ path: filePath });
+    return result?.value || "";
+  } catch {
+    return "";
+  }
+}
+
+async function extractTextFromImageWithTesseract(filePath) {
+  let worker = null;
+  try {
+    const language = process.env.CONTRACT_OCR_LANGS || "eng+ara";
+    worker = await createWorker(language);
+    const result = await worker.recognize(filePath);
+    return result?.data?.text || "";
+  } catch {
+    return "";
+  } finally {
+    if (worker && typeof worker.terminate === "function") {
+      try {
+        await worker.terminate();
+      } catch {
+        // Ignore worker cleanup errors.
+      }
+    }
+  }
+}
+
+async function extractTextUsingVisionFallback(filePath, mimeType = "", fileName = "") {
+  try {
+    const fileBuffer = await fs.promises.readFile(filePath);
+    return await extractTextWithVisionOcr({
+      fileBuffer,
+      mimeType,
+      fileName
+    });
+  } catch {
+    return "";
+  }
+}
+
+async function extractAttachmentTextForContractMemory(attachment = {}) {
   const filePath = resolveStoredAttachmentDiskPath(attachment.file_path || "");
   if (!filePath || !fs.existsSync(filePath)) {
     return "";
@@ -5201,10 +5354,27 @@ function extractAttachmentTextForContractMemory(attachment = {}) {
   }
 
   try {
+    if (extension === ".pdf") {
+      const pdfText = await extractTextFromPdf(filePath);
+      if (hasMeaningfulExtractedText(pdfText)) {
+        return pdfText;
+      }
+      return await extractTextUsingVisionFallback(filePath, attachment.mime_type || "application/pdf", attachment.file_name || attachment.originalname || "attachment.pdf");
+    }
+    if (extension === ".docx") {
+      return await extractTextFromDocx(filePath);
+    }
+    if (isImageAttachmentExtension(extension)) {
+      const imageText = await extractTextFromImageWithTesseract(filePath);
+      if (hasMeaningfulExtractedText(imageText, 60)) {
+        return imageText;
+      }
+      return await extractTextUsingVisionFallback(filePath, attachment.mime_type || "image/png", attachment.file_name || attachment.originalname || "attachment-image");
+    }
     if (extension === ".xlsx" || extension === ".xls") {
       return extractTextFromSpreadsheet(filePath);
     }
-    return fs.readFileSync(filePath, "utf8");
+    return await fs.promises.readFile(filePath, "utf8");
   } catch {
     return "";
   }
@@ -5261,6 +5431,58 @@ async function upsertContractMemoryEntry(entry = {}) {
     ]
   );
   return result.rows[0] || null;
+}
+
+async function replaceStructuredClausesForMemory(memoryEntry = {}) {
+  if (!memoryEntry?.id || !memoryEntry?.project_id || !memoryEntry?.snippet) {
+    return [];
+  }
+
+  await query(`DELETE FROM contract_clause_memory WHERE source_memory_id = $1`, [memoryEntry.id]);
+
+  const extracted = await extractStructuredContractClauses({
+    snippet: memoryEntry.snippet,
+    title: memoryEntry.title,
+    memoryType: memoryEntry.memory_type,
+    referenceKey: memoryEntry.reference_key,
+    sourceFileName: memoryEntry.source_file_name
+  });
+  const clauses = Array.isArray(extracted?.clauses) ? extracted.clauses : [];
+  const savedClauses = [];
+
+  for (const [index, clause] of clauses.entries()) {
+    if (!clause?.clause_value) continue;
+    const result = await query(
+      `
+        INSERT INTO contract_clause_memory (
+          clause_key, project_id, employee_id, source_memory_id, source_email_id, source_attachment_id,
+          clause_type, clause_title, clause_value, normalized_value, reference_key, confidence, source_updated_at, updated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
+        RETURNING *
+      `,
+      [
+        `${memoryEntry.id}:${clause.clause_type || "general"}:${index}`,
+        memoryEntry.project_id,
+        memoryEntry.employee_id || null,
+        memoryEntry.id,
+        memoryEntry.source_email_id || null,
+        memoryEntry.source_attachment_id || null,
+        clause.clause_type || "general",
+        clause.clause_title || "",
+        clause.clause_value,
+        clause.normalized_value || "",
+        memoryEntry.reference_key || "",
+        clause.confidence || memoryEntry.confidence || "medium",
+        memoryEntry.source_updated_at || null
+      ]
+    );
+    if (result.rows[0]) {
+      savedClauses.push(result.rows[0]);
+    }
+  }
+
+  return savedClauses;
 }
 
 async function ensureContractMemoryForProject(projectId, employeeId = null) {
@@ -5331,8 +5553,12 @@ async function ensureContractMemoryForProject(projectId, employeeId = null) {
 
     const attachments = await getEmailAttachments(email.email_id);
     for (const attachment of attachments || []) {
-      const candidate = looksLikeContractMemoryCandidate("", attachment.file_name || "", attachment.mime_type || "");
-      const attachmentTextRaw = candidate ? extractAttachmentTextForContractMemory(attachment) : "";
+      const attachmentExtension = path.extname(String(attachment.file_name || attachment.originalname || "")).toLowerCase();
+      const parentSuggestsContract = looksLikeContractMemoryCandidate(emailText, email.subject || "", "message/rfc822");
+      const candidate =
+        looksLikeContractMemoryCandidate("", attachment.file_name || "", attachment.mime_type || "")
+        || (parentSuggestsContract && isVisualAttachmentExtension(attachmentExtension));
+      const attachmentTextRaw = candidate ? await extractAttachmentTextForContractMemory(attachment) : "";
       const attachmentText = normalizeContractMemoryText(attachmentTextRaw);
       if (!candidate && !looksLikeContractMemoryCandidate(attachmentText, attachment.file_name || "", attachment.mime_type || "")) {
         continue;
@@ -5366,6 +5592,28 @@ async function ensureContractMemoryForProject(projectId, employeeId = null) {
   return refreshedEntries;
 }
 
+async function ensureStructuredContractClausesForProject(projectId, employeeId = null, memoryEntries = null) {
+  if (!projectId) {
+    return [];
+  }
+
+  const ensuredMemoryEntries = Array.isArray(memoryEntries) && memoryEntries.length
+    ? memoryEntries
+    : await getContractMemoryForProject({
+      projectId,
+      employeeId,
+      limit: 30
+    });
+
+  const refreshed = [];
+  for (const memoryEntry of ensuredMemoryEntries) {
+    const clauses = await replaceStructuredClausesForMemory(memoryEntry);
+    refreshed.push(...clauses);
+  }
+
+  return refreshed;
+}
+
 async function getContractMemoryForProject({
   projectId,
   employeeId = null,
@@ -5389,6 +5637,51 @@ async function getContractMemoryForProject({
     `
       SELECT *
       FROM contract_memory
+      ${whereSql}
+      ORDER BY
+        CASE confidence
+          WHEN 'high' THEN 0
+          WHEN 'medium' THEN 1
+          ELSE 2
+        END ASC,
+        updated_at DESC,
+        id DESC
+      LIMIT $${params.length}
+    `,
+    params
+  );
+
+  return result.rows || [];
+}
+
+async function getStructuredContractClausesForProject({
+  projectId,
+  employeeId = null,
+  limit = 16
+} = {}) {
+  if (!projectId) {
+    return [];
+  }
+
+  const memoryEntries = await getContractMemoryForProject({
+    projectId,
+    employeeId,
+    limit: 30
+  });
+  await ensureStructuredContractClausesForProject(projectId, employeeId, memoryEntries);
+
+  const params = [Number(projectId)];
+  let whereSql = `WHERE project_id = $1`;
+  if (employeeId) {
+    params.push(Number(employeeId));
+    whereSql += ` AND (employee_id = $${params.length} OR employee_id IS NULL)`;
+  }
+  params.push(Math.min(40, Math.max(1, Number(limit || 16))));
+
+  const result = await query(
+    `
+      SELECT *
+      FROM contract_clause_memory
       ${whereSql}
       ORDER BY
         CASE confidence
@@ -5629,7 +5922,7 @@ async function trackEmailThread(messageId, inReplyTo, referencesHeader, serial, 
         }
       }
 
-      if (!threadId && referencesHeader) {
+      if (!threadId && referencesHeader && typeof referencesHeader === "string") {
         const refs = referencesHeader.split(/\s+/).filter(Boolean);
         for (const ref of refs) {
           const refResult = await client.query(
@@ -5689,7 +5982,7 @@ async function resolveSerialFromHeaders(messageId, inReplyTo, referencesHeader) 
     if (result.rows.length && result.rows[0].serial) return result.rows[0].serial;
   }
 
-  if (referencesHeader) {
+  if (referencesHeader && typeof referencesHeader === "string") {
     const refs = referencesHeader.split(/\s+/).filter(Boolean);
     for (const ref of refs) {
       const result = await query(
@@ -6494,6 +6787,7 @@ export {
   getEmailsByProject,
   getProjectEmailHistoryForDrafting,
   getContractMemoryForProject,
+  getStructuredContractClausesForProject,
   parseSubjectForMetadata,
   generateHiddenFooter,
   extractHiddenRef,

@@ -2,6 +2,81 @@ import { useState } from "react";
 import dayjs from "dayjs";
 import { AlertTriangle, Archive, Paperclip, Send, ShieldAlert, Sparkles, X } from "lucide-react";
 
+function splitEditableReplyBody(text = "") {
+  const fullText = String(text || "");
+  const marker = "----- Original Message -----";
+  const markerIndex = fullText.indexOf(marker);
+  return markerIndex === -1 ? fullText.trim() : fullText.slice(0, markerIndex).trim();
+}
+
+function buildSafeRewriteDiffRows(currentBody = "", rewrittenBody = "") {
+  const currentLines = String(currentBody || "").split(/\r?\n/);
+  const rewrittenLines = String(rewrittenBody || "").split(/\r?\n/);
+  const maxLines = Math.max(currentLines.length, rewrittenLines.length);
+  const rows = [];
+
+  for (let index = 0; index < maxLines; index += 1) {
+    const currentLine = String(currentLines[index] || "").trim();
+    const rewrittenLine = String(rewrittenLines[index] || "").trim();
+    let type = "unchanged";
+    if (currentLine && !rewrittenLine) {
+      type = "removed";
+    } else if (!currentLine && rewrittenLine) {
+      type = "added";
+    } else if (currentLine !== rewrittenLine) {
+      type = "changed";
+    }
+    rows.push({
+      id: `${index}-${type}`,
+      index: index + 1,
+      type,
+      currentLine,
+      rewrittenLine
+    });
+  }
+
+  return rows;
+}
+
+function buildContractImpactSummary(conflicts = [], repairSuggestions = []) {
+  const source = Array.isArray(conflicts) ? conflicts : [];
+  const referenceMap = new Map(
+    (Array.isArray(repairSuggestions) ? repairSuggestions : []).map((item) => [item.conflict_type, item.reference_key || ""])
+  );
+  return source.map((conflict) => {
+    const reference = conflict.reference_key || referenceMap.get(conflict.conflict_type) || "";
+    const byType = {
+      deadline_conflict: {
+        tone: "تشديد زمني",
+        description: "إزالة موعد أو مدة غير مدعومة وإرجاع الرد إلى الجدول الزمني المعتمد."
+      },
+      payment_mismatch: {
+        tone: "تشديد مالي",
+        description: "إلغاء نسب أو مبالغ دفع غير موثقة والرجوع إلى شروط الدفع الحالية."
+      },
+      scope_expansion: {
+        tone: "تقييد النطاق",
+        description: "منع توسعة نطاق العمل أو الأعمال الإضافية بدون اعتماد منفصل."
+      },
+      unsupported_warranty: {
+        tone: "تقييد الضمان",
+        description: "سحب أي وعد ضمان أو دعم غير منصوص عليه تعاقديًا."
+      },
+      general_conflict: {
+        tone: "تصحيح تعاقدي",
+        description: "إعادة الصياغة إلى لغة أكثر تحفظًا واتساقًا مع المرجع الحالي."
+      }
+    };
+    const meta = byType[conflict.conflict_type] || byType.general_conflict;
+    return {
+      key: `${conflict.conflict_type || "general"}-${reference}-${conflict.expected_value || ""}`,
+      tone: meta.tone,
+      description: meta.description,
+      reference
+    };
+  });
+}
+
 export default function MailComposeView({
   isSendingEmail,
   handleSendEmail,
@@ -27,6 +102,8 @@ export default function MailComposeView({
   isCheckingResponsePolicyGuard,
   isResponsePolicyGuardStale,
   handleRunResponsePolicyGuard,
+  handleApplyRepairSuggestion,
+  handleApplySafeRewrite,
   handleSubmit,
   showFrom,
   renderChipEmailInput,
@@ -54,12 +131,26 @@ export default function MailComposeView({
   const [showKeyDropdown, setShowKeyDropdown] = useState(false);
   const activeAccount = emailAccounts.find(a => a.id === activeAccountId) || emailAccounts[0];
   const selectedKey = emailKeys.find(k => k.id === Number(form.email_key_id));
+  const approvalLock = responsePolicyGuard?.approval_lock || null;
+  const isSafeRewriteApprovalLocked = Boolean(
+    approvalLock?.required
+    && Number(approvalLock?.approver_id || 0)
+    && Number(approvalLock?.approver_id || 0) !== Number(currentUser?.id || 0)
+  );
+  const currentEditableBody = splitEditableReplyBody(form.body);
+  const rewrittenEditableBody = String(responsePolicyGuard?.safe_rewrite?.rewritten_body || "").trim();
+  const safeRewriteDiffRows = buildSafeRewriteDiffRows(currentEditableBody, rewrittenEditableBody);
+  const visibleSafeRewriteDiffRows = safeRewriteDiffRows.filter((row) => row.type !== "unchanged").slice(0, 12);
+  const contractImpactSummary = buildContractImpactSummary(
+    responsePolicyGuard?.conflicts || [],
+    responsePolicyGuard?.repair_suggestions || []
+  ).slice(0, 6);
   return (
     <div className="o365-compose">
       <div className="o365-compose-ribbon">
         <div className="o365-ribbon-group">
           <button type="button" className="o365-ribbon-btn o365-ribbon-primary" disabled={isSendingEmail} onClick={handleSendEmail} style={{ minWidth: 60 }}>
-            <Send size={20} /><span className="o365-ribbon-btn-label">{isSendingEmail ? "Sending..." : "Send"}</span>
+            <Send size={20} /><span className="o365-ribbon-btn-label">{isSendingEmail ? "Sending..." : isSafeRewriteApprovalLocked ? "Submit Approval" : "Send"}</span>
           </button>
           <button className="o365-ribbon-btn" type="submit" form="compose-form" disabled={isSubmitting || !canArchive}>
             <Archive size={20} /><span className="o365-ribbon-btn-label">{isSubmitting ? "Saving..." : "Save"}</span>
@@ -84,6 +175,17 @@ export default function MailComposeView({
               title="Validate this reply against historical project commitments"
             >
               <ShieldAlert size={20} /><span className="o365-ribbon-btn-label">{isCheckingResponsePolicyGuard ? "Checking..." : "Policy Guard"}</span>
+            </button>
+          ) : null}
+          {composeReplySourceEmail ? (
+            <button
+              type="button"
+              className="o365-ribbon-btn"
+              disabled={isCheckingResponsePolicyGuard || !responsePolicyGuard?.safe_rewrite?.rewritten_body || isSafeRewriteApprovalLocked}
+              onClick={handleApplySafeRewrite}
+              title="Rewrite the editable draft body using all safe repair suggestions"
+            >
+              <Sparkles size={20} /><span className="o365-ribbon-btn-label">Safe Rewrite</span>
             </button>
           ) : null}
           <button className="o365-ribbon-btn" onClick={() => setCurrentView("mail")}>
@@ -175,9 +277,25 @@ export default function MailComposeView({
           <div style={{ marginTop: 4 }}>
             Historical context: <strong>{Number(draftAssistantMeta?.historyCount || 0)}</strong> email(s)
           </div>
+          <div style={{ marginTop: 4 }}>
+            Contract memory: <strong>{Number(draftAssistantMeta?.contractMemoryCount || 0)}</strong> snippet(s)
+          </div>
+          <div style={{ marginTop: 4 }}>
+            Structured clauses: <strong>{Number(draftAssistantMeta?.contractClauseCount || 0)}</strong> clause(s)
+          </div>
           {draftAssistantMeta?.references?.length ? (
             <div style={{ marginTop: 6, fontSize: 12, color: "#555" }}>
               References: {draftAssistantMeta.references.slice(0, 5).join(" | ")}
+            </div>
+          ) : null}
+          {draftAssistantMeta?.contractMemoryReferences?.length ? (
+            <div style={{ marginTop: 6, fontSize: 12, color: "#555" }}>
+              Contract refs: {draftAssistantMeta.contractMemoryReferences.slice(0, 5).join(" | ")}
+            </div>
+          ) : null}
+          {draftAssistantMeta?.contractClauseReferences?.length ? (
+            <div style={{ marginTop: 6, fontSize: 12, color: "#555" }}>
+              Clause refs: {draftAssistantMeta.contractClauseReferences.slice(0, 5).join(" | ")}
             </div>
           ) : null}
         </div>
@@ -203,6 +321,34 @@ export default function MailComposeView({
               Run Policy Guard before sending to check for unsupported promises, deadline changes, pricing exposure, or contract conflicts.
             </div>
           )}
+          {approvalLock?.required ? (
+            <div className={`o365-safe-rewrite-lock ${isSafeRewriteApprovalLocked ? "locked" : "ready"}`}>
+              <div style={{ fontWeight: 600 }}>
+                Safe Rewrite Approval Lock
+              </div>
+              <div style={{ marginTop: 4 }}>
+                {approvalLock.summary || approvalLock.reason || "Sensitive contractual changes require approval before apply/send."}
+              </div>
+              <div style={{ marginTop: 4, fontSize: 12 }}>
+                Approver: <strong>{approvalLock.approver_name || approvalLock.approver_email || "Not assigned"}</strong>
+                {approvalLock.approver_email && approvalLock.approver_name ? ` | ${approvalLock.approver_email}` : ""}
+              </div>
+              {approvalLock?.sensitive_conflict_types?.length ? (
+                <div style={{ marginTop: 4, fontSize: 12 }}>
+                  Locked by: {approvalLock.sensitive_conflict_types.join(" | ")}
+                </div>
+              ) : null}
+              {isSafeRewriteApprovalLocked ? (
+                <div style={{ marginTop: 6, fontSize: 12 }}>
+                  Apply actions are disabled. Use <strong>Submit Approval</strong> to route the safe rewrite to the approver.
+                </div>
+              ) : (
+                <div style={{ marginTop: 6, fontSize: 12 }}>
+                  You are the designated approver for this rewrite, so apply/send remains available.
+                </div>
+              )}
+            </div>
+          ) : null}
           {responsePolicyGuard?.issues?.length ? (
             <ul className="o365-compose-guidance-list" style={{ marginTop: 8 }}>
               {responsePolicyGuard.issues.slice(0, 5).map((issue, index) => (
@@ -212,6 +358,105 @@ export default function MailComposeView({
                 </li>
               ))}
             </ul>
+          ) : null}
+          {responsePolicyGuard?.conflicts?.length ? (
+            <div style={{ marginTop: 10 }}>
+              <div style={{ fontWeight: 600, marginBottom: 6 }}>Clause conflicts</div>
+              <ul className="o365-compose-guidance-list">
+                {responsePolicyGuard.conflicts.slice(0, 4).map((conflict, index) => (
+                  <li key={`${conflict.conflict_type || "conflict"}-${index}`}>
+                    <strong>{conflict.title || conflict.conflict_type || "Conflict"}:</strong> {conflict.details || "Clause review required."}
+                    {conflict.reference_key ? ` (${conflict.reference_key})` : ""}
+                    {conflict.expected_value ? ` | Expected: ${conflict.expected_value}` : ""}
+                    {conflict.draft_evidence ? ` | Draft: ${conflict.draft_evidence}` : ""}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          {responsePolicyGuard?.repair_suggestions?.length ? (
+            <div style={{ marginTop: 10 }}>
+              <div style={{ fontWeight: 600, marginBottom: 6 }}>Auto-repair suggestions</div>
+              <ul className="o365-compose-guidance-list">
+                {responsePolicyGuard.repair_suggestions.slice(0, 4).map((suggestion, index) => (
+                  <li key={`${suggestion.conflict_type || "repair"}-${index}`}>
+                    <strong>{suggestion.title || "Suggested repair"}:</strong> {suggestion.rationale || "Safer contract-aligned wording."}
+                    {suggestion.reference_key ? ` (${suggestion.reference_key})` : ""}
+                    <div style={{ marginTop: 6, whiteSpace: "pre-wrap" }}>{suggestion.suggested_text}</div>
+                    <button
+                      type="button"
+                      style={{ marginTop: 8 }}
+                      disabled={isSafeRewriteApprovalLocked}
+                      onClick={() => handleApplyRepairSuggestion?.(suggestion)}
+                    >
+                      Apply Suggestion
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          {responsePolicyGuard?.safe_rewrite?.rewritten_body ? (
+            <div style={{ marginTop: 10 }}>
+              <div style={{ fontWeight: 600, marginBottom: 6 }}>One-click safe rewrite</div>
+              <div style={{ fontSize: 12, color: "#555" }}>
+                {responsePolicyGuard.safe_rewrite.title || "Safe rewrite"}
+                {responsePolicyGuard.safe_rewrite.rationale ? `: ${responsePolicyGuard.safe_rewrite.rationale}` : ""}
+              </div>
+              <div className="o365-safe-rewrite-stats">
+                <span>Current lines: {currentEditableBody ? currentEditableBody.split(/\r?\n/).length : 0}</span>
+                <span>Safe lines: {rewrittenEditableBody ? rewrittenEditableBody.split(/\r?\n/).length : 0}</span>
+                <span>Reviewed changes: {visibleSafeRewriteDiffRows.length}</span>
+              </div>
+              {contractImpactSummary.length ? (
+                <div className="o365-safe-rewrite-impact-list">
+                  {contractImpactSummary.map((item) => (
+                    <div key={item.key} className="o365-safe-rewrite-impact-chip">
+                      <strong>{item.tone}</strong>
+                      <span>{item.description}</span>
+                      {item.reference ? <span>Ref: {item.reference}</span> : null}
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              <div className="o365-safe-rewrite-diff">
+                <div className="o365-safe-rewrite-diff-head">Safe Rewrite Diff Review</div>
+                {visibleSafeRewriteDiffRows.length ? (
+                  <div className="o365-safe-rewrite-diff-list">
+                    {visibleSafeRewriteDiffRows.map((row) => (
+                      <div key={row.id} className={`o365-safe-rewrite-diff-row ${row.type}`}>
+                        <div className="o365-safe-rewrite-diff-meta">
+                          <span className={`o365-safe-rewrite-badge ${row.type}`}>{row.type}</span>
+                          <span>Line {row.index}</span>
+                        </div>
+                        <div className="o365-safe-rewrite-diff-columns">
+                          <div className="o365-safe-rewrite-diff-column current">
+                            <div className="o365-safe-rewrite-diff-label">Current</div>
+                            <div className="o365-safe-rewrite-diff-text">{row.currentLine || " "}</div>
+                          </div>
+                          <div className="o365-safe-rewrite-diff-column next">
+                            <div className="o365-safe-rewrite-diff-label">Safe</div>
+                            <div className="o365-safe-rewrite-diff-text">{row.rewrittenLine || " "}</div>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="o365-safe-rewrite-diff-empty">
+                    No visible textual diff was detected, but the safe rewrite remains available for application.
+                  </div>
+                )}
+              </div>
+              <button
+                type="button"
+                style={{ marginTop: 8 }}
+                disabled={isSafeRewriteApprovalLocked}
+                onClick={handleApplySafeRewrite}
+              >
+                Apply Full Safe Rewrite
+              </button>
+            </div>
           ) : null}
           {responsePolicyGuard?.checked_references?.length ? (
             <div style={{ marginTop: 6, fontSize: 12, color: "#555" }}>

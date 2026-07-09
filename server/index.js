@@ -96,6 +96,7 @@ import {
   getEmailsByProject,
   getProjectEmailHistoryForDrafting,
   getContractMemoryForProject,
+  getStructuredContractClausesForProject,
   parseSubjectForMetadata,
   generateHiddenFooter,
   extractHiddenRef,
@@ -544,10 +545,60 @@ function getUserApprovalPolicy(user, managedUsers = []) {
   };
 }
 
-async function submitPendingApprovalFromCompose(req, user, employeeId) {
+const safeRewriteSensitiveConflictTypes = new Set(["payment_mismatch", "unsupported_warranty"]);
+
+async function resolveSafeRewriteApprovalLock({ guard, sourceEmail, requestingUser } = {}) {
+  const conflicts = Array.isArray(guard?.conflicts) ? guard.conflicts : [];
+  const sensitiveConflicts = conflicts.filter((item) => safeRewriteSensitiveConflictTypes.has(String(item?.conflict_type || "").toLowerCase()));
+  if (!sensitiveConflicts.length) {
+    return {
+      required: false,
+      sensitive_conflict_types: [],
+      can_submit_for_approval: false,
+      approver_id: null
+    };
+  }
+
+  let approverId = Number(requestingUser?.manager_id || 0) || null;
+  let approverSource = approverId ? "direct_manager" : "";
+
+  if (!approverId && Number(sourceEmail?.assigned_manager_id || 0)) {
+    approverId = Number(sourceEmail.assigned_manager_id);
+    approverSource = "assigned_manager";
+  }
+
+  if (!approverId && Number(sourceEmail?.employee_id || 0) && Number(sourceEmail.employee_id || 0) !== Number(requestingUser?.id || 0)) {
+    const owner = await getUserById(Number(sourceEmail.employee_id)).catch(() => null);
+    if (Number(owner?.manager_id || 0)) {
+      approverId = Number(owner.manager_id);
+      approverSource = "source_owner_manager";
+    }
+  }
+
+  const approver = approverId ? await getUserById(approverId).catch(() => null) : null;
+  const sensitiveTypes = [...new Set(sensitiveConflicts.map((item) => String(item?.conflict_type || "").toLowerCase()).filter(Boolean))];
+
+  return {
+    required: true,
+    approver_id: approver?.id || approverId || null,
+    approver_name: approver?.name || "",
+    approver_email: approver?.email || "",
+    approver_source: approverSource || "unresolved",
+    sensitive_conflict_types: sensitiveTypes,
+    can_submit_for_approval: Boolean(approver?.id || approverId),
+    locked_actions: ["apply_safe_rewrite", "send_reply"],
+    reason: `Sensitive contractual changes detected (${sensitiveTypes.join(", ")}). Manager approval is required before applying or sending the safe rewrite.`,
+    summary: approver?.id
+      ? `يتطلب هذا التعديل اعتماد ${approver.name || approver.email || "المسؤول المحدد"} قبل التطبيق أو الإرسال.`
+      : "يتطلب هذا التعديل اعتماد مدير أو مسؤول محدد، لكن لم يتم العثور على approver صالح بعد."
+  };
+}
+
+async function submitPendingApprovalFromCompose(req, user, employeeId, options = {}) {
+  const managerId = Number(options.managerId || user?.manager_id || 0) || null;
   const { email, serial, analysis, managerNotification } = await createPendingApprovalEmail({
     employeeId,
-    managerId: user.manager_id,
+    managerId,
     recipientName: req.body.recipient_name,
     recipientEmail: req.body.recipient_email,
     ccList: req.body.cc_list,
@@ -560,10 +611,10 @@ async function submitPendingApprovalFromCompose(req, user, employeeId) {
     deliveryReceipt: req.body.delivery_receipt,
     subjectKey: req.body.subject_key || ""
   }, req.files || [], req.ip || "");
-  const manager = await getUserById(user.manager_id);
+  const manager = await getUserById(managerId);
   const action_links = await buildApprovalActionLinks({
     emailId: email.id,
-    managerId: user.manager_id,
+    managerId,
     subject: email.subject,
     serial,
     preview: email.preview,
@@ -600,10 +651,13 @@ async function handleComposeSendRoute(req, res) {
     const user = employeeId ? await getUserById(employeeId) : null;
     const managedUsers = user?.id ? await getEmployeesWithManager() : [];
     const { requiresManagerApproval } = getUserApprovalPolicy(user, managedUsers);
+    const forcedManagerApproval = String(req.body?.force_manager_approval || "").trim().toLowerCase() === "true";
+    const forcedManagerId = Number(req.body?.forced_manager_id || 0) || null;
+    const effectiveManagerId = forcedManagerId || Number(user?.manager_id || 0) || null;
 
-    if (requiresManagerApproval && !user?.manager_id) {
+    if ((requiresManagerApproval || forcedManagerApproval) && !effectiveManagerId) {
       return res.status(400).json({
-        error: "No approval manager is assigned to this employee. Please assign a manager from Admin > Employees first."
+        error: "No approval manager is available for this sensitive reply. Please assign a manager or configure the required approver first."
       });
     }
 
@@ -619,8 +673,10 @@ async function handleComposeSendRoute(req, res) {
       }
     }
 
-    if (requiresManagerApproval && user?.manager_id) {
-      const pendingResponse = await submitPendingApprovalFromCompose(req, user, employeeId);
+    if ((requiresManagerApproval || forcedManagerApproval) && effectiveManagerId) {
+      const pendingResponse = await submitPendingApprovalFromCompose(req, user, employeeId, {
+        managerId: effectiveManagerId
+      });
       return res.status(201).json(pendingResponse);
     }
 
@@ -1246,11 +1302,19 @@ app.post("/api/ai/reply-draft", authenticateRequest, async (req, res) => {
         limit: 12
       })
       : [];
+    const structuredContractClauses = projectId
+      ? await getStructuredContractClausesForProject({
+        projectId,
+        employeeId: employeeScopeId,
+        limit: 16
+      })
+      : [];
 
     const draft = await generateReplyDraftWithHistory({
       sourceEmail,
       historyEmails,
       contractMemoryEntries,
+      structuredContractClauses,
       project,
       requestedSubject,
       existingDraftBody,
@@ -1266,6 +1330,8 @@ app.post("/api/ai/reply-draft", authenticateRequest, async (req, res) => {
         project_code: project?.project_code || "",
         history_count: historyEmails.length,
         contract_memory_count: contractMemoryEntries.length,
+        contract_clause_count: structuredContractClauses.length,
+        contract_clause_references: structuredContractClauses.map((item) => item.reference_key || item.clause_title || "").filter(Boolean).slice(0, 8),
         contract_memory_references: contractMemoryEntries.map((item) => item.reference_key || item.title || "").filter(Boolean).slice(0, 8),
         references: historyEmails.map((item) => item.serial_number || item.subject || "").filter(Boolean).slice(0, 8),
         provider: draft?.provider || "rules"
@@ -1280,6 +1346,8 @@ app.post("/api/ai/reply-draft", authenticateRequest, async (req, res) => {
         project_name: project?.project_name || "",
         history_count: historyEmails.length,
         contract_memory_count: contractMemoryEntries.length,
+        contract_clause_count: structuredContractClauses.length,
+        contract_clause_references: structuredContractClauses.map((item) => item.reference_key || item.clause_title || "").filter(Boolean).slice(0, 8),
         contract_memory_references: contractMemoryEntries.map((item) => item.reference_key || item.title || "").filter(Boolean).slice(0, 8),
         references: historyEmails.map((item) => item.serial_number || item.subject || "").filter(Boolean).slice(0, 8)
       }
@@ -1330,14 +1398,27 @@ app.post("/api/ai/reply-policy-guard", authenticateRequest, async (req, res) => 
         limit: 12
       })
       : [];
+    const structuredContractClauses = projectId
+      ? await getStructuredContractClausesForProject({
+        projectId,
+        employeeId: employeeScopeId,
+        limit: 16
+      })
+      : [];
 
     const guard = await generateResponsePolicyGuard({
       sourceEmail,
       historyEmails,
       contractMemoryEntries,
+      structuredContractClauses,
       project,
       draftSubject,
       draftBody
+    });
+    guard.approval_lock = await resolveSafeRewriteApprovalLock({
+      guard,
+      sourceEmail,
+      requestingUser: req.user
     });
 
     await logEmailTrail(
@@ -1349,9 +1430,13 @@ app.post("/api/ai/reply-policy-guard", authenticateRequest, async (req, res) => 
         project_code: project?.project_code || "",
         history_count: historyEmails.length,
         contract_memory_count: contractMemoryEntries.length,
+        contract_clause_count: structuredContractClauses.length,
         severity: guard?.severity || "low",
         verdict: guard?.verdict || "clear",
         issue_count: Array.isArray(guard?.issues) ? guard.issues.length : 0,
+        conflict_count: Array.isArray(guard?.conflicts) ? guard.conflicts.length : 0,
+        approval_lock_required: Boolean(guard?.approval_lock?.required),
+        approval_lock_approver_id: guard?.approval_lock?.approver_id || null,
         provider: guard?.provider || "rules"
       })
     );
@@ -1364,6 +1449,8 @@ app.post("/api/ai/reply-policy-guard", authenticateRequest, async (req, res) => 
         project_name: project?.project_name || "",
         history_count: historyEmails.length,
         contract_memory_count: contractMemoryEntries.length,
+        contract_clause_count: structuredContractClauses.length,
+        contract_clause_references: structuredContractClauses.map((item) => item.reference_key || item.clause_title || "").filter(Boolean).slice(0, 8),
         contract_memory_references: contractMemoryEntries.map((item) => item.reference_key || item.title || "").filter(Boolean).slice(0, 8),
         references: historyEmails.map((item) => item.serial_number || item.subject || "").filter(Boolean).slice(0, 8)
       }
@@ -1984,12 +2071,17 @@ app.post("/api/integrations/telegram/webhook", async (req, res) => {
 
 app.post("/api/approvals/:id/resubmit", authenticateRequest, upload.array("attachments", 10), async (req, res) => {
   try {
+    const forcedManagerApproval = String(req.body?.force_manager_approval || "").trim().toLowerCase() === "true";
+    const forcedManagerId = forcedManagerApproval ? (Number(req.body?.forced_manager_id || 0) || null) : null;
     const result = await reviseRejectedApproval(
       Number(req.params.id),
       req.user.id,
       req.body || {},
       req.files || [],
-      req.ip || ""
+      req.ip || "",
+      {
+        managerId: forcedManagerId
+      }
     );
     return res.status(201).json({
       ...result,

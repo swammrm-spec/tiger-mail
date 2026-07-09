@@ -3081,7 +3081,7 @@ async function identifyProject(parsed) {
   }
 
   // Level 2: In-Reply-To / References chain
-  const replyChain = inReplyTo || (referencesHeader && referencesHeader.split(/\s+/)[0]) || null;
+  const replyChain = inReplyTo || (referencesHeader && typeof referencesHeader === "string" && referencesHeader.split(/\s+/)[0]) || null;
   if (replyChain) {
     try {
       const chainResult = await query(

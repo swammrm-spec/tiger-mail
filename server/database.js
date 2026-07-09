@@ -1672,6 +1672,27 @@ async function runSchema() {
 
   try {
     await query(`
+      CREATE TABLE IF NOT EXISTS tracking_task_history (
+        id BIGSERIAL PRIMARY KEY,
+        tracking_task_id BIGINT NOT NULL REFERENCES tracking_tasks(task_id) ON DELETE CASCADE,
+        existing_task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+        actor_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        action_type TEXT DEFAULT 'updated',
+        field_name TEXT DEFAULT 'task',
+        previous_value TEXT,
+        next_value TEXT,
+        previous_display TEXT,
+        next_display TEXT,
+        metadata_json TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await query(`CREATE INDEX IF NOT EXISTS idx_tracking_task_history_task_id ON tracking_task_history(tracking_task_id)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_tracking_task_history_created_at ON tracking_task_history(created_at DESC)`);
+  } catch (e) { /* tracking_task_history table optional */ }
+
+  try {
+    await query(`
       CREATE TABLE IF NOT EXISTS email_accounts (
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -4880,6 +4901,23 @@ async function syncTrackingTaskRecord(taskOrId) {
       task.alerted ? 1 : 0
     ]
   );
+  if (inserted.rows[0]) {
+    await createTrackingTaskHistoryEntry({
+      trackingTaskId: inserted.rows[0].task_id,
+      existingTaskId: inserted.rows[0].existing_task_id || null,
+      actionType: "created",
+      fieldName: "task",
+      previousValue: null,
+      nextValue: inserted.rows[0].status || "PENDING",
+      previousDisplay: null,
+      nextDisplay: `Created from operational task sync as ${inserted.rows[0].task_type || "general"} (${inserted.rows[0].status || "PENDING"})`,
+      metadata: {
+        source: "syncTrackingTaskRecord",
+        task_id: task.id || null,
+        email_id: task.email_id || null
+      }
+    });
+  }
   return inserted.rows[0] || null;
 }
 
@@ -4958,6 +4996,526 @@ async function getTasks(filters = {}) {
     email_subject: emailMap[t.email_id]?.subject || null,
     email_serial: emailMap[t.email_id]?.serial || null
   }));
+}
+
+async function getActiveTrackingTasks(filters = {}) {
+  const params = [];
+  const where = [];
+  let idx = 1;
+
+  const normalizedStatus = String(filters.status || "PENDING").trim().toUpperCase();
+  if (normalizedStatus && normalizedStatus !== "ALL") {
+    where.push(`tt.status = $${idx}`);
+    params.push(normalizedStatus);
+    idx += 1;
+  }
+  if (filters.project_id) {
+    where.push(`er.project_id = $${idx}`);
+    params.push(Number(filters.project_id));
+    idx += 1;
+  }
+  if (filters.assigned_to) {
+    where.push(`tt.assigned_to = $${idx}`);
+    params.push(Number(filters.assigned_to));
+    idx += 1;
+  }
+  if (filters.due_before) {
+    where.push(`tt.due_date IS NOT NULL AND tt.due_date <= $${idx}`);
+    params.push(filters.due_before);
+    idx += 1;
+  }
+  if (filters.due_after) {
+    where.push(`tt.due_date IS NOT NULL AND tt.due_date >= $${idx}`);
+    params.push(filters.due_after);
+    idx += 1;
+  }
+
+  const limit = Math.min(200, Math.max(1, Number(filters.limit || 100)));
+  const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  params.push(limit);
+
+  const result = await query(
+    `
+      SELECT
+        tt.task_id,
+        tt.task_type,
+        tt.priority,
+        tt.due_date,
+        tt.status,
+        er.project_id,
+        p.project_code,
+        p.project_name,
+        COALESCE(e.subject, '') AS email_subject,
+        tt.assigned_to,
+        assigned.name AS assigned_to_name,
+        COALESCE(aa.summary, eca.ai_summary, e.ai_summary, '') AS ai_summary
+      FROM tracking_tasks tt
+      LEFT JOIN email_registry er ON er.email_db_id = tt.email_db_id
+      LEFT JOIN projects p ON p.id = er.project_id
+      LEFT JOIN emails e ON e.id = COALESCE(tt.email_id, er.email_id)
+      LEFT JOIN users assigned ON assigned.id = tt.assigned_to
+      LEFT JOIN ai_analysis aa ON aa.email_id = COALESCE(tt.email_id, er.email_id)
+      LEFT JOIN email_content_archive eca ON eca.email_db_id = tt.email_db_id
+      ${whereSql}
+      ORDER BY
+        tt.due_date ASC NULLS LAST,
+        tt.updated_at DESC,
+        tt.task_id DESC
+      LIMIT $${params.length}
+    `,
+    params
+  );
+
+  return result.rows || [];
+}
+
+async function getTrackingTaskSummary(filters = {}) {
+  const params = [];
+  const where = [];
+  let idx = 1;
+
+  const normalizedStatus = String(filters.status || "ALL").trim().toUpperCase();
+  if (normalizedStatus && normalizedStatus !== "ALL") {
+    where.push(`tt.status = $${idx}`);
+    params.push(normalizedStatus);
+    idx += 1;
+  }
+  if (filters.project_id) {
+    where.push(`er.project_id = $${idx}`);
+    params.push(Number(filters.project_id));
+    idx += 1;
+  }
+  if (filters.assigned_to) {
+    where.push(`tt.assigned_to = $${idx}`);
+    params.push(Number(filters.assigned_to));
+    idx += 1;
+  }
+  if (filters.due_before) {
+    where.push(`tt.due_date IS NOT NULL AND tt.due_date <= $${idx}`);
+    params.push(filters.due_before);
+    idx += 1;
+  }
+  if (filters.due_after) {
+    where.push(`tt.due_date IS NOT NULL AND tt.due_date >= $${idx}`);
+    params.push(filters.due_after);
+    idx += 1;
+  }
+
+  const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  const summaryResult = await query(
+    `
+      SELECT
+        COUNT(*)::int AS total,
+        SUM(CASE WHEN tt.status = 'PENDING' THEN 1 ELSE 0 END)::int AS pending,
+        SUM(CASE WHEN tt.status = 'IN_PROGRESS' THEN 1 ELSE 0 END)::int AS in_progress,
+        SUM(CASE WHEN tt.status = 'COMPLETED' THEN 1 ELSE 0 END)::int AS completed,
+        SUM(CASE WHEN tt.status = 'PENDING' AND tt.due_date IS NOT NULL AND tt.due_date < NOW() THEN 1 ELSE 0 END)::int AS overdue,
+        SUM(CASE WHEN tt.status = 'PENDING' AND tt.due_date IS NOT NULL AND tt.due_date >= NOW() AND tt.due_date <= NOW() + INTERVAL '48 hours' THEN 1 ELSE 0 END)::int AS due_soon
+      FROM tracking_tasks tt
+      LEFT JOIN email_registry er ON er.email_db_id = tt.email_db_id
+      ${whereSql}
+    `,
+    params
+  );
+
+  const byStatusResult = await query(
+    `
+      SELECT
+        tt.status,
+        COUNT(*)::int AS total
+      FROM tracking_tasks tt
+      LEFT JOIN email_registry er ON er.email_db_id = tt.email_db_id
+      ${whereSql}
+      GROUP BY tt.status
+      ORDER BY tt.status ASC
+    `,
+    params
+  );
+
+  const byTaskTypeResult = await query(
+    `
+      SELECT
+        COALESCE(tt.task_type, 'general') AS task_type,
+        COUNT(*)::int AS total
+      FROM tracking_tasks tt
+      LEFT JOIN email_registry er ON er.email_db_id = tt.email_db_id
+      ${whereSql}
+      GROUP BY COALESCE(tt.task_type, 'general')
+      ORDER BY total DESC, task_type ASC
+    `,
+    params
+  );
+
+  const byPriorityResult = await query(
+    `
+      SELECT
+        COALESCE(tt.priority, 'medium') AS priority,
+        COUNT(*)::int AS total
+      FROM tracking_tasks tt
+      LEFT JOIN email_registry er ON er.email_db_id = tt.email_db_id
+      ${whereSql}
+      GROUP BY COALESCE(tt.priority, 'medium')
+      ORDER BY total DESC, priority ASC
+    `,
+    params
+  );
+
+  return {
+    filters: {
+      status: normalizedStatus,
+      project_id: filters.project_id ? Number(filters.project_id) : null,
+      assigned_to: filters.assigned_to ? Number(filters.assigned_to) : null,
+      due_before: filters.due_before || null,
+      due_after: filters.due_after || null
+    },
+    totals: {
+      total: Number(summaryResult.rows[0]?.total || 0),
+      pending: Number(summaryResult.rows[0]?.pending || 0),
+      in_progress: Number(summaryResult.rows[0]?.in_progress || 0),
+      completed: Number(summaryResult.rows[0]?.completed || 0),
+      overdue: Number(summaryResult.rows[0]?.overdue || 0),
+      due_soon: Number(summaryResult.rows[0]?.due_soon || 0)
+    },
+    by_status: (byStatusResult.rows || []).map((row) => ({
+      status: row.status || "UNKNOWN",
+      total: Number(row.total || 0)
+    })),
+    by_task_type: (byTaskTypeResult.rows || []).map((row) => ({
+      task_type: row.task_type || "general",
+      total: Number(row.total || 0)
+    })),
+    by_priority: (byPriorityResult.rows || []).map((row) => ({
+      priority: row.priority || "medium",
+      total: Number(row.total || 0)
+    }))
+  };
+}
+
+async function getTrackingTaskById(taskId) {
+  const result = await query(
+    `
+      SELECT
+        tt.task_id,
+        tt.existing_task_id,
+        tt.email_db_id,
+        tt.email_id,
+        tt.assigned_to,
+        tt.task_type,
+        tt.priority,
+        tt.due_date,
+        tt.status,
+        tt.is_alerted,
+        tt.alert_count,
+        tt.updated_at,
+        er.project_id,
+        p.project_code,
+        p.project_name,
+        COALESCE(e.subject, '') AS email_subject,
+        assigned.name AS assigned_to_name,
+        COALESCE(aa.summary, eca.ai_summary, e.ai_summary, '') AS ai_summary
+      FROM tracking_tasks tt
+      LEFT JOIN email_registry er ON er.email_db_id = tt.email_db_id
+      LEFT JOIN projects p ON p.id = er.project_id
+      LEFT JOIN emails e ON e.id = COALESCE(tt.email_id, er.email_id)
+      LEFT JOIN users assigned ON assigned.id = tt.assigned_to
+      LEFT JOIN ai_analysis aa ON aa.email_id = COALESCE(tt.email_id, er.email_id)
+      LEFT JOIN email_content_archive eca ON eca.email_db_id = tt.email_db_id
+      WHERE tt.task_id = $1
+      LIMIT 1
+    `,
+    [Number(taskId)]
+  );
+  return result.rows[0] || null;
+}
+
+function normalizeTrackingHistoryValue(value, fieldName = "") {
+  const normalizedField = String(fieldName || "").trim().toLowerCase();
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === null || value === "") {
+    return null;
+  }
+  if (normalizedField === "due_date") {
+    const dateValue = value instanceof Date ? value : new Date(value);
+    if (Number.isNaN(dateValue.getTime())) {
+      return String(value);
+    }
+    return dateValue.toISOString();
+  }
+  return String(value);
+}
+
+function areTrackingHistoryValuesEqual(left, right, fieldName = "") {
+  return normalizeTrackingHistoryValue(left, fieldName) === normalizeTrackingHistoryValue(right, fieldName);
+}
+
+async function resolveTrackingHistoryDisplay(fieldName, value) {
+  const normalizedField = String(fieldName || "").trim().toLowerCase();
+  const normalizedValue = normalizeTrackingHistoryValue(value, fieldName);
+  if (normalizedValue === null || normalizedValue === undefined) {
+    if (normalizedField === "assigned_to") {
+      return "Unassigned";
+    }
+    return "Empty";
+  }
+  if (normalizedField === "assigned_to") {
+    const userId = Number(normalizedValue || 0);
+    if (!userId) {
+      return "Unassigned";
+    }
+    const user = await getUserById(userId).catch(() => null);
+    return user?.name || user?.email || `User ${userId}`;
+  }
+  if (normalizedField === "status") {
+    return String(normalizedValue).replace(/_/g, " ").toUpperCase();
+  }
+  if (normalizedField === "priority") {
+    const label = String(normalizedValue).trim().toLowerCase();
+    return label ? `${label.charAt(0).toUpperCase()}${label.slice(1)}` : "Medium";
+  }
+  if (normalizedField === "due_date") {
+    return String(normalizedValue);
+  }
+  return String(normalizedValue);
+}
+
+async function createTrackingTaskHistoryEntry({
+  trackingTaskId,
+  existingTaskId = null,
+  actorUserId = null,
+  actionType = "updated",
+  fieldName = "task",
+  previousValue = null,
+  nextValue = null,
+  previousDisplay = null,
+  nextDisplay = null,
+  metadata = null
+} = {}) {
+  const normalizedTrackingTaskId = Number(trackingTaskId || 0);
+  if (!normalizedTrackingTaskId) {
+    return null;
+  }
+  const result = await query(
+    `
+      INSERT INTO tracking_task_history (
+        tracking_task_id,
+        existing_task_id,
+        actor_user_id,
+        action_type,
+        field_name,
+        previous_value,
+        next_value,
+        previous_display,
+        next_display,
+        metadata_json,
+        created_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+      RETURNING *
+    `,
+    [
+      normalizedTrackingTaskId,
+      Number(existingTaskId || 0) || null,
+      Number(actorUserId || 0) || null,
+      String(actionType || "updated").trim().toLowerCase(),
+      String(fieldName || "task").trim().toLowerCase(),
+      normalizeTrackingHistoryValue(previousValue, fieldName),
+      normalizeTrackingHistoryValue(nextValue, fieldName),
+      previousDisplay,
+      nextDisplay,
+      metadata ? JSON.stringify(metadata) : null
+    ]
+  );
+  return result.rows[0] || null;
+}
+
+async function createTrackingTaskHistoryEntries({
+  trackingTaskId,
+  existingTaskId = null,
+  actorUserId = null,
+  actionType = "updated",
+  changes = [],
+  metadata = null
+} = {}) {
+  const normalizedChanges = Array.isArray(changes) ? changes : [];
+  const entries = [];
+  for (const change of normalizedChanges) {
+    const fieldName = String(change?.field_name || change?.fieldName || "task").trim().toLowerCase();
+    const previousValue = change?.previous_value ?? change?.previousValue ?? null;
+    const nextValue = change?.next_value ?? change?.nextValue ?? null;
+    entries.push(await createTrackingTaskHistoryEntry({
+      trackingTaskId,
+      existingTaskId,
+      actorUserId,
+      actionType,
+      fieldName,
+      previousValue,
+      nextValue,
+      previousDisplay: change?.previous_display ?? change?.previousDisplay ?? await resolveTrackingHistoryDisplay(fieldName, previousValue),
+      nextDisplay: change?.next_display ?? change?.nextDisplay ?? await resolveTrackingHistoryDisplay(fieldName, nextValue),
+      metadata
+    }));
+  }
+  return entries;
+}
+
+async function getTrackingTaskHistory(taskId, options = {}) {
+  const normalizedTaskId = Number(taskId || 0);
+  const normalizedLimit = Math.max(1, Math.min(200, Number(options?.limit || 40) || 40));
+  const conditions = ["history.tracking_task_id = $1"];
+  const values = [normalizedTaskId];
+  let idx = 2;
+
+  if (options?.hasActorFilter) {
+    if (options.actorUserId === null) {
+      conditions.push("history.actor_user_id IS NULL");
+    } else {
+      conditions.push(`history.actor_user_id = $${idx}`);
+      values.push(Number(options.actorUserId || 0));
+      idx += 1;
+    }
+  }
+
+  if (options?.actionType) {
+    conditions.push(`LOWER(history.action_type) = $${idx}`);
+    values.push(String(options.actionType).trim().toLowerCase());
+    idx += 1;
+  }
+
+  if (options?.fromDate) {
+    conditions.push(`history.created_at >= $${idx}`);
+    values.push(options.fromDate);
+    idx += 1;
+  }
+
+  if (options?.toDate) {
+    conditions.push(`history.created_at <= $${idx}`);
+    values.push(options.toDate);
+    idx += 1;
+  }
+
+  values.push(normalizedLimit);
+  const result = await query(
+    `
+      SELECT
+        history.*,
+        actor.name AS actor_name,
+        actor.email AS actor_email
+      FROM tracking_task_history history
+      LEFT JOIN users actor ON actor.id = history.actor_user_id
+      WHERE ${conditions.join(" AND ")}
+      ORDER BY history.created_at DESC, history.id DESC
+      LIMIT $${idx}
+    `,
+    values
+  );
+  return (result.rows || []).map((row) => ({
+    ...row,
+    metadata: safeJsonParse(row.metadata_json, null)
+  }));
+}
+
+async function updateTrackingTask(taskId, updates = {}, options = {}) {
+  const current = await getTrackingTaskById(taskId);
+  if (!current) {
+    throw new Error("Tracking task not found.");
+  }
+
+  const fields = [];
+  const values = [];
+  let idx = 1;
+  const normalizedUpdates = {};
+  const historyChanges = [];
+
+  if (updates.assigned_to !== undefined) {
+    normalizedUpdates.assigned_to = Number(updates.assigned_to || 0) || null;
+    if (!areTrackingHistoryValuesEqual(current.assigned_to, normalizedUpdates.assigned_to, "assigned_to")) {
+      fields.push(`assigned_to = $${idx}`);
+      values.push(normalizedUpdates.assigned_to);
+      idx += 1;
+      historyChanges.push({
+        field_name: "assigned_to",
+        previous_value: current.assigned_to,
+        next_value: normalizedUpdates.assigned_to
+      });
+    }
+  }
+  if (updates.status !== undefined) {
+    normalizedUpdates.status = String(updates.status || "").trim().toUpperCase();
+    if (!areTrackingHistoryValuesEqual(current.status, normalizedUpdates.status, "status")) {
+      fields.push(`status = $${idx}`);
+      values.push(normalizedUpdates.status);
+      idx += 1;
+      historyChanges.push({
+        field_name: "status",
+        previous_value: current.status,
+        next_value: normalizedUpdates.status
+      });
+    }
+  }
+  if (updates.priority !== undefined) {
+    normalizedUpdates.priority = String(updates.priority || "").trim().toLowerCase() || "medium";
+    if (!areTrackingHistoryValuesEqual(current.priority, normalizedUpdates.priority, "priority")) {
+      fields.push(`priority = $${idx}`);
+      values.push(normalizedUpdates.priority);
+      idx += 1;
+      historyChanges.push({
+        field_name: "priority",
+        previous_value: current.priority,
+        next_value: normalizedUpdates.priority
+      });
+    }
+  }
+  if (updates.due_date !== undefined) {
+    normalizedUpdates.due_date = updates.due_date || null;
+    if (!areTrackingHistoryValuesEqual(current.due_date, normalizedUpdates.due_date, "due_date")) {
+      fields.push(`due_date = $${idx}`);
+      values.push(normalizedUpdates.due_date);
+      idx += 1;
+      historyChanges.push({
+        field_name: "due_date",
+        previous_value: current.due_date,
+        next_value: normalizedUpdates.due_date
+      });
+    }
+  }
+
+  if (!fields.length) {
+    return current;
+  }
+
+  fields.push("updated_at = NOW()");
+  values.push(Number(taskId));
+
+  await query(
+    `UPDATE tracking_tasks SET ${fields.join(", ")} WHERE task_id = $${idx}`,
+    values
+  );
+
+  if (current.existing_task_id) {
+    const taskUpdates = {};
+    if (normalizedUpdates.assigned_to !== undefined) taskUpdates.assigned_to = normalizedUpdates.assigned_to;
+    if (normalizedUpdates.status !== undefined) taskUpdates.status = normalizedUpdates.status.toLowerCase();
+    if (normalizedUpdates.priority !== undefined) taskUpdates.priority = normalizedUpdates.priority;
+    if (normalizedUpdates.due_date !== undefined) taskUpdates.due_date = normalizedUpdates.due_date;
+    if (Object.keys(taskUpdates).length) {
+      await updateTask(current.existing_task_id, taskUpdates);
+    }
+  }
+
+  if (historyChanges.length) {
+    await createTrackingTaskHistoryEntries({
+      trackingTaskId: taskId,
+      existingTaskId: current.existing_task_id || null,
+      actorUserId: options.actorUserId || null,
+      actionType: options.actionType || "updated",
+      changes: historyChanges,
+      metadata: options.metadata || null
+    });
+  }
+
+  return getTrackingTaskById(taskId);
 }
 
 async function getTaskById(id) {
@@ -6454,16 +7012,33 @@ async function createTrackingTasksFromBrainAnalysis(emailId, actionItems, userId
       );
       const task = taskResult.rows[0];
 
-      await query(
+      const trackingInsertResult = await query(
         `INSERT INTO tracking_tasks (
           existing_task_id, email_id, assigned_to, task_type, priority, due_date, status
         ) VALUES ($1, $2, $3, 'ai_extracted', $4, $5, 'PENDING')
-        ON CONFLICT (existing_task_id) DO NOTHING`,
+        ON CONFLICT (existing_task_id) DO NOTHING
+        RETURNING *`,
         [
           task.id, emailId, item.assignee_email_id || null,
           (item.priority || "medium").toLowerCase(), item.due_date || null
         ]
       );
+      if (trackingInsertResult.rows[0]) {
+        await createTrackingTaskHistoryEntry({
+          trackingTaskId: trackingInsertResult.rows[0].task_id,
+          existingTaskId: trackingInsertResult.rows[0].existing_task_id || null,
+          actionType: "created",
+          fieldName: "task",
+          previousValue: null,
+          nextValue: trackingInsertResult.rows[0].status || "PENDING",
+          previousDisplay: null,
+          nextDisplay: `Created from AI extraction as ${trackingInsertResult.rows[0].task_type || "ai_extracted"} (${trackingInsertResult.rows[0].status || "PENDING"})`,
+          metadata: {
+            source: "createTrackingTasksFromBrainAnalysis",
+            email_id: emailId || null
+          }
+        });
+      }
       createdTasks.push(task);
     } catch (e) {
       console.error("[AI-BRAIN] Failed to create tracking task:", e.message);
@@ -6846,6 +7421,11 @@ export {
   extractEmailMetadata,
   createTask,
   getTasks,
+  getActiveTrackingTasks,
+  getTrackingTaskSummary,
+  getTrackingTaskById,
+  getTrackingTaskHistory,
+  updateTrackingTask,
   getTaskById,
   updateTask,
   deleteTask,

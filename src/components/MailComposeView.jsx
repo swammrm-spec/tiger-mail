@@ -1,6 +1,7 @@
 import { useState } from "react";
 import dayjs from "dayjs";
 import { AlertTriangle, Archive, Paperclip, Send, ShieldAlert, Sparkles, X } from "lucide-react";
+import { formatJordanDateTime } from "../utils/timezone.js";
 
 function splitEditableReplyBody(text = "") {
   const fullText = String(text || "");
@@ -662,7 +663,7 @@ export default function MailComposeView({
                       <div className="o365-approval-thread-head">
                         <strong>{item.actorLabel}</strong>
                         <span className={`o365-approval-thread-badge ${getApprovalConversationBadgeClass(item.lane)}`}>{item.summary}</span>
-                        <span>{dayjs(item.created_at).format("YYYY-MM-DD HH:mm")}</span>
+                        <span>{formatJordanDateTime(item.created_at, { month: "2-digit", day: "2-digit", year: "numeric" })}</span>
                       </div>
                       <div className="o365-approval-thread-meta">
                         {item.action_type} | {item.serial_id} | REV{String(item.version_number || 1).padStart(2, "0")}

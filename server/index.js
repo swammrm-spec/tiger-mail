@@ -103,6 +103,11 @@ import {
   extractEmailMetadata,
   createTask,
   getTasks,
+  getActiveTrackingTasks,
+  getTrackingTaskSummary,
+  getTrackingTaskById,
+  getTrackingTaskHistory,
+  updateTrackingTask,
   getTaskById,
   updateTask,
   deleteTask,
@@ -138,6 +143,8 @@ import {
 import { analyzeInboundTaskExtractionWithLlm, analyzeEmailBrain, generateReplyDraftWithHistory, generateResponsePolicyGuard, analyzeAttachment, analyzeEmailWithAttachments } from "./aiAnalysisService.js";
 import {
   ensureNotificationsTable,
+  createTrackingTaskNotification,
+  getAdminNotificationAnalytics,
   getNotifications,
   getUnreadNotificationCount,
   markNotificationRead,
@@ -147,7 +154,9 @@ import {
   markEmailReplied,
   runProactiveAlertCycle,
   startProactiveAlertEngine,
-  stopProactiveAlertEngine
+  stopProactiveAlertEngine,
+  normalizeNotificationMetadata,
+  getNotificationHistory
 } from "./proactiveAlertService.js";
 import { SMTPServer } from "smtp-server";
 import { simpleParser } from "mailparser";
@@ -241,6 +250,119 @@ function getReminderSlot(now = new Date()) {
 
 function getPublicReminderBaseUrl() {
   return (process.env.APP_BASE_URL || process.env.PUBLIC_APP_URL || "http://localhost:5173").replace(/\/+$/, "");
+}
+
+async function notifyTrackingTaskTransition({ beforeTask, afterTask, actorUser, actionType }) {
+  const normalizedActionType = String(actionType || "").trim().toLowerCase();
+  const actorName = actorUser?.name || actorUser?.email || "System";
+  const titleBase = afterTask?.email_subject || `Tracking Task #${afterTask?.task_id || beforeTask?.task_id || ""}`;
+  const trackingTaskId = Number(afterTask?.task_id || beforeTask?.task_id || 0) || null;
+  const existingTaskId = Number(afterTask?.existing_task_id || beforeTask?.existing_task_id || 0) || null;
+  const emailId = Number(afterTask?.email_id || beforeTask?.email_id || 0) || null;
+  const projectId = Number(afterTask?.project_id || beforeTask?.project_id || 0) || null;
+
+  if (normalizedActionType === "reassigned") {
+    const previousAssigneeId = Number(beforeTask?.assigned_to || 0) || null;
+    const nextAssigneeId = Number(afterTask?.assigned_to || 0) || null;
+    if (previousAssigneeId === nextAssigneeId) {
+      return;
+    }
+    const operations = [];
+
+    if (nextAssigneeId) {
+      operations.push(createTrackingTaskNotification(nextAssigneeId, {
+        type: "info",
+        category: "tracking_task_reassigned",
+        title: `تم تعيين مهمة متابعة: ${titleBase}`,
+        message: `قام ${actorName} بتعيين المهمة لك${afterTask?.project_code ? ` ضمن المشروع ${afterTask.project_code}` : ""}.`,
+        trackingTaskId,
+        existingTaskId,
+        emailId,
+        projectId,
+        priority: String(afterTask?.priority || "").toLowerCase() === "critical" ? "high" : "medium",
+        actorUserId: actorUser?.id || null,
+        actorName,
+        actionType: "reassigned",
+        metadata: {
+          previous_assignee_id: previousAssigneeId,
+          previous_assignee_name: beforeTask?.assigned_to_name || "",
+          next_assignee_id: nextAssigneeId,
+          next_assignee_name: afterTask?.assigned_to_name || ""
+        }
+      }));
+    }
+
+    if (previousAssigneeId && previousAssigneeId !== nextAssigneeId) {
+      operations.push(createTrackingTaskNotification(previousAssigneeId, {
+        type: "warning",
+        category: "tracking_task_reassigned",
+        title: `تم تحديث تعيين المهمة: ${titleBase}`,
+        message: nextAssigneeId
+          ? `قام ${actorName} بإعادة تعيين هذه المهمة إلى ${afterTask?.assigned_to_name || "مستخدم آخر"}.`
+          : `قام ${actorName} بإلغاء تعيين هذه المهمة من حسابك.`,
+        trackingTaskId,
+        existingTaskId,
+        emailId,
+        projectId,
+        priority: "medium",
+        actorUserId: actorUser?.id || null,
+        actorName,
+        actionType: "reassigned",
+        metadata: {
+          previous_assignee_id: previousAssigneeId,
+          previous_assignee_name: beforeTask?.assigned_to_name || "",
+          next_assignee_id: nextAssigneeId,
+          next_assignee_name: afterTask?.assigned_to_name || ""
+        }
+      }));
+    }
+
+    await Promise.all(operations);
+    return;
+  }
+
+  if (normalizedActionType === "completed") {
+    if (String(beforeTask?.status || "").trim().toUpperCase() === String(afterTask?.status || "").trim().toUpperCase()) {
+      return;
+    }
+    const recipientUserId = Number(afterTask?.assigned_to || beforeTask?.assigned_to || actorUser?.id || 0) || null;
+    if (!recipientUserId) {
+      return;
+    }
+    await createTrackingTaskNotification(recipientUserId, {
+      type: "success",
+      category: "tracking_task_completed",
+      title: `تم إكمال المهمة: ${titleBase}`,
+      message: `تم تعليم المهمة كمكتملة بواسطة ${actorName}${afterTask?.project_code ? ` ضمن المشروع ${afterTask.project_code}` : ""}.`,
+      trackingTaskId,
+      existingTaskId,
+      emailId,
+      projectId,
+      priority: "medium",
+      actorUserId: actorUser?.id || null,
+      actorName,
+      actionType: "completed",
+      metadata: {
+        completed_by_user_id: actorUser?.id || null,
+        completed_by_name: actorName
+      }
+    });
+  }
+}
+
+function normalizeHistoryDateFilter(value, boundary = "start") {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return null;
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    return boundary === "end" ? `${raw}T23:59:59.999Z` : `${raw}T00:00:00.000Z`;
+  }
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new Error(`Invalid ${boundary === "end" ? "to_date" : "from_date"} filter.`);
+  }
+  return parsed.toISOString();
 }
 
 async function runApprovalReminderCycle(now = new Date()) {
@@ -891,6 +1013,200 @@ app.get("/api/tasks", authenticateRequest, async (req, res) => {
     return res.json({ tasks });
   } catch (error) {
     return res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/tracking-tasks/active", authenticateRequest, async (req, res) => {
+  try {
+    const filters = {
+      status: req.query.status || "PENDING"
+    };
+    if (req.query.project_id) filters.project_id = req.query.project_id;
+    if (req.query.assigned_to) filters.assigned_to = req.query.assigned_to;
+    if (req.query.due_before) filters.due_before = req.query.due_before;
+    if (req.query.due_after) filters.due_after = req.query.due_after;
+    if (req.query.limit) filters.limit = req.query.limit;
+    if (!canAccessAdmin(req.user)) filters.assigned_to = req.user?.id;
+
+    const tasks = await getActiveTrackingTasks(filters);
+    return res.json({ tasks });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/tracking-tasks/summary", authenticateRequest, async (req, res) => {
+  try {
+    const filters = {
+      status: req.query.status || "ALL"
+    };
+    if (req.query.project_id) filters.project_id = req.query.project_id;
+    if (req.query.assigned_to) filters.assigned_to = req.query.assigned_to;
+    if (req.query.due_before) filters.due_before = req.query.due_before;
+    if (req.query.due_after) filters.due_after = req.query.due_after;
+    if (!canAccessAdmin(req.user)) filters.assigned_to = req.user?.id;
+
+    const summary = await getTrackingTaskSummary(filters);
+    return res.json({ summary });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/tracking-tasks/:id/history", authenticateRequest, async (req, res) => {
+  try {
+    const trackingTaskId = Number(req.params.id || 0);
+    if (!trackingTaskId) {
+      return res.status(400).json({ error: "Valid tracking task id is required." });
+    }
+
+    const existingTask = await getTrackingTaskById(trackingTaskId);
+    if (!existingTask) {
+      return res.status(404).json({ error: "Tracking task not found." });
+    }
+
+    const isAdminUser = canAccessAdmin(req.user);
+    const assignedToCurrentUser = Number(existingTask.assigned_to || 0) === Number(req.user?.id || 0);
+    if (!isAdminUser && !assignedToCurrentUser) {
+      return res.status(403).json({ error: "You can only view history for tracking tasks assigned to you." });
+    }
+
+    const historyFilters = {
+      limit: req.query?.limit
+    };
+
+    const rawActorFilter = req.query?.actor_user_id ?? req.query?.actor ?? "";
+    if (String(rawActorFilter).trim() !== "") {
+      const normalizedActorFilter = String(rawActorFilter).trim().toLowerCase();
+      historyFilters.hasActorFilter = true;
+      if (normalizedActorFilter === "system") {
+        historyFilters.actorUserId = null;
+      } else {
+        const actorUserId = Number(rawActorFilter || 0);
+        if (!actorUserId) {
+          return res.status(400).json({ error: "Valid actor filter is required." });
+        }
+        historyFilters.actorUserId = actorUserId;
+      }
+    }
+
+    if (req.query?.action_type) {
+      historyFilters.actionType = String(req.query.action_type).trim().toLowerCase();
+    }
+    if (req.query?.from_date) {
+      historyFilters.fromDate = normalizeHistoryDateFilter(req.query.from_date, "start");
+    }
+    if (req.query?.to_date) {
+      historyFilters.toDate = normalizeHistoryDateFilter(req.query.to_date, "end");
+    }
+
+    const history = await getTrackingTaskHistory(trackingTaskId, historyFilters);
+    return res.json({ history });
+  } catch (error) {
+    return res.status(400).json({ error: error.message || "Unable to load tracking task history." });
+  }
+});
+
+app.put("/api/tracking-tasks/:id", authenticateRequest, async (req, res) => {
+  try {
+    const trackingTaskId = Number(req.params.id || 0);
+    if (!trackingTaskId) {
+      return res.status(400).json({ error: "Valid tracking task id is required." });
+    }
+
+    const existingTask = await getTrackingTaskById(trackingTaskId);
+    if (!existingTask) {
+      return res.status(404).json({ error: "Tracking task not found." });
+    }
+
+    const isAdminUser = canAccessAdmin(req.user);
+    const assignedToCurrentUser = Number(existingTask.assigned_to || 0) === Number(req.user?.id || 0);
+    if (!isAdminUser && !assignedToCurrentUser) {
+      return res.status(403).json({ error: "You can only update tracking tasks assigned to you." });
+    }
+
+    const payload = {};
+    if (req.body?.status !== undefined) {
+      payload.status = req.body.status;
+    }
+    if (req.body?.priority !== undefined) {
+      payload.priority = req.body.priority;
+    }
+    if (req.body?.due_date !== undefined) {
+      payload.due_date = req.body.due_date;
+    }
+    if (req.body?.assigned_to !== undefined) {
+      if (!isAdminUser) {
+        return res.status(403).json({ error: "Only admin users can reassign tracking tasks." });
+      }
+      payload.assigned_to = req.body.assigned_to;
+    }
+
+    let actionType = "updated";
+    const payloadKeys = Object.keys(payload);
+    if (payloadKeys.length === 1 && payload.assigned_to !== undefined) {
+      actionType = "reassigned";
+    } else if (payloadKeys.length === 1 && String(payload.status || "").trim().toUpperCase() === "IN_PROGRESS") {
+      actionType = "started";
+    } else if (payloadKeys.length === 1 && String(payload.status || "").trim().toUpperCase() === "COMPLETED") {
+      actionType = "completed";
+    }
+
+    const task = await updateTrackingTask(trackingTaskId, payload, {
+      actorUserId: req.user?.id || null,
+      actionType,
+      metadata: {
+        source: "api",
+        route: "PUT /api/tracking-tasks/:id"
+      }
+    });
+    await notifyTrackingTaskTransition({
+      beforeTask: existingTask,
+      afterTask: task,
+      actorUser: req.user,
+      actionType
+    });
+    return res.json({ task });
+  } catch (error) {
+    return res.status(400).json({ error: error.message || "Unable to update tracking task." });
+  }
+});
+
+app.post("/api/tracking-tasks/:id/complete", authenticateRequest, async (req, res) => {
+  try {
+    const trackingTaskId = Number(req.params.id || 0);
+    if (!trackingTaskId) {
+      return res.status(400).json({ error: "Valid tracking task id is required." });
+    }
+
+    const existingTask = await getTrackingTaskById(trackingTaskId);
+    if (!existingTask) {
+      return res.status(404).json({ error: "Tracking task not found." });
+    }
+
+    const isAdminUser = canAccessAdmin(req.user);
+    const assignedToCurrentUser = Number(existingTask.assigned_to || 0) === Number(req.user?.id || 0);
+    if (!isAdminUser && !assignedToCurrentUser) {
+      return res.status(403).json({ error: "You can only complete tracking tasks assigned to you." });
+    }
+
+    const task = await updateTrackingTask(trackingTaskId, { status: "COMPLETED" }, {
+      actorUserId: req.user?.id || null,
+      actionType: "completed",
+      metadata: {
+        source: "api",
+        route: "POST /api/tracking-tasks/:id/complete"
+      }
+    });
+    await notifyTrackingTaskTransition({
+      beforeTask: existingTask,
+      afterTask: task,
+      actorUser: req.user,
+      actionType: "completed"
+    });
+    return res.json({ task });
+  } catch (error) {
+    return res.status(400).json({ error: error.message || "Unable to complete tracking task." });
   }
 });
 
@@ -1666,6 +1982,34 @@ app.post("/api/notifications/run-cycle", authenticateRequest, requireAdminAccess
     return res.json({ success: true, result });
   } catch (error) {
     return res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/admin/notification-analytics", authenticateRequest, requireAdminAccess, async (req, res) => {
+  try {
+    const analytics = await getAdminNotificationAnalytics({
+      days: req.query?.days,
+      from_date: req.query?.from_date || null,
+      to_date: req.query?.to_date || null
+    });
+    return res.json({ analytics });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || "Unable to load notification analytics." });
+  }
+});
+
+app.get("/api/admin/notification-history", authenticateRequest, requireAdminAccess, async (req, res) => {
+  try {
+    const result = await getNotificationHistory({
+      from_date: req.query?.from_date,
+      to_date: req.query?.to_date,
+      category: req.query?.category,
+      actor_user_id: req.query?.actor_user_id,
+      limit: req.query?.limit
+    });
+    return res.json(result);
+  } catch (error) {
+    return res.status(500).json({ error: error.message || "Unable to load notification history." });
   }
 });
 // #endregion

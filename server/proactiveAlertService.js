@@ -4,6 +4,20 @@ const CYCLE_INTERVAL_MS = 60 * 60 * 1000;
 
 let proactiveAlertHandle = null;
 
+function normalizeNotificationMetadata(value) {
+  if (!value) {
+    return {};
+  }
+  if (typeof value === "object") {
+    return value;
+  }
+  try {
+    return JSON.parse(value);
+  } catch {
+    return {};
+  }
+}
+
 export async function ensureNotificationsTable() {
   await query(`
     CREATE TABLE IF NOT EXISTS notifications (
@@ -49,6 +63,46 @@ export async function createNotification(userId, { type, category, title, messag
   return result.rows[0];
 }
 
+export async function createTrackingTaskNotification(userId, {
+  title,
+  message,
+  trackingTaskId = null,
+  existingTaskId = null,
+  emailId = null,
+  projectId = null,
+  type = "info",
+  category = "tracking_task_update",
+  priority = "medium",
+  actorUserId = null,
+  actorName = "",
+  actionType = "updated",
+  actionUrl = null,
+  metadata = {}
+} = {}) {
+  if (!Number(userId || 0)) {
+    return null;
+  }
+  return createNotification(userId, {
+    type,
+    category,
+    title,
+    message,
+    emailId,
+    taskId: existingTaskId || null,
+    projectId: projectId || null,
+    priority,
+    actionUrl: actionUrl || `/tasks/${trackingTaskId || existingTaskId || ""}`,
+    metadata: {
+      tracking_task_id: trackingTaskId || null,
+      existing_task_id: existingTaskId || null,
+      actor_user_id: actorUserId || null,
+      actor_name: actorName || "",
+      action_type: actionType || "updated",
+      ...metadata
+    }
+  });
+}
+
 export async function getNotifications(userId, { limit = 50, unreadOnly = false, category } = {}) {
   let where = "WHERE user_id = $1";
   const params = [userId];
@@ -74,11 +128,148 @@ export async function getNotifications(userId, { limit = 50, unreadOnly = false,
   const projectMap = Object.fromEntries(allProjects.rows.filter(p => projectIds.includes(p.id)).map(p => [p.id, p]));
   return rows.map(n => ({
     ...n,
+    metadata: normalizeNotificationMetadata(n.metadata),
     email_subject: emailMap[n.email_id]?.subject || null,
     task_title: taskMap[n.task_id]?.title || null,
     project_code: projectMap[n.project_id]?.project_code || null
   }));
-  return result.rows;
+}
+
+function normalizeAnalyticsBoundary(value, boundary = "start") {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return null;
+  }
+  const date = raw.includes("T")
+    ? new Date(raw)
+    : new Date(`${raw}T${boundary === "end" ? "23:59:59.999" : "00:00:00.000"}Z`);
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+  return date.toISOString();
+}
+
+export async function getAdminNotificationAnalytics({ days = 30, from_date, to_date } = {}) {
+  const normalizedDays = Math.max(1, Math.min(365, Number(days || 30) || 30));
+  const normalizedFromDate = normalizeAnalyticsBoundary(from_date, "start");
+  const normalizedToDate = normalizeAnalyticsBoundary(to_date, "end");
+  const sinceDate = normalizedFromDate || new Date(Date.now() - normalizedDays * 24 * 60 * 60 * 1000).toISOString();
+  const endDateFilter = normalizedToDate || null;
+  const periodLabel = normalizedFromDate || normalizedToDate
+    ? `${from_date || "start"} to ${to_date || "now"}`
+    : `Last ${normalizedDays} days`;
+
+  let sql = `
+    SELECT *
+    FROM notifications
+    WHERE created_at >= $1
+      AND category IN ('tracking_task_reassigned', 'tracking_task_completed', 'tracking_task_overdue')
+  `;
+  const params = [sinceDate];
+
+  if (endDateFilter) {
+    sql += ` AND created_at <= $2`;
+    params.push(endDateFilter);
+  }
+
+  sql += ` ORDER BY created_at DESC`;
+
+  const result = await query(sql, params);
+  const rows = (result.rows || []).map((row) => ({
+    ...row,
+    metadata: normalizeNotificationMetadata(row.metadata)
+  }));
+
+  const totals = {
+    reassigned: 0,
+    completed: 0,
+    overdue: 0,
+    total: rows.length
+  };
+  const actorMap = new Map();
+
+  for (const row of rows) {
+    if (row.category === "tracking_task_reassigned") {
+      totals.reassigned += 1;
+    } else if (row.category === "tracking_task_completed") {
+      totals.completed += 1;
+    } else if (row.category === "tracking_task_overdue") {
+      totals.overdue += 1;
+    }
+
+    const actorUserId = Number(row.metadata?.actor_user_id || 0) || null;
+    const actorName = String(row.metadata?.actor_name || "").trim() || "System";
+    const actorKey = actorUserId ? `user:${actorUserId}` : `system:${actorName}`;
+    const current = actorMap.get(actorKey) || {
+      actor_user_id: actorUserId,
+      actor_name: actorName,
+      total: 0,
+      reassigned: 0,
+      completed: 0,
+      overdue: 0
+    };
+    current.total += 1;
+    if (row.category === "tracking_task_reassigned") current.reassigned += 1;
+    if (row.category === "tracking_task_completed") current.completed += 1;
+    if (row.category === "tracking_task_overdue") current.overdue += 1;
+    actorMap.set(actorKey, current);
+  }
+
+  return {
+    period_days: normalizedDays,
+    period_label: periodLabel,
+    from_date: sinceDate,
+    to_date: endDateFilter,
+    totals,
+    latest_event_at: rows[0]?.created_at || null,
+    top_actors: Array.from(actorMap.values())
+      .sort((left, right) => right.total - left.total || String(left.actor_name).localeCompare(String(right.actor_name)))
+      .slice(0, 8)
+  };
+}
+
+export async function getNotificationHistory({ from_date, to_date, category, actor_user_id, limit: limitParam } = {}) {
+  const normalizedLimit = Math.max(1, Math.min(500, Number(limitParam) || 100));
+
+  let sql = `
+    SELECT id, user_id, title, message, category, metadata, created_at, read, read_at
+    FROM notifications
+    WHERE 1=1
+  `;
+  const params = [];
+  let paramIndex = 1;
+
+  if (from_date) {
+    sql += ` AND created_at >= $${paramIndex}`;
+    params.push(new Date(from_date).toISOString());
+    paramIndex++;
+  }
+  if (to_date) {
+    sql += ` AND created_at <= $${paramIndex}`;
+    params.push(new Date(to_date).toISOString());
+    paramIndex++;
+  }
+  if (category) {
+    sql += ` AND category = $${paramIndex}`;
+    params.push(category);
+    paramIndex++;
+  }
+  if (actor_user_id) {
+    sql += ` AND metadata->>'actor_user_id' = $${paramIndex}`;
+    params.push(String(actor_user_id));
+    paramIndex++;
+  }
+
+  sql += ` ORDER BY created_at DESC LIMIT $${paramIndex}`;
+  params.push(normalizedLimit);
+
+  const result = await query(sql, params);
+  const rows = (result.rows || []).map((row) => ({
+    ...row,
+    metadata: normalizeNotificationMetadata(row.metadata)
+  }));
+
+  return { history: rows, total: rows.length };
 }
 
 export async function getUnreadNotificationCount(userId) {
@@ -108,7 +299,16 @@ export async function markEmailReplied(emailId) {
 
 async function getOverdueTasks() {
   const result = await query(
-    `SELECT * FROM tasks WHERE status = 'pending' AND due_date IS NOT NULL ORDER BY due_date ASC`
+    `
+      SELECT
+        t.*,
+        tt.task_id AS tracking_task_id,
+        tt.email_id AS tracking_email_id
+      FROM tasks t
+      LEFT JOIN tracking_tasks tt ON tt.existing_task_id = t.id
+      WHERE t.status = 'pending' AND t.due_date IS NOT NULL
+      ORDER BY t.due_date ASC
+    `
   );
   const now = new Date();
   const overdue = result.rows.filter(t => new Date(t.due_date) < now && (!t.overdue_notified || (t.overdue_notified_at && (now - new Date(t.overdue_notified_at)) > 24*60*60*1000)));
@@ -131,7 +331,16 @@ async function getOverdueTasks() {
 
 async function getUpcomingDeadlineTasks(hoursAhead = 24) {
   const result = await query(
-    `SELECT * FROM tasks WHERE status = 'pending' AND due_date IS NOT NULL ORDER BY due_date ASC`
+    `
+      SELECT
+        t.*,
+        tt.task_id AS tracking_task_id,
+        tt.email_id AS tracking_email_id
+      FROM tasks t
+      LEFT JOIN tracking_tasks tt ON tt.existing_task_id = t.id
+      WHERE t.status = 'pending' AND due_date IS NOT NULL
+      ORDER BY t.due_date ASC
+    `
   );
   const now = new Date();
   const ahead = new Date(now.getTime() + hoursAhead * 60 * 60 * 1000);
@@ -193,15 +402,17 @@ export async function runProactiveAlertCycle() {
     for (const task of overdueTasks) {
       if (!task.assigned_to) continue;
       const daysOverdue = Math.round((now - new Date(task.due_date)) / (1000 * 60 * 60 * 24));
-      await createNotification(task.assigned_to, {
+      await createTrackingTaskNotification(task.assigned_to, {
         type: "warning",
-        category: "task_overdue",
+        category: task.tracking_task_id ? "tracking_task_overdue" : "task_overdue",
         title: `مهمة متأخرة: ${task.title}`,
-        message: `المهمة "${task.title}" تأخرت عن مواعدها منذ ${daysOverdue} يوم. المشروع: ${task.project_code || "بدون"}`,
-        taskId: task.id,
+        message: `المهمة "${task.title}" تأخرت عن موعدها منذ ${daysOverdue} يوم. المشروع: ${task.project_code || "بدون"}`,
+        trackingTaskId: task.tracking_task_id || null,
+        existingTaskId: task.id,
+        emailId: task.tracking_email_id || task.email_id || null,
         projectId: task.project_id,
         priority: "high",
-        actionUrl: `/tasks/${task.id}`,
+        actionType: "overdue",
         metadata: { days_overdue: daysOverdue, project_code: task.project_code }
       });
       await query(`UPDATE tasks SET overdue_notified = TRUE, overdue_notified_at = CURRENT_TIMESTAMP WHERE id = $1`, [task.id]);
@@ -304,3 +515,5 @@ export function stopProactiveAlertEngine() {
     proactiveAlertHandle = null;
   }
 }
+
+export { normalizeNotificationMetadata };

@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { Bell, Calendar, Clock, X, ChevronDown, AlertTriangle, MapPin } from "lucide-react";
+import { formatJordanDateOnly, formatJordanDateTime } from "../utils/timezone.js";
 
 const SNOOZE_OPTIONS = [
   { value: 5, label: "5 minutes" },
@@ -220,9 +221,9 @@ export default function ReminderPopup({ calendarEvents = [], tasks = [], onDismi
               <div className="reminder-preview-content">
                 <div className="reminder-preview-title">{selectedReminder.title}</div>
                 <div className="reminder-preview-time">
-                  {selectedReminder.time.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })}
+                  {formatJordanDateTime(selectedReminder.time, { month: undefined, day: undefined, year: undefined })}
                   {" "}
-                  {selectedReminder.time.toLocaleDateString("en-US", { month: "2-digit", day: "2-digit", year: "numeric" })}
+                  {formatJordanDateOnly(selectedReminder.time, { month: "2-digit", day: "2-digit", year: "numeric" })}
                 </div>
                 {selectedReminder.location && (
                   <div className="reminder-preview-location">

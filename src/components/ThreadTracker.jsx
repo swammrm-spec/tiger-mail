@@ -1,10 +1,14 @@
 import { useState } from "react";
 import { Search, ChevronRight, ChevronDown, Mail, Users, Clock, BarChart3, ArrowLeft, Filter } from "lucide-react";
+import { formatJordanDateTime } from "../utils/timezone.js";
 
 function formatDate(d) {
   if (!d) return "";
-  const dt = new Date(d);
-  return dt.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" });
+  return formatJordanDateTime(d, {
+    day: "2-digit",
+    month: "short",
+    year: "numeric"
+  });
 }
 
 function highlightText(text, query) {

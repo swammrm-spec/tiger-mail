@@ -2,6 +2,7 @@ import { useState, useMemo } from "react";
 import dayjs from "dayjs";
 import { Check, Forward, Mail, Reply, ReplyAll, Trash2, X, Calendar, MapPin, Clock, Users, User, Paperclip, Sparkles, ZoomIn, ZoomOut, RotateCcw, AlertTriangle, FileText, ChevronDown, ChevronUp } from "lucide-react";
 import { analyzeEmail, getPriorityColor, getCategoryIcon } from "../utils/emailAnalyzer";
+import { formatJordanDateTime } from "../utils/timezone.js";
 
 export default function MailReaderPane({
   selectedEmail,
@@ -88,7 +89,7 @@ export default function MailReaderPane({
               <div className="reader-sender-email">{highlightText(selectedEmail.sender_email, highlightTerms)}</div>
             </div>
             <div className="reader-date">
-              {dayjs(selectedEmail.sent_at || selectedEmail.received_at).format("ddd, MMM D, YYYY HH:mm")}
+              {formatJordanDateTime(selectedEmail.sent_at || selectedEmail.received_at, { weekday: "short" })}
             </div>
           </div>
 
@@ -376,7 +377,7 @@ export default function MailReaderPane({
                     <div className="reader-approval-card-head">
                       <strong>{item.actorLabel}</strong>
                       <span className={`reader-approval-badge ${getApprovalConversationBadgeClass(item.lane)}`}>{item.summary}</span>
-                      <span className="reader-approval-date">{dayjs(item.created_at).format("ddd MM/DD HH:mm")}</span>
+                      <span className="reader-approval-date">{formatJordanDateTime(item.created_at, { weekday: "short", month: "2-digit", day: "2-digit", year: undefined })}</span>
                     </div>
                     <div className="reader-approval-meta">
                       {item.action_type} | {item.serial_id} | REV{String(item.version_number || 1).padStart(2, "0")}

@@ -1,8 +1,12 @@
-import React, { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { Bell, Calendar, Clock, X, CheckCircle, AlertTriangle, Mail, ChevronRight, BellOff, Trash2, RefreshCw } from "lucide-react";
+import { formatJordanDateTime } from "../utils/timezone.js";
 
 const CATEGORY_ICONS = {
   task_overdue: AlertTriangle,
+  tracking_task_overdue: AlertTriangle,
+  tracking_task_reassigned: ChevronRight,
+  tracking_task_completed: CheckCircle,
   task_deadline: Clock,
   email_unanswered: Mail,
   email_stale: Mail,
@@ -13,6 +17,9 @@ const CATEGORY_ICONS = {
 
 const CATEGORY_COLORS = {
   task_overdue: { bg: "#fde7e9", fg: "#d13438" },
+  tracking_task_overdue: { bg: "#fde7e9", fg: "#d13438" },
+  tracking_task_reassigned: { bg: "#e8f0fe", fg: "#1a73e8" },
+  tracking_task_completed: { bg: "#e8f5e9", fg: "#2e7d32" },
   task_deadline: { bg: "#fff3e0", fg: "#f57c00" },
   email_unanswered: { bg: "#fce4ec", fg: "#c62828" },
   email_stale: { bg: "#fff8e1", fg: "#f9a825" },
@@ -22,6 +29,16 @@ const CATEGORY_COLORS = {
 };
 
 const PRIORITY_ORDER = { critical: 0, high: 1, medium: 2, low: 3 };
+
+function getTrackingTaskId(notif = {}) {
+  const metadataTaskId = Number(notif?.metadata?.tracking_task_id || 0);
+  if (metadataTaskId > 0) {
+    return metadataTaskId;
+  }
+  const matched = String(notif?.action_url || "").match(/^\/tracking-tasks\/(\d+)$/);
+  const actionUrlTaskId = Number(matched?.[1] || 0);
+  return actionUrlTaskId > 0 ? actionUrlTaskId : null;
+}
 
 export default function NotificationPanel({ calendarEvents, pendingApprovals, currentUser, onSelectEvent, onSelectEmail, onNavigate }) {
   const [isOpen, setIsOpen] = useState(false);
@@ -119,7 +136,10 @@ export default function NotificationPanel({ calendarEvents, pendingApprovals, cu
 
   const handleNotifClick = (notif) => {
     markAsRead(notif.id);
-    if (notif.action_url && onNavigate) {
+    const trackingTaskId = getTrackingTaskId(notif);
+    if (trackingTaskId && onNavigate) {
+      onNavigate(`/tracking-tasks/${trackingTaskId}`);
+    } else if (notif.action_url && onNavigate) {
       onNavigate(notif.action_url);
     } else if (notif.email_id && onSelectEmail) {
       onSelectEmail({ id: notif.email_id });
@@ -135,6 +155,11 @@ export default function NotificationPanel({ calendarEvents, pendingApprovals, cu
     if (a.read !== b.read) return a.read ? 1 : -1;
     return (PRIORITY_ORDER[a.priority] || 99) - (PRIORITY_ORDER[b.priority] || 99);
   });
+  const categoryCounts = useMemo(() => notifications.reduce((acc, notif) => {
+    const category = String(notif?.category || "info");
+    acc[category] = Number(acc[category] || 0) + 1;
+    return acc;
+  }, {}), [notifications]);
 
   const formatTime = (dateStr) => {
     if (!dateStr) return "";
@@ -180,10 +205,13 @@ export default function NotificationPanel({ calendarEvents, pendingApprovals, cu
           </div>
 
           <div className="notif-filter-bar">
-            {[
+                {[
               { key: "all", label: "الكل" },
               { key: "unread", label: "غير مقروء" },
               { key: "task_overdue", label: "متأخر" },
+                  { key: "tracking_task_overdue", label: "متابعة متأخرة" },
+                  { key: "tracking_task_reassigned", label: "إعادة تعيين" },
+                  { key: "tracking_task_completed", label: "مكتملة" },
               { key: "task_deadline", label: "مواعيد" },
               { key: "email_unanswered", label: "بانتظار رد" },
             ].map(f => (
@@ -194,6 +222,9 @@ export default function NotificationPanel({ calendarEvents, pendingApprovals, cu
               >
                 {f.label}
                 {f.key === "unread" && unreadCount > 0 && <span className="notif-filter-count">{unreadCount}</span>}
+                {f.key !== "all" && f.key !== "unread" && Number(categoryCounts[f.key] || 0) > 0 ? (
+                  <span className="notif-filter-count">{categoryCounts[f.key]}</span>
+                ) : null}
               </button>
             ))}
           </div>
@@ -208,6 +239,7 @@ export default function NotificationPanel({ calendarEvents, pendingApprovals, cu
               filtered.map(n => {
                 const Icon = CATEGORY_ICONS[n.category] || Bell;
                 const colors = CATEGORY_COLORS[n.category] || CATEGORY_COLORS.info;
+                const trackingTaskId = getTrackingTaskId(n);
                 return (
                   <div
                     key={n.id}
@@ -221,13 +253,30 @@ export default function NotificationPanel({ calendarEvents, pendingApprovals, cu
                       <div className="notif-item-title">{n.title}</div>
                       <div className="notif-item-subtitle">{n.message}</div>
                       <div className="notif-item-meta">
-                        <span className="notif-item-time">{formatTime(n.created_at)}</span>
+                        <span className="notif-item-time" title={formatJordanDateTime(n.created_at)}>
+                          {formatTime(n.created_at)}
+                        </span>
                         {n.project_code && <span className="notif-item-project">[{n.project_code}]</span>}
                         {n.email_subject && <span className="notif-item-email">📧 {n.email_subject}</span>}
                         {n.task_title && <span className="notif-item-task">📋 {n.task_title}</span>}
+                        {trackingTaskId ? <span className="notif-item-tracking">Tracking #{trackingTaskId}</span> : null}
                       </div>
                     </div>
                     <div className="notif-item-actions">
+                      {trackingTaskId ? (
+                        <button
+                          className="notif-item-btn jump"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            markAsRead(n.id);
+                            onNavigate?.(`/tracking-tasks/${trackingTaskId}`);
+                            setIsOpen(false);
+                          }}
+                          title="فتح مهمة التتبع"
+                        >
+                          <ChevronRight size={14} />
+                        </button>
+                      ) : null}
                       {!n.read && (
                         <button className="notif-item-btn" onClick={(e) => { e.stopPropagation(); markAsRead(n.id); }} title="تحديد كمقروء">
                           <CheckCircle size={14} />

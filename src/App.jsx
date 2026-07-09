@@ -9,6 +9,7 @@ import {
   Printer, Bookmark, Star, Filter, Menu, X, Copy, Flag, ExternalLink, MessageSquare,
   List, Grid3X3, Users, Calendar, Clock as ClockIcon, MessageCircle, CheckCircle, Sparkles
 } from "lucide-react";
+import { formatJordanDateOnly, formatJordanDateTime, getJordanDateKey } from "./utils/timezone.js";
 
 const folderIcons = { Inbox, Sent: Send, Outbox: Send, Drafts: FilePenLine, Deleted: Trash2, Junk: ShieldAlert, Spam: OctagonAlert, Archive };
 const folderDisplayNames = { Sent: "Sent Items", Deleted: "Deleted Items", Junk: "Junk Email" };
@@ -125,6 +126,14 @@ function formatApprovalReminderCountdown(nowValue) {
     slotLabel: nextSlot.format("HH:mm"),
     absoluteLabel: nextSlot.format("MMM D, HH:mm")
   };
+}
+
+function formatJordanTimeValue(value, options = {}) {
+  return formatJordanDateTime(value, options);
+}
+
+function formatJordanDateValue(value, options = {}) {
+  return formatJordanDateOnly(value, options);
 }
 
 function isSafeEmailLinkUrl(url = "") {
@@ -733,6 +742,7 @@ function App() {
   const [currentUser, setCurrentUser] = useState(null);
   const [data, setData] = useState(emptyBootstrap);
   const [currentView, setCurrentView] = useState("mail");
+  const [notificationFocusedTrackingTaskId, setNotificationFocusedTrackingTaskId] = useState(null);
   const [selectedFolder, setSelectedFolder] = useState("Inbox");
   const [smartFolder, setSmartFolder] = useState(null);
   const [smartFolderData, setSmartFolderData] = useState({ scheduled: [], snoozed: [], aiTasks: [] });
@@ -1070,7 +1080,12 @@ function App() {
     const subjectPrefix = mode === "forward" ? "FW: " : "RE: ";
     const originalSubject = selectedEmail.subject || "(No subject)";
     const subject = originalSubject.toUpperCase().startsWith(subjectPrefix.trim()) ? originalSubject : `${subjectPrefix}${originalSubject}`;
-    const originalDate = dayjs(selectedEmail.sent_at || selectedEmail.received_at).format("ddd DD/MM/YYYY HH:mm");
+    const originalDate = formatJordanTimeValue(selectedEmail.sent_at || selectedEmail.received_at, {
+      weekday: "short",
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric"
+    });
     const quotedBody = ["", "", "----- Original Message -----",
       `From: ${selectedEmail.sender_name || ""} <${selectedEmail.sender_email || ""}>`,
       `Sent: ${originalDate}`,
@@ -1773,7 +1788,7 @@ function App() {
                   <div style={{ flex: 1 }}>
                     <div style={{ fontWeight: 500, color: "#1a1a1a" }}>{outlookLabel}</div>
                     <div style={{ fontSize: 11, color: "#888" }}>
-                      Used {c.use_count || 0} time(s){c.last_used_at ? ` • ${dayjs(c.last_used_at).format("MMM D, HH:mm")}` : ""}
+                      Used {c.use_count || 0} time(s){c.last_used_at ? ` • ${formatJordanTimeValue(c.last_used_at, { month: "short", day: "2-digit", year: undefined })}` : ""}
                     </div>
                   </div>
                   <span style={{ fontSize: 10, color: "#0f6cbd", fontWeight: 600 }}>Pick</span>
@@ -3207,7 +3222,7 @@ function App() {
     {
       label: "Device Cache",
       value: deviceCacheInfo?.emailCount ?? 0,
-      note: deviceCacheInfo?.savedAt ? `Last sync ${dayjs(deviceCacheInfo.savedAt).format("YYYY-MM-DD HH:mm")}` : "No local copy yet"
+      note: deviceCacheInfo?.savedAt ? `Last sync ${formatJordanTimeValue(deviceCacheInfo.savedAt, { month: "2-digit", day: "2-digit", year: "numeric" })}` : "No local copy yet"
     },
     {
       label: "Folders",
@@ -3220,7 +3235,7 @@ function App() {
     const start = calDate.startOf("month").startOf("week");
     return Array.from({ length: 42 }, (_, i) => {
       const d = start.add(i, "day");
-      return { date: d, events: data.calendar.filter(ev => dayjs(ev.starts_at).format("YYYY-MM-DD") === d.format("YYYY-MM-DD")) };
+      return { date: d, events: data.calendar.filter(ev => getJordanDateKey(ev.starts_at) === d.format("YYYY-MM-DD")) };
     });
   }, [data.calendar, calDate]);
 
@@ -3228,7 +3243,7 @@ function App() {
     const start = calDate.startOf("week");
     return Array.from({ length: 7 }, (_, i) => {
       const d = start.add(i, "day");
-      return { date: d, events: data.calendar.filter(ev => dayjs(ev.starts_at).format("YYYY-MM-DD") === d.format("YYYY-MM-DD")) };
+      return { date: d, events: data.calendar.filter(ev => getJordanDateKey(ev.starts_at) === d.format("YYYY-MM-DD")) };
     });
   }, [data.calendar, calDate]);
 
@@ -3295,7 +3310,7 @@ function App() {
 
   async function exportSearchResults(format) {
     if (!filteredEmails.length) { setError("No search results available to export."); setSuccessMessage(""); return; }
-    const rows = filteredEmails.map(e => ({ Folder: e.folder_name, From: e.sender_name, FromEmail: e.sender_email, To: e.recipient_email, CC: e.cc_list || "", BCC: e.bcc_list || "", Subject: e.subject, Priority: e.priority, Status: e.recalled ? "Recalled" : e.folder_name === "Outbox" && e.queue_last_error ? "Failed" : e.folder_name === "Outbox" ? "Queued" : e.status === "Sent" || e.folder_name === "Sent" ? "Sent" : e.status, Serial: e.serial, Date: dayjs(e.sent_at || e.received_at).format("YYYY-MM-DD HH:mm:ss"), HasAttachments: e.has_attachments ? "Yes" : "No", Preview: e.preview }));
+    const rows = filteredEmails.map(e => ({ Folder: e.folder_name, From: e.sender_name, FromEmail: e.sender_email, To: e.recipient_email, CC: e.cc_list || "", BCC: e.bcc_list || "", Subject: e.subject, Priority: e.priority, Status: e.recalled ? "Recalled" : e.folder_name === "Outbox" && e.queue_last_error ? "Failed" : e.folder_name === "Outbox" ? "Queued" : e.status === "Sent" || e.folder_name === "Sent" ? "Sent" : e.status, Serial: e.serial, Date: formatJordanTimeValue(e.sent_at || e.received_at, { month: "2-digit", day: "2-digit", year: "numeric", second: "2-digit" }), HasAttachments: e.has_attachments ? "Yes" : "No", Preview: e.preview }));
     const stamp = dayjs().format("YYYYMMDD-HHmmss");
     if (format === "csv") {
       const headers = Object.keys(rows[0] || {});
@@ -3628,7 +3643,7 @@ function App() {
   }
 
   function handleExportEmailTrailCsv() {
-    const csv = [["ID", "Serial", "Subject", "Sender", "Recipient", "Folder", "Employee", "Date", "Priority", "Status"].join(","), ...emailTrail.map((row) => [row.id, row.serial, `"${row.subject}"`, row.sender_email, row.recipient_email, row.folder_name, row.employee_name || "", row.received_at, row.priority, row.status].join(","))].join("\n");
+    const csv = [["ID", "Serial", "Subject", "Sender", "Recipient", "Folder", "Employee", "Date", "Priority", "Status"].join(","), ...emailTrail.map((row) => [row.id, row.serial, `"${row.subject}"`, row.sender_email, row.recipient_email, row.folder_name, row.employee_name || "", formatJordanTimeValue(row.received_at, { month: "2-digit", day: "2-digit", year: "numeric", second: "2-digit" }), row.priority, row.status].join(","))].join("\n");
     const blob = new Blob([csv], { type: "text/csv" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -3846,7 +3861,7 @@ function App() {
               {data.reminders.length ? data.reminders.slice(0, 5).map(r => (
                 <div key={r.id} style={{ fontSize: 11, padding: "4px 0", borderBottom: "1px solid #eee" }}>
                   <strong>{r.title}</strong><br />
-                  <span style={{ color: "#666" }}>{dayjs(r.remind_at).format("MMM D, HH:mm")}</span>
+                  <span style={{ color: "#666" }}>{formatJordanTimeValue(r.remind_at, { month: "short", day: "2-digit", year: undefined })}</span>
                 </div>
               )) : <div style={{ fontSize: 11, color: "#999" }}>No upcoming events</div>}
             </div>
@@ -3868,9 +3883,9 @@ function App() {
           {calView === "day" ? (
             <div style={{ flex: 1, overflow: "auto", padding: 16 }}>
               <h3 style={{ fontSize: 16, fontWeight: 300, marginBottom: 12 }}>{calDate.format("dddd, MMMM D, YYYY")}</h3>
-              {data.calendar.filter(ev => dayjs(ev.starts_at).format("YYYY-MM-DD") === calDate.format("YYYY-MM-DD")).length ? data.calendar.filter(ev => dayjs(ev.starts_at).format("YYYY-MM-DD") === calDate.format("YYYY-MM-DD")).map(ev => (
+              {data.calendar.filter(ev => getJordanDateKey(ev.starts_at) === calDate.format("YYYY-MM-DD")).length ? data.calendar.filter(ev => getJordanDateKey(ev.starts_at) === calDate.format("YYYY-MM-DD")).map(ev => (
                 <div key={ev.id} style={{ padding: "8px 12px", background: "#deecf9", marginBottom: 4, borderLeft: "3px solid #243A80", fontSize: 12 }}>
-                  <strong>{ev.title}</strong> {dayjs(ev.starts_at).format("HH:mm")} - {dayjs(ev.ends_at).format("HH:mm")}
+                  <strong>{ev.title}</strong> {formatJordanTimeValue(ev.starts_at, { month: undefined, day: undefined, year: undefined })} - {formatJordanTimeValue(ev.ends_at, { month: undefined, day: undefined, year: undefined })}
                   {ev.location ? <span style={{ color: "#666", marginLeft: 8 }}>{ev.location}</span> : null}
                 </div>
               )) : <div style={{ fontSize: 12, color: "#999" }}>No events for this day.</div>}
@@ -3879,7 +3894,7 @@ function App() {
             <div className="o365-cal-grid">
               {weekdayLabels.map(d => <div key={d} style={{ padding: 6, textAlign: "center", fontSize: 11, fontWeight: 700, color: "#555", background: "#f5f5f5" }}>{d}</div>)}
               {currentCells.map(cell => (
-                <div key={cell.date.toString()} className={`o365-cal-cell ${cell.date.month() !== calDate.month() ? "other-month" : ""} ${cell.date.format("YYYY-MM-DD") === dayjs().format("YYYY-MM-DD") ? "today" : ""}`}
+                <div key={cell.date.toString()} className={`o365-cal-cell ${cell.date.month() !== calDate.month() ? "other-month" : ""} ${cell.date.format("YYYY-MM-DD") === getJordanDateKey(new Date()) ? "today" : ""}`}
                   onClick={() => { setCalDate(cell.date); setCalView("day"); }}>
                   <div className="o365-cal-day-num">{cell.date.date()}</div>
                   {cell.events.slice(0, 3).map(ev => <div key={ev.id} className="o365-cal-event">{ev.title}</div>)}
@@ -4360,8 +4375,8 @@ function App() {
                           </span>
                         </span>
                         <span><span style={{ color: "#999" }}>Reminders:</span> {Number(email.reminder_count || 0)}</span>
-                        {email.last_reminder_at ? <span><span style={{ color: "#999" }}>Last Reminder:</span> {dayjs(email.last_reminder_at).format("MMM D, HH:mm")}</span> : null}
-                        <span><span style={{ color: "#999" }}>Date:</span> {new Date(email.received_at).toLocaleString()}</span>
+                        {email.last_reminder_at ? <span><span style={{ color: "#999" }}>Last Reminder:</span> {formatJordanTimeValue(email.last_reminder_at, { month: "short", day: "2-digit", year: undefined })}</span> : null}
+                        <span><span style={{ color: "#999" }}>Date:</span> {formatJordanTimeValue(email.received_at)}</span>
                         {email.has_attachments ? <span style={{ color: "var(--c-primary)" }}><Paperclip size={12} style={{ marginRight: 2, verticalAlign: "middle" }} /> Attachments</span> : null}
                       </div>
                       {formatRiskFlags(email.risk_flags) ? (
@@ -4455,8 +4470,8 @@ function App() {
                     </div>
                     {approvalActionLinksByEmail[email.id] ? (
                       <div style={{ marginTop: 10, fontSize: 12, color: "#555", lineHeight: 1.6 }}>
-                        <div><strong>Approve Expires:</strong> {dayjs(approvalActionLinksByEmail[email.id].approve_expires_at).format("YYYY-MM-DD HH:mm")}</div>
-                        <div><strong>Reject Expires:</strong> {dayjs(approvalActionLinksByEmail[email.id].reject_expires_at).format("YYYY-MM-DD HH:mm")}</div>
+                        <div><strong>Approve Expires:</strong> {formatJordanTimeValue(approvalActionLinksByEmail[email.id].approve_expires_at, { month: "2-digit", day: "2-digit", year: "numeric" })}</div>
+                        <div><strong>Reject Expires:</strong> {formatJordanTimeValue(approvalActionLinksByEmail[email.id].reject_expires_at, { month: "2-digit", day: "2-digit", year: "numeric" })}</div>
                         <div><strong>Telegram Target:</strong> {approvalActionLinksByEmail[email.id].telegram_chat_id || "Not mapped yet"}</div>
                       </div>
                     ) : null}
@@ -4563,7 +4578,7 @@ function App() {
             <button className={`o365-banner-tab ${currentView === "archive" ? "active" : ""}`} onClick={() => { setCurrentView("archive"); setArchiveSearch(""); setArchiveResults([]); loadArchiveStats(); }}><Bookmark size={15} /> Archive</button>
             <button className={`o365-banner-tab ${currentView === "calendar" ? "active" : ""}`} onClick={() => openCalendarView()}><CalendarDays size={15} /> Calendar</button>
             <button className={`o365-banner-tab`} title="Address book"><Users size={15} /> Address book</button>
-            <button className={`o365-banner-tab ${currentView === "tasks" ? "active" : ""}`} onClick={() => setCurrentView("tasks")}><List size={15} /> Tasks</button>
+            <button className={`o365-banner-tab ${currentView === "tasks" ? "active" : ""}`} onClick={() => { setNotificationFocusedTrackingTaskId(null); setCurrentView("tasks"); }}><List size={15} /> Tasks</button>
             <button className={`o365-banner-tab`} title="Notes"><FileText size={15} /> Notes</button>
             <button className={`o365-banner-tab`} title="Files"><Grid3X3 size={15} /> Files</button>
             {canAccessAdmin ? <button className={`o365-banner-tab ${currentView === "admin" ? "active" : ""}`} onClick={() => setCurrentView("admin")}><LayoutDashboard size={15} /> Admin</button> : null}
@@ -4585,11 +4600,20 @@ function App() {
                 if (url.startsWith("/email/")) {
                   const eid = parseInt(url.split("/email/")[1]);
                   if (eid) { setSelectedEmailId(eid); setCurrentView("mail"); }
+                } else if (url.startsWith("/tracking-tasks/")) {
+                  const trackingTaskId = parseInt(url.split("/tracking-tasks/")[1]);
+                  if (trackingTaskId) {
+                    setNotificationFocusedTrackingTaskId(trackingTaskId);
+                    setCurrentView("tasks");
+                  }
                 } else if (url.startsWith("/tasks/")) {
+                  setNotificationFocusedTrackingTaskId(null);
                   setCurrentView("tasks");
                 } else if (url.startsWith("/projects")) {
+                  setNotificationFocusedTrackingTaskId(null);
                   setCurrentView("projects");
                 } else {
+                  setNotificationFocusedTrackingTaskId(null);
                   setCurrentView("mail");
                 }
               }}
@@ -4933,7 +4957,7 @@ function App() {
                               {highlightText(email.subject, highlightTerms)}
                               <span className="msg-preview">- {getEmailListPreview(email)}</span>
                             </span>
-                            <span className="msg-date">{dayjs(getEmailTimestamp(email)).format("MM/DD")}</span>
+                            <span className="msg-date">{formatJordanDateValue(getEmailTimestamp(email), { month: "2-digit", day: "2-digit", year: undefined })}</span>
                           </div>
                         </Fragment>
                       );
@@ -5023,7 +5047,7 @@ function App() {
                   <div key={email.id} style={{ border: "1px solid #e0e0e0", borderRadius: 8, padding: 14, marginBottom: 10, background: "#fff", borderLeft: `4px solid ${email.folder_name === "Sent" ? "#1a237e" : "#107c10"}` }}>
                     <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
                       <span style={{ fontSize: 12, fontWeight: 600 }}>{email.sender_name || email.sender_email}</span>
-                      <span style={{ fontSize: 11, color: "#888" }}>{dayjs(email.sent_at || email.received_at).format("ddd, MMM D, YYYY HH:mm")}</span>
+                      <span style={{ fontSize: 11, color: "#888" }}>{formatJordanTimeValue(email.sent_at || email.received_at, { weekday: "short" })}</span>
                     </div>
                     <div style={{ fontSize: 12, color: "#666", marginBottom: 4 }}>To: {email.recipient_email}</div>
                     <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 4 }}>{email.subject}</div>
@@ -5043,7 +5067,7 @@ function App() {
                   <div key={email.id} onClick={() => loadArchiveThread(email.serial)} style={{ border: "1px solid #e0e0e0", borderRadius: 8, padding: 14, marginBottom: 8, background: "#fff", cursor: "pointer", transition: "all 0.15s" }}>
                     <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
                       <span style={{ fontSize: 13, fontWeight: 600 }}>{email.subject}</span>
-                      <span style={{ fontSize: 11, color: "#888" }}>{dayjs(email.sent_at || email.received_at).format("MM/DD/YYYY HH:mm")}</span>
+                      <span style={{ fontSize: 11, color: "#888" }}>{formatJordanTimeValue(email.sent_at || email.received_at, { month: "2-digit", day: "2-digit", year: "numeric" })}</span>
                     </div>
                     <div style={{ display: "flex", gap: 12, fontSize: 12, color: "#666" }}>
                       <span>From: {email.sender_name || email.sender_email}</span>
@@ -5060,7 +5084,7 @@ function App() {
                   <div key={i} onClick={() => loadArchiveThread(email.serial)} style={{ border: "1px solid #e0e0e0", borderRadius: 8, padding: 14, marginBottom: 8, background: "#fff", cursor: "pointer" }}>
                     <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
                       <span style={{ fontSize: 13, fontWeight: 600 }}>{email.subject}</span>
-                      <span style={{ fontSize: 11, color: "#888" }}>{dayjs(email.received_at).format("MM/DD/YYYY")}</span>
+                      <span style={{ fontSize: 11, color: "#888" }}>{formatJordanDateValue(email.received_at, { month: "2-digit", day: "2-digit", year: "numeric" })}</span>
                     </div>
                     <div style={{ display: "flex", gap: 12, fontSize: 12, color: "#666" }}>
                       <span>{email.sender_name || email.sender_email}</span>
@@ -5079,7 +5103,12 @@ function App() {
 
       {currentView === "tasks" && (
         <Suspense fallback={<div style={{ padding: 40, textAlign: "center", color: "#999" }}>Loading tasks...</div>}>
-          <TaskDashboard currentUser={currentUser} setCurrentView={setCurrentView} />
+          <TaskDashboard
+            currentUser={currentUser}
+            setCurrentView={setCurrentView}
+            focusedTrackingTaskId={notificationFocusedTrackingTaskId}
+            onFocusedTrackingTaskHandled={() => setNotificationFocusedTrackingTaskId(null)}
+          />
         </Suspense>
       )}
 
@@ -5205,9 +5234,9 @@ function App() {
                   <div className="o365-approval-panel-title">Telegram-Ready Links</div>
                   <div className="o365-approval-link-stack">
                     <label>Approve Expires</label>
-                    <div style={{ fontSize: 12, color: "#555" }}>{approvalActionLinks.approve_expires_at ? dayjs(approvalActionLinks.approve_expires_at).format("YYYY-MM-DD HH:mm") : "-"}</div>
+                    <div style={{ fontSize: 12, color: "#555" }}>{approvalActionLinks.approve_expires_at ? formatJordanTimeValue(approvalActionLinks.approve_expires_at, { month: "2-digit", day: "2-digit", year: "numeric" }) : "-"}</div>
                     <label>Reject Expires</label>
-                    <div style={{ fontSize: 12, color: "#555" }}>{approvalActionLinks.reject_expires_at ? dayjs(approvalActionLinks.reject_expires_at).format("YYYY-MM-DD HH:mm") : "-"}</div>
+                    <div style={{ fontSize: 12, color: "#555" }}>{approvalActionLinks.reject_expires_at ? formatJordanTimeValue(approvalActionLinks.reject_expires_at, { month: "2-digit", day: "2-digit", year: "numeric" }) : "-"}</div>
                     <label>Telegram Chat Mapping</label>
                     <div style={{ fontSize: 12, color: "#555" }}>{approvalActionLinks.telegram_chat_id || "No persistent Telegram chat mapped."}</div>
                     <label>Approve URL</label>
@@ -5256,7 +5285,7 @@ function App() {
                           <div className="o365-approval-thread-head">
                             <strong>{item.actorLabel}</strong>
                             <span className={`o365-approval-thread-badge ${getApprovalConversationBadgeClass(item.lane)}`}>{item.summary}</span>
-                            <span>{dayjs(item.created_at).format("YYYY-MM-DD HH:mm")}</span>
+                            <span>{formatJordanTimeValue(item.created_at, { month: "2-digit", day: "2-digit", year: "numeric" })}</span>
                           </div>
                           <div className="o365-approval-thread-meta">
                             {item.action_type} | {item.serial_id} | REV{String(item.version_number || 1).padStart(2, "0")}

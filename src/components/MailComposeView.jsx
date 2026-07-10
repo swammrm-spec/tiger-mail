@@ -127,7 +127,11 @@ export default function MailComposeView({
   activeAccountId,
   setActiveAccountId,
   emailKeys = [],
-  projects = []
+  outboundCompanyOptions = [],
+  outboundClientOptions = [],
+  outgoingReferenceOptions = [],
+  professionalOutgoingState = { emailSubject: "", isComplete: false, missing: [], preview: "", previewHtml: "", subjectNo: "", documentNo: "" },
+  enforceOutboundSubjectSchema = true
 }) {
   const [showKeyDropdown, setShowKeyDropdown] = useState(false);
   const activeAccount = emailAccounts.find(a => a.id === activeAccountId) || emailAccounts[0];
@@ -493,83 +497,179 @@ export default function MailComposeView({
               {renderChipEmailInput("bcc_list", "Bcc recipients", bccInputRef)}
             </div>
           ) : null}
-          <div className="o365-compose-field" style={{ borderBottom: "none" }}>
-            <span className="field-label">Subject</span>
-            <div style={{ display: "flex", gap: 8, marginBottom: 6 }}>
-              <div style={{ position: "relative" }}>
-                <button
-                  type="button"
-                  onClick={() => setShowKeyDropdown(!showKeyDropdown)}
-                  style={{
-                    width: 150, padding: "4px 8px", fontSize: 12, borderRadius: 4,
-                    border: "1px solid #ccc", background: "#fff", cursor: "pointer",
-                    display: "flex", alignItems: "center", gap: 6, textAlign: "left"
-                  }}
-                >
-                  {selectedKey ? (
+          <div className="o365-compose-field" style={{ borderBottom: "none", flexDirection: "column", alignItems: "stretch", gap: 0 }}>
+            <div style={{ display: "flex", alignItems: "center" }}>
+              <span className="field-label">Subject</span>
+              <div style={{ flex: 1, padding: "6px 8px", display: "flex", alignItems: "center", gap: 6 }}>
+                <div style={{ position: "relative", flexShrink: 0 }}>
+                  <button
+                    type="button"
+                    onClick={() => setShowKeyDropdown(!showKeyDropdown)}
+                    style={{
+                      width: 140, padding: "4px 8px", fontSize: 12, borderRadius: 4,
+                      border: "1px solid #ccc", background: "#fff", cursor: "pointer",
+                      display: "flex", alignItems: "center", gap: 6, textAlign: "left"
+                    }}
+                  >
+                    {selectedKey ? (
+                      <>
+                        <span style={{ width: 10, height: 10, borderRadius: "50%", background: selectedKey.color || "#1a237e", flexShrink: 0 }} />
+                        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>[{selectedKey.key_code}]</span>
+                      </>
+                    ) : (
+                      <span style={{ color: "#888" }}>Key (optional)</span>
+                    )}
+                  </button>
+                  {showKeyDropdown && (
                     <>
-                      <span style={{ width: 10, height: 10, borderRadius: "50%", background: selectedKey.color || "#1a237e", flexShrink: 0 }} />
-                      <span>[{selectedKey.key_code}] {selectedKey.key_name}</span>
-                    </>
-                  ) : (
-                    <span style={{ color: "#888" }}>Key (optional)</span>
-                  )}
-                </button>
-                {showKeyDropdown && (
-                  <>
-                    <div style={{ position: "fixed", inset: 0, zIndex: 999 }} onClick={() => setShowKeyDropdown(false)} />
-                    <div style={{
-                      position: "absolute", top: "100%", left: 0, zIndex: 1000,
-                      background: "#fff", border: "1px solid #d1d1d1", borderRadius: 6,
-                      boxShadow: "0 4px 16px rgba(0,0,0,0.15)", maxHeight: 280, overflowY: "auto",
-                      minWidth: 200, padding: 4
-                    }}>
-                      <div
-                        onClick={() => { setForm({ ...form, email_key_id: "" }); setShowKeyDropdown(false); }}
-                        style={{ padding: "6px 10px", fontSize: 12, cursor: "pointer", borderRadius: 4, color: "#888" }}
-                      >
-                        No key
-                      </div>
-                      {emailKeys.map(k => (
+                      <div style={{ position: "fixed", inset: 0, zIndex: 999 }} onClick={() => setShowKeyDropdown(false)} />
+                      <div style={{
+                        position: "absolute", top: "100%", left: 0, zIndex: 1000,
+                        background: "#fff", border: "1px solid #d1d1d1", borderRadius: 6,
+                        boxShadow: "0 4px 16px rgba(0,0,0,0.15)", maxHeight: 280, overflowY: "auto",
+                        minWidth: 200, padding: 4
+                      }}>
                         <div
-                          key={k.id}
-                          onClick={() => { setForm({ ...form, email_key_id: k.id }); setShowKeyDropdown(false); }}
-                          style={{
-                            padding: "6px 10px", fontSize: 12, cursor: "pointer", borderRadius: 4,
-                            display: "flex", alignItems: "center", gap: 8,
-                            background: Number(form.email_key_id) === k.id ? "#e8f0fe" : "transparent"
-                          }}
-                          onMouseEnter={(e) => e.currentTarget.style.background = "#f0f0f0"}
-                          onMouseLeave={(e) => e.currentTarget.style.background = Number(form.email_key_id) === k.id ? "#e8f0fe" : "transparent"}
+                          onClick={() => { setForm({ ...form, email_key_id: "" }); setShowKeyDropdown(false); }}
+                          style={{ padding: "6px 10px", fontSize: 12, cursor: "pointer", borderRadius: 4, color: "#888" }}
                         >
-                          <span style={{ width: 12, height: 12, borderRadius: "50%", background: k.color || "#1a237e", flexShrink: 0 }} />
-                          <span style={{ fontWeight: 600 }}>[{k.key_code}]</span>
-                          <span style={{ color: "#555" }}>{k.key_name}</span>
+                          No key
                         </div>
-                      ))}
-                    </div>
-                  </>
-                )}
+                        {emailKeys.map(k => (
+                          <div
+                            key={k.id}
+                            onClick={() => { setForm({ ...form, email_key_id: k.id }); setShowKeyDropdown(false); }}
+                            style={{
+                              padding: "6px 10px", fontSize: 12, cursor: "pointer", borderRadius: 4,
+                              display: "flex", alignItems: "center", gap: 8,
+                              background: Number(form.email_key_id) === k.id ? "#e8f0fe" : "transparent"
+                            }}
+                            onMouseEnter={(e) => e.currentTarget.style.background = "#f0f0f0"}
+                            onMouseLeave={(e) => e.currentTarget.style.background = Number(form.email_key_id) === k.id ? "#e8f0fe" : "transparent"}
+                          >
+                            <span style={{ width: 12, height: 12, borderRadius: "50%", background: k.color || "#1a237e", flexShrink: 0 }} />
+                            <span style={{ fontWeight: 600 }}>[{k.key_code}]</span>
+                            <span style={{ color: "#555" }}>{k.key_name}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  )}
+                </div>
+                <input
+                  value={form.subject}
+                  onChange={(e) => setForm({ ...form, subject: e.target.value })}
+                  placeholder="Email Subject"
+                  required
+                  readOnly={enforceOutboundSubjectSchema}
+                  style={{ flex: 1, padding: "4px 6px", fontSize: 12, borderRadius: 4, border: "1px solid #ccc", minWidth: 120 }}
+                />
               </div>
-              <select
-                value={form.project_id}
-                onChange={(e) => setForm({ ...form, project_id: e.target.value })}
-                style={{ width: 180, padding: "4px 6px", fontSize: 12, borderRadius: 4, border: "1px solid #ccc" }}
-              >
-                <option value="">Project (optional)</option>
-                {projects.map(p => (
-                  <option key={p.id} value={p.id}>[{p.project_code}] {p.project_name}</option>
-                ))}
-              </select>
             </div>
-            <div className="field-input">
-              <input value={form.subject} onChange={(e) => setForm({ ...form, subject: e.target.value })} placeholder="Subject" required />
+            {enforceOutboundSubjectSchema ? (
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))", gap: 6, padding: "4px 8px 4px 80px", borderTop: "1px solid #eee" }}>
+                <select
+                  value={form.outbound_company || ""}
+                  onChange={(e) => setForm({ ...form, outbound_company: e.target.value })}
+                  style={{ padding: "4px 6px", fontSize: 12, borderRadius: 4, border: "1px solid #ccc" }}
+                >
+                  <option value="">Company</option>
+                  {outboundCompanyOptions.map((item) => (
+                    <option key={item.value} value={item.value}>{item.label}</option>
+                  ))}
+                </select>
+                <select
+                  value={form.outbound_client || ""}
+                  onChange={(e) => setForm({ ...form, outbound_client: e.target.value })}
+                  style={{ padding: "4px 6px", fontSize: 12, borderRadius: 4, border: "1px solid #ccc" }}
+                >
+                  <option value="">Client</option>
+                  {outboundClientOptions.map((item) => (
+                    <option key={item.value} value={item.value}>{item.label}</option>
+                  ))}
+                </select>
+                <select
+                  value={form.outbound_group_type || "projects"}
+                  onChange={(e) => setForm({ ...form, outbound_group_type: e.target.value, outbound_reference_value: "", project_id: "" })}
+                  style={{ padding: "4px 6px", fontSize: 12, borderRadius: 4, border: "1px solid #ccc" }}
+                >
+                  <option value="projects">Projects</option>
+                  <option value="quotations">Quotations</option>
+                  <option value="studies">Studies</option>
+                  <option value="admin_subjects">Admin Subjects</option>
+                </select>
+                <select
+                  value={form.outbound_reference_value || ""}
+                  onChange={(e) => setForm({
+                    ...form,
+                    outbound_reference_value: e.target.value,
+                    project_id: form.outbound_group_type === "projects" ? e.target.value : form.project_id
+                  })}
+                  style={{ padding: "4px 6px", fontSize: 12, borderRadius: 4, border: "1px solid #ccc" }}
+                >
+                  <option value="">Subject Number Reference</option>
+                  {outgoingReferenceOptions.map((item) => (
+                    <option key={item.value} value={item.value}>{item.label}</option>
+                  ))}
+                </select>
+              </div>
+            ) : null}
+            {enforceOutboundSubjectSchema ? (
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))", gap: 6, padding: "4px 8px 4px 80px", borderTop: "1px solid #eee" }}>
+                <input value={form.outbound_letter_type || "Letter"} readOnly style={{ padding: "4px 6px", fontSize: 12, borderRadius: 4, border: "1px solid #ccc", background: "#f8f8f8" }} />
+                <input
+                  value={form.outbound_letter_title || ""}
+                  onChange={(e) => setForm({ ...form, outbound_letter_title: e.target.value })}
+                  placeholder="Letter Title"
+                  style={{ padding: "4px 6px", fontSize: 12, borderRadius: 4, border: "1px solid #ccc" }}
+                />
+                <select
+                  value={professionalOutgoingState.subjectNo || ""}
+                  disabled
+                  style={{ padding: "4px 6px", fontSize: 12, borderRadius: 4, border: "1px solid #ccc", background: "#f8f8f8" }}
+                >
+                  <option value={professionalOutgoingState.subjectNo || ""}>{professionalOutgoingState.subjectNo || "Subject No."}</option>
+                </select>
+                <input
+                  value={form.outbound_document_serial || ""}
+                  onChange={(e) => setForm({ ...form, outbound_document_serial: e.target.value.toUpperCase() })}
+                  placeholder="Document Serial"
+                  style={{ padding: "4px 6px", fontSize: 12, borderRadius: 4, border: "1px solid #ccc" }}
+                />
+              </div>
+            ) : null}
+            {enforceOutboundSubjectSchema ? (
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))", gap: 6, padding: "4px 8px 4px 80px", borderTop: "1px solid #eee" }}>
+                <input
+                  value={form.outbound_internal_serial || ""}
+                  onChange={(e) => setForm({ ...form, outbound_internal_serial: e.target.value.toUpperCase() })}
+                  placeholder="Internal Serial"
+                  style={{ padding: "4px 6px", fontSize: 12, borderRadius: 4, border: "1px solid #ccc" }}
+                />
+                <input
+                  type="date"
+                  value={form.outbound_subject_date || ""}
+                  onChange={(e) => setForm({ ...form, outbound_subject_date: e.target.value })}
+                  style={{ padding: "4px 6px", fontSize: 12, borderRadius: 4, border: "1px solid #ccc" }}
+                />
+                <input value={professionalOutgoingState.documentNo || ""} readOnly placeholder="Document No." style={{ padding: "4px 6px", fontSize: 12, borderRadius: 4, border: "1px solid #ccc", background: "#f8f8f8" }} />
+                <input value={form.subject} onChange={(e) => setForm({ ...form, subject: e.target.value })} placeholder="Email Subject" required readOnly style={{ padding: "4px 6px", fontSize: 12, borderRadius: 4, border: "1px solid #ccc" }} />
+              </div>
+            ) : null}
+            <div style={{ padding: "4px 8px 4px 80px", display: "flex", flexDirection: "column", gap: 4 }}>
+              <span style={{ fontSize: 10, color: "#888" }}>
+                {form.email_key_id && form.subject
+                  ? `Will be sent as: ${emailKeys.find(k => k.id === Number(form.email_key_id))?.key_code || ""}:${String(new Date().getFullYear()).slice(-2)}/${form.subject}`
+                  : "Select Key to auto-format subject"}
+              </span>
+              {enforceOutboundSubjectSchema && (
+                <span style={{ fontSize: 11, color: professionalOutgoingState.isComplete ? "#107c10" : "#b54708" }}>
+                  {professionalOutgoingState.isComplete
+                    ? "الكتاب الرسمي جاهز للإرسال."
+                    : `الحقول المطلوبة قبل الإرسال: ${(professionalOutgoingState.missing || []).join("، ") || "غير مكتملة"}`}
+                </span>
+              )}
             </div>
-            <span style={{ fontSize: 10, color: "#888", marginTop: 2 }}>
-              {form.email_key_id && form.subject
-                ? `Will be sent as: ${emailKeys.find(k => k.id === Number(form.email_key_id))?.key_code || ""}:${String(new Date().getFullYear()).slice(-2)}/${form.subject}`
-                : "Select Key to auto-format subject"}
-            </span>
           </div>
         </div>
         <div className={`o365-compose-body-shell ${composeSourceEmail ? "with-review" : ""}`}>
@@ -678,6 +778,50 @@ export default function MailComposeView({
           </div>
         ) : null}
       </form>
+      {enforceOutboundSubjectSchema && (
+        <OutgoingPreviewPanel professionalOutgoingState={professionalOutgoingState} />
+      )}
+    </div>
+  );
+}
+
+function OutgoingPreviewPanel({ professionalOutgoingState }) {
+  const [isExpanded, setIsExpanded] = useState(false);
+
+  return (
+    <div style={{ borderTop: "1px solid #e1e1e1", background: "#fafbfc" }}>
+      <button
+        type="button"
+        onClick={() => setIsExpanded(!isExpanded)}
+        style={{
+          width: "100%", padding: "8px 12px", fontSize: 12, fontWeight: 600,
+          background: "transparent", border: "none", cursor: "pointer",
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          color: "#44546f"
+        }}
+      >
+        <span>Outgoing Letter Preview</span>
+        <span style={{ fontSize: 10, fontWeight: 400, color: "#888" }}>
+          {isExpanded ? "▲ Hide" : "▼ Show"} | HTML + text fallback are generated automatically on send.
+        </span>
+      </button>
+      {isExpanded && (
+        <div className="o365-outgoing-preview" style={{ margin: "0 12px 12px", borderRadius: 8 }}>
+          <div className="o365-outgoing-preview-canvas" style={{ maxHeight: 300 }}>
+            {professionalOutgoingState.previewHtml ? (
+              <div
+                className="o365-outgoing-preview-document"
+                dangerouslySetInnerHTML={{ __html: professionalOutgoingState.previewHtml }}
+              />
+            ) : (
+              <div className="o365-outgoing-preview-empty">املأ حقول الكتاب الرسمي لتظهر المعاينة هنا.</div>
+            )}
+          </div>
+          <div className="o365-outgoing-preview-note">
+            يتم تثبيت البيانات الرسمية داخل نص الرسالة والنسخة المنسقة عند الإرسال من الخادم.
+          </div>
+        </div>
+      )}
     </div>
   );
 }

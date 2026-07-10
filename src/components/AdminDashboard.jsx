@@ -194,6 +194,11 @@ export default function AdminDashboard({
   const [notificationAnalyticsFromDate, setNotificationAnalyticsFromDate] = useState("");
   const [notificationAnalyticsToDate, setNotificationAnalyticsToDate] = useState("");
   const [notificationAnalyticsHistory, setNotificationAnalyticsHistory] = useState([]);
+  const [notificationAnalyticsHistoryLoading, setNotificationAnalyticsHistoryLoading] = useState(false);
+  const [notificationAnalyticsHistoryError, setNotificationAnalyticsHistoryError] = useState("");
+  const [notificationHistoryActorFilter, setNotificationHistoryActorFilter] = useState("all");
+  const [notificationHistoryActionFilter, setNotificationHistoryActionFilter] = useState("all");
+  const [notificationHistoryTrackingTaskFilter, setNotificationHistoryTrackingTaskFilter] = useState("");
   const [showNotificationHistory, setShowNotificationHistory] = useState(false);
 
   const trackerSummaryCards = [
@@ -290,6 +295,52 @@ export default function AdminDashboard({
       || Object.values(notificationAnalytics?.totals || {}).some((value) => Number(value || 0) > 0)
     );
   }, [notificationAnalytics]);
+  const notificationHistoryQuery = useMemo(() => {
+    const params = new URLSearchParams();
+    if (notificationAnalyticsFromDate) {
+      params.set("from_date", notificationAnalyticsFromDate);
+    }
+    if (notificationAnalyticsToDate) {
+      params.set("to_date", notificationAnalyticsToDate);
+    }
+    if (notificationHistoryActorFilter !== "all") {
+      params.set("actor", notificationHistoryActorFilter);
+    }
+    if (notificationHistoryActionFilter !== "all") {
+      params.set("action_type", notificationHistoryActionFilter);
+    }
+    const normalizedTrackingTaskId = Number(notificationHistoryTrackingTaskFilter || 0) || null;
+    if (normalizedTrackingTaskId) {
+      params.set("tracking_task_id", String(normalizedTrackingTaskId));
+    }
+    params.set("limit", "100");
+    return params.toString();
+  }, [notificationAnalyticsFromDate, notificationAnalyticsToDate, notificationHistoryActionFilter, notificationHistoryActorFilter, notificationHistoryTrackingTaskFilter]);
+  const notificationHistoryActorOptions = useMemo(() => {
+    const seen = new Map();
+    for (const item of notificationAnalytics?.top_actors || []) {
+      const key = String(item.actor_user_id || "").trim() || (String(item.actor_name || "").trim().toLowerCase() === "system" ? "system" : "");
+      if (!key || seen.has(key)) {
+        continue;
+      }
+      seen.set(key, {
+        value: key,
+        label: item.actor_name || (key === "system" ? "System" : `Actor ${key}`)
+      });
+    }
+    for (const item of notificationAnalyticsHistory || []) {
+      const actorId = String(item.actor_user_id || "").trim();
+      const key = actorId || (String(item.actor_name || "").trim().toLowerCase() === "system" ? "system" : "");
+      if (!key || seen.has(key)) {
+        continue;
+      }
+      seen.set(key, {
+        value: key,
+        label: item.actor_name || (key === "system" ? "System" : `Actor ${key}`)
+      });
+    }
+    return Array.from(seen.values());
+  }, [notificationAnalytics, notificationAnalyticsHistory]);
 
   const loadTrackerAdminData = useCallback(async ({ silent = false } = {}) => {
     if (adminTab !== "tracker") {
@@ -364,21 +415,26 @@ export default function AdminDashboard({
     let cancelled = false;
     async function loadNotificationHistory() {
       try {
-        const params = new URLSearchParams();
-        if (notificationAnalyticsFromDate) params.set("from_date", notificationAnalyticsFromDate);
-        if (notificationAnalyticsToDate) params.set("to_date", notificationAnalyticsToDate);
-        params.set("limit", "100");
-        const response = await apiFetch(`/api/admin/notification-history?${params.toString()}`);
+        setNotificationAnalyticsHistoryLoading(true);
+        setNotificationAnalyticsHistoryError("");
+        const response = await apiFetch(`/api/admin/notification-history?${notificationHistoryQuery}`);
         if (!cancelled) {
           setNotificationAnalyticsHistory(Array.isArray(response.history) ? response.history : []);
         }
       } catch (e) {
-        if (!cancelled) setNotificationAnalyticsHistory([]);
+        if (!cancelled) {
+          setNotificationAnalyticsHistory([]);
+          setNotificationAnalyticsHistoryError(e.message || "Unable to load notification event history.");
+        }
+      } finally {
+        if (!cancelled) {
+          setNotificationAnalyticsHistoryLoading(false);
+        }
       }
     }
     loadNotificationHistory();
     return () => { cancelled = true; };
-  }, [adminTab, apiFetch, notificationAnalyticsFromDate, notificationAnalyticsToDate]);
+  }, [adminTab, apiFetch, notificationHistoryQuery]);
 
   useEffect(() => {
     if (adminTab === "tracker") {
@@ -682,9 +738,79 @@ export default function AdminDashboard({
     downloadCsvFile(`admin-notification-analytics-${Date.now()}.csv`, csv);
   }
 
+  function handleNotificationEventTimelineExportCsv() {
+    if (!notificationAnalyticsHistory.length) {
+      return;
+    }
+
+    const periodInfo = notificationAnalytics?.period_label
+      || (notificationAnalyticsFromDate || notificationAnalyticsToDate
+        ? `${notificationAnalyticsFromDate || "Start"} to ${notificationAnalyticsToDate || "Now"}`
+        : `Last ${notificationAnalytics?.period_days || 30} days`);
+
+    const filterRows = [
+      ["Section", "Metric", "Value"].join(","),
+      ["Filters", "Time Zone", escapeCsvValue("Asia/Amman")].join(","),
+      ["Filters", "Period", escapeCsvValue(periodInfo)].join(","),
+      ["Filters", "From Date", escapeCsvValue(notificationAnalytics?.from_date ? formatJordanDateTime(notificationAnalytics.from_date) : "")].join(","),
+      ["Filters", "To Date", escapeCsvValue(notificationAnalytics?.to_date ? formatJordanDateTime(notificationAnalytics.to_date) : "")].join(","),
+      ["Filters", "Actor", escapeCsvValue(notificationHistoryActorFilter === "all" ? "All Actors" : notificationHistoryActorFilter)].join(","),
+      ["Filters", "Action Type", escapeCsvValue(notificationHistoryActionFilter === "all" ? "All Actions" : notificationHistoryActionFilter)].join(","),
+      ["Filters", "Tracking Task ID", escapeCsvValue(notificationHistoryTrackingTaskFilter || "")].join(",")
+    ];
+
+    const eventHeader = [
+      "Section",
+      "Notification ID",
+      "Category",
+      "Action Type",
+      "Actor User ID",
+      "Actor Name",
+      "Tracking Task ID",
+      "Existing Task ID",
+      "Title",
+      "Message",
+      "Serial Number",
+      "Created At"
+    ].join(",");
+
+    const eventRows = notificationAnalyticsHistory.map((evt) => {
+      const meta = evt.metadata || {};
+      return [
+        "Timeline",
+        escapeCsvValue(evt.id),
+        escapeCsvValue(evt.category),
+        escapeCsvValue(String(evt.action_type || evt.category || "event").replace(/tracking_task_/g, "")),
+        escapeCsvValue(evt.actor_user_id || ""),
+        escapeCsvValue(evt.actor_name || meta.actor_name || "System"),
+        escapeCsvValue(evt.tracking_task_id || ""),
+        escapeCsvValue(evt.existing_task_id || ""),
+        escapeCsvValue(evt.title || ""),
+        escapeCsvValue(evt.message || ""),
+        escapeCsvValue(meta.serial_number || ""),
+        escapeCsvValue(evt.created_at ? dayjs(evt.created_at).toISOString() : "")
+      ].join(",");
+    });
+
+    const csv = [
+      ...filterRows,
+      "",
+      eventHeader,
+      ...eventRows
+    ].join("\n");
+
+    downloadCsvFile(`admin-notification-event-timeline-${Date.now()}.csv`, csv);
+  }
+
   function resetNotificationAnalyticsFilters() {
     setNotificationAnalyticsFromDate("");
     setNotificationAnalyticsToDate("");
+  }
+
+  function resetNotificationHistoryFilters() {
+    setNotificationHistoryActorFilter("all");
+    setNotificationHistoryActionFilter("all");
+    setNotificationHistoryTrackingTaskFilter("");
   }
 
   function resetTrackerHistoryFilters() {
@@ -1251,10 +1377,17 @@ export default function AdminDashboard({
                               )}
                             </div>
                           </div>
-                          {notificationAnalyticsHistory.length > 0 && (
-                            <div style={{ border: "1px solid #f0f0f0", borderRadius: 8, background: "#fafafa", overflow: "hidden" }}>
-                              <div style={{ padding: "10px 12px", borderBottom: "1px solid #eee", fontSize: 12, fontWeight: 600, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                                <span>Event Timeline ({notificationAnalyticsHistory.length} events)</span>
+                          <div style={{ border: "1px solid #f0f0f0", borderRadius: 8, background: "#fafafa", overflow: "hidden" }}>
+                            <div style={{ padding: "10px 12px", borderBottom: "1px solid #eee", fontSize: 12, fontWeight: 600, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                              <span>Event Timeline ({notificationAnalyticsHistory.length} events)</span>
+                              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                                <button
+                                  onClick={handleNotificationEventTimelineExportCsv}
+                                  disabled={notificationAnalyticsHistoryLoading || !notificationAnalyticsHistory.length}
+                                  style={{ fontSize: 11, padding: "4px 8px", background: "#fff", border: "1px solid #ddd", borderRadius: 4, cursor: notificationAnalyticsHistoryLoading || !notificationAnalyticsHistory.length ? "not-allowed" : "pointer", opacity: notificationAnalyticsHistoryLoading || !notificationAnalyticsHistory.length ? 0.6 : 1, display: "flex", alignItems: "center", gap: 6 }}
+                                >
+                                  <Download size={13} /> Export Timeline CSV
+                                </button>
                                 <button
                                   onClick={() => setShowNotificationHistory(!showNotificationHistory)}
                                   style={{ fontSize: 11, padding: "2px 8px", background: "#fff", border: "1px solid #ddd", borderRadius: 4, cursor: "pointer" }}
@@ -1262,8 +1395,56 @@ export default function AdminDashboard({
                                   {showNotificationHistory ? "Hide" : "Show"}
                                 </button>
                               </div>
-                              {showNotificationHistory && (
-                                <div style={{ padding: 12, display: "grid", gap: 6, maxHeight: 300, overflowY: "auto" }}>
+                            </div>
+                            {showNotificationHistory ? (
+                              notificationAnalyticsHistoryLoading ? (
+                                <div className="task-history-empty" style={{ margin: 12 }}>Loading notification history...</div>
+                              ) : notificationAnalyticsHistoryError ? (
+                                <div className="task-history-error" style={{ margin: 12 }}>{notificationAnalyticsHistoryError}</div>
+                              ) : (
+                                <div style={{ padding: 12, display: "grid", gap: 8 }}>
+                                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                                    <select
+                                      value={notificationHistoryActorFilter}
+                                      onChange={(e) => setNotificationHistoryActorFilter(e.target.value)}
+                                      style={{ fontSize: 12, padding: "6px 8px", border: "1px solid #ddd", borderRadius: 4 }}
+                                    >
+                                      <option value="all">All Actors</option>
+                                      <option value="system">System</option>
+                                      {notificationHistoryActorOptions.map((item) => (
+                                        <option key={item.value} value={item.value}>{item.label}</option>
+                                      ))}
+                                    </select>
+                                    <select
+                                      value={notificationHistoryActionFilter}
+                                      onChange={(e) => setNotificationHistoryActionFilter(e.target.value)}
+                                      style={{ fontSize: 12, padding: "6px 8px", border: "1px solid #ddd", borderRadius: 4 }}
+                                    >
+                                      <option value="all">All Actions</option>
+                                      <option value="reassigned">Reassigned</option>
+                                      <option value="completed">Completed</option>
+                                      <option value="overdue">Overdue</option>
+                                    </select>
+                                    <input
+                                      type="number"
+                                      min="1"
+                                      placeholder="Tracking Task ID"
+                                      value={notificationHistoryTrackingTaskFilter}
+                                      onChange={(e) => setNotificationHistoryTrackingTaskFilter(e.target.value)}
+                                      style={{ width: 140, fontSize: 12, padding: "6px 8px", border: "1px solid #ddd", borderRadius: 4 }}
+                                    />
+                                    <button
+                                      onClick={resetNotificationHistoryFilters}
+                                      disabled={notificationHistoryActorFilter === "all" && notificationHistoryActionFilter === "all" && !notificationHistoryTrackingTaskFilter}
+                                      style={{ fontSize: 12, padding: "6px 10px", background: "#fff", color: "#333", border: "1px solid #ddd", borderRadius: 4, cursor: notificationHistoryActorFilter === "all" && notificationHistoryActionFilter === "all" && !notificationHistoryTrackingTaskFilter ? "not-allowed" : "pointer", opacity: notificationHistoryActorFilter === "all" && notificationHistoryActionFilter === "all" && !notificationHistoryTrackingTaskFilter ? 0.6 : 1 }}
+                                    >
+                                      Reset Filters
+                                    </button>
+                                  </div>
+                                  {!notificationAnalyticsHistory.length ? (
+                                    <div className="task-history-empty">No notification events match the current timeline filters.</div>
+                                  ) : (
+                                  <div style={{ display: "grid", gap: 6, maxHeight: 300, overflowY: "auto" }}>
                                   {notificationAnalyticsHistory.map((evt, idx) => {
                                     const meta = evt.metadata || {};
                                     const categoryColors = {
@@ -1271,29 +1452,33 @@ export default function AdminDashboard({
                                       tracking_task_completed: "#107c10",
                                       tracking_task_overdue: "#d83b01"
                                     };
+                                    const actionLabel = String(evt.action_type || evt.category || "event").replace(/tracking_task_/g, "");
                                     return (
                                       <div key={evt.id || idx} style={{ display: "flex", gap: 8, alignItems: "flex-start", fontSize: 11, padding: "6px 8px", background: "#fff", borderRadius: 4, borderLeft: `3px solid ${categoryColors[evt.category] || "#999"}` }}>
                                         <div style={{ flex: 1, minWidth: 0 }}>
                                           <div style={{ fontWeight: 600, marginBottom: 2 }}>{evt.title || "Notification"}</div>
                                           <div style={{ color: "#666", marginBottom: 2 }}>{evt.message || ""}</div>
                                           <div style={{ display: "flex", gap: 12, color: "#888", flexWrap: "wrap" }}>
-                                            <span>Actor: <strong>{meta.actor_name || "System"}</strong></span>
-                                            {meta.tracking_task_id && <span>Task ID: <strong>#{meta.tracking_task_id}</strong></span>}
-                                            {meta.task_id && <span>Task: <strong>{meta.task_id}</strong></span>}
-                                            {meta.serial_number && <span>Serial: <strong>{meta.serial_number}</strong></span>}
+                                            <span>Actor: <strong>{evt.actor_name || meta.actor_name || "System"}</strong></span>
+                                            <span>Action: <strong>{actionLabel}</strong></span>
+                                            {evt.tracking_task_id ? <span>Tracking Task: <strong>#{evt.tracking_task_id}</strong></span> : null}
+                                            {evt.existing_task_id ? <span>Task: <strong>{evt.existing_task_id}</strong></span> : null}
+                                            {meta.serial_number ? <span>Serial: <strong>{meta.serial_number}</strong></span> : null}
                                             <span>{formatDateTime(evt.created_at)}</span>
                                           </div>
                                         </div>
                                         <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 10, background: `${categoryColors[evt.category] || "#999"}20`, color: categoryColors[evt.category] || "#999", whiteSpace: "nowrap" }}>
-                                          {evt.category?.replace("tracking_task_", "") || "event"}
+                                          {actionLabel}
                                         </span>
                                       </div>
                                     );
                                   })}
+                                  </div>
+                                  )}
                                 </div>
-                              )}
-                            </div>
-                          )}
+                              )
+                            ) : null}
+                          </div>
                         </div>
                       </div>
 

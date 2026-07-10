@@ -4134,6 +4134,7 @@ async function processOutboxQueue(config, userId = null) {
         bcc: email.bcc_list || undefined,
         subject: email.subject,
         text: email.body,
+        html: String(email.body_html || "").trim() || undefined,
         attachments: await buildAttachmentPayload(attachments)
       });
       await markOutboxSent(email.id, info.messageId);
@@ -4197,6 +4198,7 @@ async function retryQueuedEmailNow(emailId, userId = null) {
       bcc: email.bcc_list || undefined,
       subject: email.subject,
       text: email.body,
+      html: String(email.body_html || "").trim() || undefined,
       attachments: await buildAttachmentPayload(attachments)
     });
 
@@ -4235,7 +4237,35 @@ async function retryQueuedEmailNow(emailId, userId = null) {
   }
 }
 
-async function sendMailMessage({ recipient_name, recipient_email, cc_list, bcc_list, subject, body, priority = "Normal", sensitivity = "Normal", read_receipt, delivery_receipt, from, account_id }, files = [], employeeId = null) {
+function escapeMailHtml(value = "") {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function convertPlainTextToHtml(value = "") {
+  const normalized = String(value || "").replace(/\r\n/g, "\n");
+  if (!normalized.trim()) {
+    return "";
+  }
+  return normalized
+    .split(/\n{2,}/)
+    .map((paragraph) => `<p style="margin:0 0 12px;line-height:1.7;">${escapeMailHtml(paragraph).replace(/\n/g, "<br />")}</p>`)
+    .join("");
+}
+
+function buildArchiveFooterHtml(value = "") {
+  const normalized = String(value || "").trim();
+  if (!normalized) {
+    return "";
+  }
+  return `<div style="margin-top:18px;padding-top:12px;border-top:1px solid #dbe1ea;font-family:Arial,'Segoe UI',sans-serif;font-size:12px;color:#64748b;white-space:pre-wrap;">${escapeMailHtml(normalized)}</div>`;
+}
+
+async function sendMailMessage({ recipient_name, recipient_email, cc_list, bcc_list, subject, body, body_html, priority = "Normal", sensitivity = "Normal", read_receipt, delivery_receipt, from, account_id }, files = [], employeeId = null) {
   const ownerUserId = Number(employeeId || 0);
   let config = activeConfigs.get(ownerUserId) || await ensureActiveConfig(ownerUserId);
 
@@ -4284,7 +4314,11 @@ async function sendMailMessage({ recipient_name, recipient_email, cc_list, bcc_l
   }
 
   const hiddenFooter = await generateHiddenFooter(subjectMeta.project_code || "UNSPECIFIED", serialInfo.serial);
-  const bodyWithFooter = (body || "") + bodyFooter + hiddenFooter;
+  const textBodyWithFooter = (body || "") + bodyFooter;
+  const htmlContent = String(body_html || "").trim()
+    ? String(body_html || "")
+    : `<div style="font-family:Arial,'Segoe UI',sans-serif;font-size:14px;color:#0f172a;">${convertPlainTextToHtml(body || "")}</div>`;
+  const bodyWithFooter = `${htmlContent}${buildArchiveFooterHtml(bodyFooter)}${hiddenFooter}`;
 
   const transporter = getSmtpTransporter(config);
   try {
@@ -4294,7 +4328,7 @@ async function sendMailMessage({ recipient_name, recipient_email, cc_list, bcc_l
       cc: cc_list || undefined,
       bcc: bcc_list || undefined,
       subject: subjectWithSerial,
-      text: (body || "") + bodyFooter,
+      text: textBodyWithFooter,
       html: bodyWithFooter,
       attachments: await buildAttachmentPayload(files),
       headers: {
@@ -4314,7 +4348,8 @@ async function sendMailMessage({ recipient_name, recipient_email, cc_list, bcc_l
         cc_list: cc_list || null,
         bcc_list: bcc_list || null,
         subject: subjectWithSerial,
-        body: (body || "") + bodyFooter,
+        body: textBodyWithFooter,
+        body_html: bodyWithFooter,
         preview: (body || "").slice(0, 120),
         received_at: new Date().toISOString(),
         sent_at: new Date().toISOString(),
@@ -4368,6 +4403,7 @@ async function sendMailMessage({ recipient_name, recipient_email, cc_list, bcc_l
         cc_list: cc_list || null,
         subject,
         body,
+        body_html: String(body_html || "").trim() || null,
         preview: body.slice(0, 120),
         received_at: new Date().toISOString(),
         queued_at: new Date().toISOString(),
@@ -4451,6 +4487,7 @@ async function deliverApprovalEmail(emailRecord, files = [], employeeId = null) 
       bcc: emailRecord.bcc_list || undefined,
       subject: emailRecord.subject,
       text: emailRecord.body,
+      html: String(emailRecord.body_html || "").trim() || undefined,
       attachments: await buildAttachmentPayload(files)
     });
 

@@ -1591,6 +1591,62 @@ input:focus, select:focus, textarea:focus {
 .o365-compose-body-shell { display: block; flex: 1; min-height: 0; }
 .o365-compose-editor-stage { display: flex; flex-direction: column; flex: 1; min-height: 0; }
 
+.o365-outgoing-preview {
+  margin-top: 10px;
+  border: 1px solid #dbe1ea;
+  border-radius: 12px;
+  background: linear-gradient(180deg, #fbfdff 0%, #f7f9fc 100%);
+  overflow: hidden;
+}
+
+.o365-outgoing-preview-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-bottom: 1px solid #e5eaf1;
+  background: #f8fafc;
+  font-size: 11px;
+  color: #475569;
+}
+
+.o365-outgoing-preview-head span:first-child {
+  font-weight: 700;
+  color: #334155;
+}
+
+.o365-outgoing-preview-canvas {
+  max-height: 420px;
+  overflow: auto;
+  padding: 14px;
+  background:
+    linear-gradient(180deg, rgba(15, 60, 120, 0.03), rgba(15, 60, 120, 0)),
+    #eef3f9;
+}
+
+.o365-outgoing-preview-document {
+  min-width: 720px;
+}
+
+.o365-outgoing-preview-empty {
+  padding: 28px 20px;
+  text-align: center;
+  font-size: 13px;
+  color: #64748b;
+  background: #fff;
+  border: 1px dashed #cbd5e1;
+  border-radius: 10px;
+}
+
+.o365-outgoing-preview-note {
+  padding: 10px 12px 12px;
+  border-top: 1px solid #e5eaf1;
+  background: #fff;
+  font-size: 11px;
+  color: #64748b;
+}
+
 .o365-compose-editor-stack {
   position: relative;
   flex: 1;

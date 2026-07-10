@@ -228,8 +228,15 @@ export async function getAdminNotificationAnalytics({ days = 30, from_date, to_d
   };
 }
 
-export async function getNotificationHistory({ from_date, to_date, category, actor_user_id, limit: limitParam } = {}) {
+export async function getNotificationHistory({ from_date, to_date, category, actor_user_id, actor, action_type, tracking_task_id, limit: limitParam } = {}) {
   const normalizedLimit = Math.max(1, Math.min(500, Number(limitParam) || 100));
+  const normalizedFromDate = normalizeAnalyticsBoundary(from_date, "start");
+  const normalizedToDate = normalizeAnalyticsBoundary(to_date, "end");
+  const trackedCategories = [
+    "tracking_task_reassigned",
+    "tracking_task_completed",
+    "tracking_task_overdue"
+  ];
 
   let sql = `
     SELECT id, user_id, title, message, category, metadata, created_at, read, read_at
@@ -239,24 +246,41 @@ export async function getNotificationHistory({ from_date, to_date, category, act
   const params = [];
   let paramIndex = 1;
 
-  if (from_date) {
+  if (normalizedFromDate) {
     sql += ` AND created_at >= $${paramIndex}`;
-    params.push(new Date(from_date).toISOString());
+    params.push(normalizedFromDate);
     paramIndex++;
   }
-  if (to_date) {
+  if (normalizedToDate) {
     sql += ` AND created_at <= $${paramIndex}`;
-    params.push(new Date(to_date).toISOString());
+    params.push(normalizedToDate);
     paramIndex++;
   }
   if (category) {
     sql += ` AND category = $${paramIndex}`;
     params.push(category);
     paramIndex++;
+  } else {
+    sql += ` AND category IN ('tracking_task_reassigned', 'tracking_task_completed', 'tracking_task_overdue')`;
   }
-  if (actor_user_id) {
+  const normalizedActorValue = String(actor ?? actor_user_id ?? "").trim().toLowerCase();
+  if (normalizedActorValue === "system") {
+    sql += ` AND COALESCE(metadata->>'actor_user_id', '') = ''`;
+  } else if (normalizedActorValue) {
     sql += ` AND metadata->>'actor_user_id' = $${paramIndex}`;
-    params.push(String(actor_user_id));
+    params.push(normalizedActorValue);
+    paramIndex++;
+  }
+  const normalizedActionType = String(action_type || "").trim().toLowerCase();
+  if (normalizedActionType) {
+    sql += ` AND (category = $${paramIndex} OR metadata->>'action_type' = $${paramIndex + 1})`;
+    params.push(`tracking_task_${normalizedActionType}`, normalizedActionType);
+    paramIndex += 2;
+  }
+  const normalizedTrackingTaskId = Number(tracking_task_id || 0) || null;
+  if (normalizedTrackingTaskId) {
+    sql += ` AND metadata->>'tracking_task_id' = $${paramIndex}`;
+    params.push(String(normalizedTrackingTaskId));
     paramIndex++;
   }
 
@@ -269,7 +293,20 @@ export async function getNotificationHistory({ from_date, to_date, category, act
     metadata: normalizeNotificationMetadata(row.metadata)
   }));
 
-  return { history: rows, total: rows.length };
+  return {
+    history: rows.map((row) => ({
+      ...row,
+      action_type: row.metadata?.action_type || row.category || "event",
+      actor_name: row.metadata?.actor_name || "System",
+      actor_user_id: Number(row.metadata?.actor_user_id || 0) || null,
+      tracking_task_id: Number(row.metadata?.tracking_task_id || 0) || null,
+      existing_task_id: Number(row.metadata?.existing_task_id || 0) || null
+    })),
+    total: rows.length,
+    from_date: normalizedFromDate,
+    to_date: normalizedToDate,
+    categories: category ? [category] : trackedCategories
+  };
 }
 
 export async function getUnreadNotificationCount(userId) {

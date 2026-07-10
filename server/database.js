@@ -1107,6 +1107,9 @@ async function runSchema() {
         id INTEGER PRIMARY KEY,
         company_name TEXT NOT NULL,
         logo_url TEXT,
+        company_address TEXT DEFAULT '',
+        company_phone TEXT DEFAULT '',
+        company_website TEXT DEFAULT '',
         display_name TEXT NOT NULL,
         email_address TEXT NOT NULL,
         account_type TEXT NOT NULL,
@@ -1133,6 +1136,12 @@ async function runSchema() {
         graph_client_id TEXT DEFAULT '',
         graph_client_secret TEXT DEFAULT '',
         graph_mailbox_user TEXT DEFAULT '',
+        outbound_subject_companies_json TEXT DEFAULT '[]',
+        outbound_subject_quotations_json TEXT DEFAULT '[]',
+        outbound_subject_clients_json TEXT DEFAULT '[]',
+        outbound_subject_studies_json TEXT DEFAULT '[]',
+        outbound_subject_admin_subjects_json TEXT DEFAULT '[]',
+        enforce_outbound_subject_schema BOOLEAN DEFAULT TRUE,
         default_priority TEXT DEFAULT 'Normal',
         default_sensitivity TEXT DEFAULT 'Normal',
         default_read_receipt BOOLEAN DEFAULT FALSE,
@@ -1145,6 +1154,9 @@ async function runSchema() {
         user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
         company_name TEXT NOT NULL,
         logo_url TEXT,
+        company_address TEXT DEFAULT '',
+        company_phone TEXT DEFAULT '',
+        company_website TEXT DEFAULT '',
         display_name TEXT NOT NULL,
         email_address TEXT NOT NULL,
         account_type TEXT NOT NULL,
@@ -1171,6 +1183,12 @@ async function runSchema() {
         graph_client_id TEXT DEFAULT '',
         graph_client_secret TEXT DEFAULT '',
         graph_mailbox_user TEXT DEFAULT '',
+        outbound_subject_companies_json TEXT DEFAULT '[]',
+        outbound_subject_quotations_json TEXT DEFAULT '[]',
+        outbound_subject_clients_json TEXT DEFAULT '[]',
+        outbound_subject_studies_json TEXT DEFAULT '[]',
+        outbound_subject_admin_subjects_json TEXT DEFAULT '[]',
+        enforce_outbound_subject_schema BOOLEAN DEFAULT TRUE,
         default_priority TEXT DEFAULT 'Normal',
         default_sensitivity TEXT DEFAULT 'Normal',
         default_read_receipt BOOLEAN DEFAULT FALSE,
@@ -1746,6 +1764,15 @@ async function runSchema() {
   await query("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS graph_client_id TEXT DEFAULT ''");
   await query("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS graph_client_secret TEXT DEFAULT ''");
   await query("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS graph_mailbox_user TEXT DEFAULT ''");
+  await query("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS company_address TEXT DEFAULT ''");
+  await query("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS company_phone TEXT DEFAULT ''");
+  await query("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS company_website TEXT DEFAULT ''");
+  await query("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS outbound_subject_companies_json TEXT DEFAULT '[]'");
+  await query("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS outbound_subject_quotations_json TEXT DEFAULT '[]'");
+  await query("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS outbound_subject_clients_json TEXT DEFAULT '[]'");
+  await query("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS outbound_subject_studies_json TEXT DEFAULT '[]'");
+  await query("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS outbound_subject_admin_subjects_json TEXT DEFAULT '[]'");
+  await query("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS enforce_outbound_subject_schema BOOLEAN DEFAULT TRUE");
   await query("ALTER TABLE user_mail_settings ADD COLUMN IF NOT EXISTS default_priority TEXT DEFAULT 'Normal'");
   await query("ALTER TABLE user_mail_settings ADD COLUMN IF NOT EXISTS default_sensitivity TEXT DEFAULT 'Normal'");
   await query("ALTER TABLE user_mail_settings ADD COLUMN IF NOT EXISTS default_read_receipt BOOLEAN DEFAULT FALSE");
@@ -1757,6 +1784,15 @@ async function runSchema() {
   await query("ALTER TABLE user_mail_settings ADD COLUMN IF NOT EXISTS graph_client_id TEXT DEFAULT ''");
   await query("ALTER TABLE user_mail_settings ADD COLUMN IF NOT EXISTS graph_client_secret TEXT DEFAULT ''");
   await query("ALTER TABLE user_mail_settings ADD COLUMN IF NOT EXISTS graph_mailbox_user TEXT DEFAULT ''");
+  await query("ALTER TABLE user_mail_settings ADD COLUMN IF NOT EXISTS company_address TEXT DEFAULT ''");
+  await query("ALTER TABLE user_mail_settings ADD COLUMN IF NOT EXISTS company_phone TEXT DEFAULT ''");
+  await query("ALTER TABLE user_mail_settings ADD COLUMN IF NOT EXISTS company_website TEXT DEFAULT ''");
+  await query("ALTER TABLE user_mail_settings ADD COLUMN IF NOT EXISTS outbound_subject_companies_json TEXT DEFAULT '[]'");
+  await query("ALTER TABLE user_mail_settings ADD COLUMN IF NOT EXISTS outbound_subject_quotations_json TEXT DEFAULT '[]'");
+  await query("ALTER TABLE user_mail_settings ADD COLUMN IF NOT EXISTS outbound_subject_clients_json TEXT DEFAULT '[]'");
+  await query("ALTER TABLE user_mail_settings ADD COLUMN IF NOT EXISTS outbound_subject_studies_json TEXT DEFAULT '[]'");
+  await query("ALTER TABLE user_mail_settings ADD COLUMN IF NOT EXISTS outbound_subject_admin_subjects_json TEXT DEFAULT '[]'");
+  await query("ALTER TABLE user_mail_settings ADD COLUMN IF NOT EXISTS enforce_outbound_subject_schema BOOLEAN DEFAULT TRUE");
 }
 
 async function seedDefaults() {
@@ -2572,6 +2608,26 @@ async function getApprovalActionLinksState(emailId, managerId = null) {
 }
 
 function buildUserMailSettings(user, settings = {}) {
+  const parseCatalog = (value, fallback = []) => {
+    if (Array.isArray(value)) {
+      return value.map((item) => String(item || "").trim()).filter(Boolean);
+    }
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (!trimmed) {
+        return fallback;
+      }
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) {
+          return parsed.map((item) => String(item || "").trim()).filter(Boolean);
+        }
+      } catch {
+        return trimmed.split(/\r?\n|,/).map((item) => String(item || "").trim()).filter(Boolean);
+      }
+    }
+    return fallback;
+  };
   const userName = user?.name || "User";
   const userEmail = user?.email || "";
   const effectiveEmailAddress = settings.user_id ? settings.email_address : userEmail;
@@ -2580,6 +2636,9 @@ function buildUserMailSettings(user, settings = {}) {
   return {
     company_name: settings.company_name || "TECHNO GROUP",
     logo_url: settings.logo_url || "",
+    company_address: settings.company_address || "",
+    company_phone: settings.company_phone || "",
+    company_website: settings.company_website || "",
     display_name: settings.display_name || userName,
     email_address: effectiveEmailAddress || userEmail,
     account_type: settings.account_type || "POP3",
@@ -2617,6 +2676,15 @@ function buildUserMailSettings(user, settings = {}) {
         ? Boolean(settings.default_delivery_receipt)
         : Boolean(settings.delivery_receipt),
     signature: settings.signature || "",
+    outbound_subject_companies: parseCatalog(settings.outbound_subject_companies ?? settings.outbound_subject_companies_json, []),
+    outbound_subject_quotations: parseCatalog(settings.outbound_subject_quotations ?? settings.outbound_subject_quotations_json, []),
+    outbound_subject_clients: parseCatalog(settings.outbound_subject_clients ?? settings.outbound_subject_clients_json, []),
+    outbound_subject_studies: parseCatalog(settings.outbound_subject_studies ?? settings.outbound_subject_studies_json, []),
+    outbound_subject_admin_subjects: parseCatalog(settings.outbound_subject_admin_subjects ?? settings.outbound_subject_admin_subjects_json, []),
+    enforce_outbound_subject_schema:
+      settings.enforce_outbound_subject_schema === undefined
+        ? true
+        : Boolean(settings.enforce_outbound_subject_schema),
     user_id: user?.id || settings.user_id || null
   };
 }
@@ -2983,43 +3051,55 @@ async function updateAppSettings(settings) {
       SET
         company_name = $1,
         logo_url = $2,
-        display_name = $3,
-        email_address = $4,
-        account_type = $5,
-        incoming_server = $6,
-        incoming_port = $7,
-        incoming_ssl = $8,
-        outgoing_server = $9,
-        outgoing_port = $10,
-        outgoing_encryption = $11,
-        smtp_auth_required = $12,
-        smtp_same_as_incoming = $13,
-        username = $14,
-        password = $15,
-        remember_password = $16,
-        require_spa = $17,
-        leave_copy_on_server = $18,
-        remove_after_days = $19,
-        remove_when_deleted = $20,
-        auto_send_receive_minutes = $21,
-        signature = $22,
-        default_priority = $23,
-        default_sensitivity = $24,
-        default_read_receipt = $25,
-        default_delivery_receipt = $26,
-        inbox_folder_name = $27,
-        sent_folder_name = $28,
-        sync_sent_items = $29,
-        graph_tenant_id = $30,
-        graph_client_id = $31,
-        graph_client_secret = $32,
-        graph_mailbox_user = $33
+        company_address = $3,
+        company_phone = $4,
+        company_website = $5,
+        display_name = $6,
+        email_address = $7,
+        account_type = $8,
+        incoming_server = $9,
+        incoming_port = $10,
+        incoming_ssl = $11,
+        outgoing_server = $12,
+        outgoing_port = $13,
+        outgoing_encryption = $14,
+        smtp_auth_required = $15,
+        smtp_same_as_incoming = $16,
+        username = $17,
+        password = $18,
+        remember_password = $19,
+        require_spa = $20,
+        leave_copy_on_server = $21,
+        remove_after_days = $22,
+        remove_when_deleted = $23,
+        auto_send_receive_minutes = $24,
+        signature = $25,
+        default_priority = $26,
+        default_sensitivity = $27,
+        default_read_receipt = $28,
+        default_delivery_receipt = $29,
+        inbox_folder_name = $30,
+        sent_folder_name = $31,
+        sync_sent_items = $32,
+        graph_tenant_id = $33,
+        graph_client_id = $34,
+        graph_client_secret = $35,
+        graph_mailbox_user = $36,
+        outbound_subject_companies_json = $37,
+        outbound_subject_quotations_json = $38,
+        outbound_subject_clients_json = $39,
+        outbound_subject_studies_json = $40,
+        outbound_subject_admin_subjects_json = $41,
+        enforce_outbound_subject_schema = $42
       WHERE id = 1
       RETURNING *
     `,
     [
       settings.company_name,
       settings.logo_url || "",
+      settings.company_address || "",
+      settings.company_phone || "",
+      settings.company_website || "",
       settings.display_name,
       settings.email_address,
       settings.account_type,
@@ -3050,7 +3130,13 @@ async function updateAppSettings(settings) {
       settings.graph_tenant_id || "",
       settings.graph_client_id || "",
       settings.graph_client_secret || "",
-      settings.graph_mailbox_user || settings.email_address || ""
+      settings.graph_mailbox_user || settings.email_address || "",
+      JSON.stringify(Array.isArray(settings.outbound_subject_companies) ? settings.outbound_subject_companies : []),
+      JSON.stringify(Array.isArray(settings.outbound_subject_quotations) ? settings.outbound_subject_quotations : []),
+      JSON.stringify(Array.isArray(settings.outbound_subject_clients) ? settings.outbound_subject_clients : []),
+      JSON.stringify(Array.isArray(settings.outbound_subject_studies) ? settings.outbound_subject_studies : []),
+      JSON.stringify(Array.isArray(settings.outbound_subject_admin_subjects) ? settings.outbound_subject_admin_subjects : []),
+      settings.enforce_outbound_subject_schema === undefined ? true : Boolean(settings.enforce_outbound_subject_schema)
     ]
   );
   const updated = result.rows[0];
@@ -3100,27 +3186,33 @@ async function updateMailSettingsForUser(userId, settings) {
   const result = await query(
     `
       INSERT INTO user_mail_settings (
-        id, user_id, company_name, logo_url, display_name, email_address, account_type,
+        id, user_id, company_name, logo_url, company_address, company_phone, company_website, display_name, email_address, account_type,
         incoming_server, incoming_port, incoming_ssl, outgoing_server, outgoing_port,
         outgoing_encryption, smtp_auth_required, smtp_same_as_incoming, username, password,
         remember_password, require_spa, leave_copy_on_server, remove_after_days,
         remove_when_deleted, auto_send_receive_minutes, default_priority, default_sensitivity,
         default_read_receipt, default_delivery_receipt, signature, inbox_folder_name, sent_folder_name,
-        sync_sent_items, graph_tenant_id, graph_client_id, graph_client_secret, graph_mailbox_user, updated_at
+        sync_sent_items, graph_tenant_id, graph_client_id, graph_client_secret, graph_mailbox_user,
+        outbound_subject_companies_json, outbound_subject_quotations_json, outbound_subject_clients_json,
+        outbound_subject_studies_json, outbound_subject_admin_subjects_json, enforce_outbound_subject_schema, updated_at
       )
       VALUES (
-        $1, $2, $3, $4, $5, $6, $7,
-        $8, $9, $10, $11, $12,
-        $13, $14, $15, $16, $17,
-        $18, $19, $20, $21,
-        $22, $23, $24, $25,
-        $26, $27, $28, $29, $30,
-        $31, $32, $33, $34, $35, NOW()
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+        $11, $12, $13, $14, $15,
+        $16, $17, $18, $19, $20,
+        $21, $22, $23, $24,
+        $25, $26, $27, $28,
+        $29, $30, $31, $32, $33,
+        $34, $35, $36, $37, $38,
+        $39, $40, $41, $42, $43, $44, NOW()
       )
       ON CONFLICT (user_id)
       DO UPDATE SET
         company_name = EXCLUDED.company_name,
         logo_url = EXCLUDED.logo_url,
+        company_address = EXCLUDED.company_address,
+        company_phone = EXCLUDED.company_phone,
+        company_website = EXCLUDED.company_website,
         display_name = EXCLUDED.display_name,
         email_address = EXCLUDED.email_address,
         account_type = EXCLUDED.account_type,
@@ -3152,6 +3244,12 @@ async function updateMailSettingsForUser(userId, settings) {
         graph_client_id = EXCLUDED.graph_client_id,
         graph_client_secret = EXCLUDED.graph_client_secret,
         graph_mailbox_user = EXCLUDED.graph_mailbox_user,
+        outbound_subject_companies_json = EXCLUDED.outbound_subject_companies_json,
+        outbound_subject_quotations_json = EXCLUDED.outbound_subject_quotations_json,
+        outbound_subject_clients_json = EXCLUDED.outbound_subject_clients_json,
+        outbound_subject_studies_json = EXCLUDED.outbound_subject_studies_json,
+        outbound_subject_admin_subjects_json = EXCLUDED.outbound_subject_admin_subjects_json,
+        enforce_outbound_subject_schema = EXCLUDED.enforce_outbound_subject_schema,
         updated_at = NOW()
       RETURNING *
     `,
@@ -3160,6 +3258,9 @@ async function updateMailSettingsForUser(userId, settings) {
       userId,
       normalized.company_name,
       normalized.logo_url || "",
+      normalized.company_address || "",
+      normalized.company_phone || "",
+      normalized.company_website || "",
       normalized.display_name,
       normalized.email_address,
       normalized.account_type,
@@ -3190,7 +3291,13 @@ async function updateMailSettingsForUser(userId, settings) {
       normalized.graph_tenant_id || "",
       normalized.graph_client_id || "",
       normalized.graph_client_secret || "",
-      normalized.graph_mailbox_user || normalized.email_address || ""
+      normalized.graph_mailbox_user || normalized.email_address || "",
+      JSON.stringify(Array.isArray(normalized.outbound_subject_companies) ? normalized.outbound_subject_companies : []),
+      JSON.stringify(Array.isArray(normalized.outbound_subject_quotations) ? normalized.outbound_subject_quotations : []),
+      JSON.stringify(Array.isArray(normalized.outbound_subject_clients) ? normalized.outbound_subject_clients : []),
+      JSON.stringify(Array.isArray(normalized.outbound_subject_studies) ? normalized.outbound_subject_studies : []),
+      JSON.stringify(Array.isArray(normalized.outbound_subject_admin_subjects) ? normalized.outbound_subject_admin_subjects : []),
+      normalized.enforce_outbound_subject_schema === undefined ? true : Boolean(normalized.enforce_outbound_subject_schema)
     ]
   );
 
@@ -4197,7 +4304,7 @@ function buildManagerApprovalNotification(emailRecord, employee, manager, aiAnal
   };
 }
 
-async function createPendingApprovalEmail({ employeeId, managerId, recipientName, recipientEmail, ccList, bccList, subject, body, priority, sensitivity, readReceipt, deliveryReceipt, subjectKey = "", previousEmailId = null }, files = [], ipAddress = "") {
+async function createPendingApprovalEmail({ employeeId, managerId, recipientName, recipientEmail, ccList, bccList, subject, body, bodyHtml = "", priority, sensitivity, readReceipt, deliveryReceipt, subjectKey = "", previousEmailId = null }, files = [], ipAddress = "") {
   const employee = await getUserById(employeeId);
   const manager = await getUserById(managerId);
   if (!employee) {
@@ -4237,6 +4344,7 @@ async function createPendingApprovalEmail({ employeeId, managerId, recipientName
       bcc_list: bccList || null,
       subject,
       body,
+      body_html: bodyHtml || null,
       preview: (body || "").slice(0, 120),
       received_at: new Date().toISOString(),
       priority: priority || "Normal",
@@ -4475,6 +4583,7 @@ async function reviseRejectedApproval(emailId, employeeId, draftUpdates = {}, fi
       bccList: draftUpdates.bcc_list ?? rejected.bcc_list,
       subject: draftUpdates.subject ?? rejected.subject,
       body: draftUpdates.body ?? rejected.body,
+      bodyHtml: draftUpdates.body_html ?? rejected.body_html ?? "",
       priority: draftUpdates.priority ?? rejected.priority,
       sensitivity: draftUpdates.sensitivity ?? rejected.sensitivity,
       readReceipt: draftUpdates.read_receipt ?? rejected.read_receipt,

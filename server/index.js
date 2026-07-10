@@ -669,6 +669,432 @@ function getUserApprovalPolicy(user, managedUsers = []) {
 
 const safeRewriteSensitiveConflictTypes = new Set(["payment_mismatch", "unsupported_warranty"]);
 
+function normalizeSubjectCatalog(values = []) {
+  return Array.isArray(values)
+    ? values.map((item) => String(item || "").trim()).filter(Boolean)
+    : [];
+}
+
+function deriveOutgoingCode(value = "") {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "";
+  }
+  return raw
+    .replace(/[^\w.\-/\s]+/g, "")
+    .trim()
+    .replace(/\s+/g, "-")
+    .toUpperCase();
+}
+
+function normalizeSerialToken(value = "") {
+  return String(value || "").trim().replace(/\s+/g, "-").toUpperCase();
+}
+
+function normalizeStructuredDate(value = "") {
+  const raw = String(value || "").trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(raw) ? raw : "";
+}
+
+function parseOutgoingCatalogEntry(value = "", mode = "generic") {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return null;
+  }
+  const [labelPart = "", secondPart = "", thirdPart = ""] = raw.split("|").map((item) => String(item || "").trim());
+  const label = labelPart || raw;
+  if (mode === "client") {
+    return {
+      value: raw,
+      label,
+      detail: secondPart,
+      code: thirdPart || deriveOutgoingCode(label)
+    };
+  }
+  return {
+    value: raw,
+    label,
+    code: secondPart || deriveOutgoingCode(label),
+    detail: thirdPart
+  };
+}
+
+const OUTGOING_GROUP_DEFINITIONS = {
+  projects: { label: "Projects", code: "PRJ" },
+  quotations: { label: "Quotations", code: "QTN" },
+  studies: { label: "Studies", code: "STD" },
+  admin_subjects: { label: "Admin Subjects", code: "ADM" }
+};
+
+function escapeOutgoingHtml(value = "") {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function renderOutgoingBodyHtml(value = "") {
+  const escaped = escapeOutgoingHtml(value).replace(/\r\n/g, "\n");
+  if (!escaped.trim()) {
+    return `<p style="margin:0;color:#6b7280;">........................................................</p>`;
+  }
+  return escaped
+    .split(/\n{2,}/)
+    .map((paragraph) => `<p style="margin:0 0 12px;line-height:1.9;">${paragraph.replace(/\n/g, "<br />")}</p>`)
+    .join("");
+}
+
+function resolveOutgoingAssetUrl(value = "", baseUrl = "") {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "";
+  }
+  if (/^https?:\/\//i.test(raw)) {
+    return raw;
+  }
+  if (raw.startsWith("/") && baseUrl) {
+    return `${String(baseUrl).replace(/\/+$/, "")}${raw}`;
+  }
+  return raw;
+}
+
+function buildOutgoingBrandingLines({
+  companyAddress = "",
+  companyPhone = "",
+  companyWebsite = "",
+  companyEmail = ""
+} = {}) {
+  return [
+    companyAddress ? `العنوان\t${companyAddress}` : "",
+    companyPhone ? `الهاتف\t${companyPhone}` : "",
+    companyWebsite ? `الموقع\t${companyWebsite}` : "",
+    companyEmail ? `البريد الإلكتروني\t${companyEmail}` : ""
+  ].filter(Boolean);
+}
+
+function buildOutgoingLetterBody({
+  companyLabel,
+  clientLabel,
+  clientDetail,
+  subjectNo,
+  documentNo,
+  groupLabel,
+  referenceLabel,
+  internalSerial,
+  subjectDate,
+  attachmentsCount,
+  letterTitle,
+  body,
+  senderName,
+  companyAddress,
+  companyPhone,
+  companyWebsite,
+  companyEmail
+} = {}) {
+  return [
+    `إلى السيد / ${clientLabel || "........................................................"} المحترم.`,
+    clientDetail ? `(${clientDetail})` : "",
+    `Subject No.\t${subjectNo}\tDocument No.\t${documentNo}`,
+    `Total pages including this one\t1\tSerial\t${internalSerial}`,
+    `Date\t${subjectDate}\tAttachments\t${attachmentsCount > 0 ? `Yes (${attachmentsCount})` : "No"}`,
+    `Company\t${companyLabel}\tGroup\t${groupLabel}`,
+    `Reference\t${referenceLabel}\tType\tLetter`,
+    "Confidential Message; meant for the party listed above only.",
+    "Please refer to Subject No. listed above in your response.",
+    "",
+    `الموضوع : ${letterTitle}`,
+    "تحية طيبة وبعد،،،،",
+    "",
+    String(body || "").trim(),
+    "",
+    "وتفضلوا بقبول فائق الاحترام،،،",
+    "",
+    senderName || "المدير التنفيذي",
+    "",
+    "أقر أنا ................................................................................................ بالموافقة على ما هو مبين اعلاه.",
+    "التوقيع:\t\tالتاريخ :",
+    "",
+    ...buildOutgoingBrandingLines({ companyAddress, companyPhone, companyWebsite, companyEmail })
+  ].filter((line, index) => line || index === 1).join("\n");
+}
+
+function buildOutgoingLetterHtml({
+  companyLabel,
+  clientLabel,
+  clientDetail,
+  subjectNo,
+  documentNo,
+  groupLabel,
+  referenceLabel,
+  internalSerial,
+  subjectDate,
+  attachmentsCount,
+  letterTitle,
+  body,
+  senderName,
+  companyAddress,
+  companyPhone,
+  companyWebsite,
+  companyEmail,
+  logoUrl,
+  brandName
+} = {}) {
+  const metadataRows = [
+    [
+      { label: "Subject No.", value: subjectNo || "________________" },
+      { label: "Document No.", value: documentNo || "________________" }
+    ],
+    [
+      { label: "Total pages including this one", value: "1" },
+      { label: "Serial", value: internalSerial || "________________" }
+    ],
+    [
+      { label: "Date", value: subjectDate || "________________" },
+      { label: "Attachments", value: attachmentsCount > 0 ? `Yes (${attachmentsCount})` : "No" }
+    ],
+    [
+      { label: "Company", value: companyLabel || "________________" },
+      { label: "Group", value: groupLabel || "________________" }
+    ],
+    [
+      { label: "Reference", value: referenceLabel || "________________" },
+      { label: "Type", value: "Letter" }
+    ]
+  ];
+
+  const metadataHtml = metadataRows
+    .map((row) => `
+      <tr>
+        <td style="padding:10px 12px;border:1px solid #d8dee8;background:#f8fafc;font-size:12px;font-weight:700;color:#334155;width:23%;">${escapeOutgoingHtml(row[0].label)}</td>
+        <td style="padding:10px 12px;border:1px solid #d8dee8;font-size:12px;color:#0f172a;width:27%;">${escapeOutgoingHtml(row[0].value)}</td>
+        <td style="padding:10px 12px;border:1px solid #d8dee8;background:#f8fafc;font-size:12px;font-weight:700;color:#334155;width:23%;">${escapeOutgoingHtml(row[1].label)}</td>
+        <td style="padding:10px 12px;border:1px solid #d8dee8;font-size:12px;color:#0f172a;width:27%;">${escapeOutgoingHtml(row[1].value)}</td>
+      </tr>
+    `)
+    .join("");
+
+  const footerChips = [
+    companyAddress,
+    companyPhone,
+    companyWebsite,
+    companyEmail
+  ].filter(Boolean).map((item) => (
+    `<span style="display:inline-block;margin:4px 8px 0 0;padding:6px 10px;border-radius:999px;background:#eff4fb;border:1px solid #d7e2f1;font-size:12px;color:#334155;">${escapeOutgoingHtml(item)}</span>`
+  )).join("");
+
+  const effectiveBrandName = brandName || companyLabel || "TECHNO Group";
+  const logoBlock = logoUrl
+    ? `<img src="${escapeOutgoingHtml(logoUrl)}" alt="Company Logo" style="width:74px;height:74px;object-fit:contain;border-radius:14px;background:#ffffff;padding:8px;box-shadow:0 8px 22px rgba(15,23,42,0.14);" />`
+    : `<div style="width:74px;height:74px;border-radius:18px;background:rgba(255,255,255,0.16);display:flex;align-items:center;justify-content:center;font-size:28px;font-weight:700;color:#ffffff;box-shadow:inset 0 0 0 1px rgba(255,255,255,0.18);">${escapeOutgoingHtml(effectiveBrandName.slice(0, 1).toUpperCase())}</div>`;
+
+  return `
+    <div style="font-family:Arial,'Segoe UI',Tahoma,sans-serif;max-width:820px;margin:0 auto;background:#ffffff;color:#0f172a;">
+      <div style="border:1px solid #cfd8e3;border-radius:14px;overflow:hidden;box-shadow:0 18px 40px rgba(15,23,42,0.08);">
+        <div style="padding:20px 24px;background:linear-gradient(135deg,#0b2f5b 0%,#124b8a 55%,#1d6fc1 100%);color:#ffffff;">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;">
+            <div style="min-width:0;">
+              <div style="font-size:12px;letter-spacing:1.2px;text-transform:uppercase;opacity:0.9;">Official Correspondence</div>
+              <div style="margin-top:6px;font-size:24px;font-weight:700;">${escapeOutgoingHtml(effectiveBrandName)}</div>
+              <div style="margin-top:4px;font-size:12px;opacity:0.88;">Confidential Message; meant for the party listed above only.</div>
+            </div>
+            ${logoBlock}
+          </div>
+        </div>
+        <div style="padding:22px 24px 12px;background:#ffffff;">
+          <div style="direction:rtl;text-align:right;font-size:16px;font-weight:700;color:#111827;">إلى السيد / ${escapeOutgoingHtml(clientLabel || "........................................................")} المحترم.</div>
+          ${clientDetail ? `<div style="direction:rtl;text-align:right;margin-top:6px;font-size:13px;color:#475569;">(${escapeOutgoingHtml(clientDetail)})</div>` : ""}
+          <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;margin-top:18px;">
+            ${metadataHtml}
+          </table>
+          <div style="margin-top:14px;padding:10px 12px;border:1px solid #dbe5f0;border-radius:10px;background:#f8fafc;font-size:12px;color:#475569;">
+            Please refer to Subject No. listed above in your response.
+          </div>
+        </div>
+        <div style="padding:0 24px 24px;background:linear-gradient(180deg,#ffffff 0%,#f8fbff 100%);">
+          <div style="direction:rtl;text-align:right;padding:18px 20px;border:1px solid #d8dee8;border-radius:12px;background:#fcfcfd;">
+            <div style="font-size:18px;font-weight:700;color:#0f172a;">الموضوع : ${escapeOutgoingHtml(letterTitle || "........................................................")}</div>
+            <div style="margin-top:18px;font-size:15px;font-weight:700;color:#111827;">تحية طيبة وبعد،،،،</div>
+            <div style="margin-top:18px;font-size:14px;color:#1f2937;">
+              ${renderOutgoingBodyHtml(body)}
+            </div>
+            <div style="margin-top:24px;font-size:15px;font-weight:700;">وتفضلوا بقبول فائق الاحترام،،،</div>
+            <div style="margin-top:18px;font-size:16px;font-weight:700;color:#0f3c78;">${escapeOutgoingHtml(senderName || "المدير التنفيذي")}</div>
+          </div>
+          <div style="margin-top:16px;padding:16px 18px;border:1px dashed #c8d3df;border-radius:12px;background:#f8fafc;direction:rtl;text-align:right;">
+            <div style="font-size:14px;color:#0f172a;">أقر أنا ................................................................................................ بالموافقة على ما هو مبين اعلاه.</div>
+            <div style="margin-top:18px;font-size:13px;color:#334155;">التوقيع: <span style="display:inline-block;min-width:160px;border-bottom:1px solid #94a3b8;">&nbsp;</span> التاريخ : <span style="display:inline-block;min-width:120px;border-bottom:1px solid #94a3b8;">&nbsp;</span></div>
+          </div>
+          <div style="margin-top:18px;padding:16px 18px;border-radius:12px;background:#0f2f57;color:#e5eefb;text-align:center;">
+            <div style="font-size:12px;font-weight:700;letter-spacing:1px;text-transform:uppercase;">Corporate Footer</div>
+            <div style="margin-top:10px;font-size:14px;font-weight:700;color:#ffffff;">${escapeOutgoingHtml(effectiveBrandName)}</div>
+            ${footerChips ? `<div style="margin-top:8px;">${footerChips}</div>` : ""}
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+async function enforceOutboundStructuredSubject(req, userId) {
+  if (req.body?.reply_source_email_id || req.body?.approval_source_email_id) {
+    return null;
+  }
+  const settings = await getMailSettingsForUser(userId);
+  if (settings?.enforce_outbound_subject_schema === false) {
+    return null;
+  }
+
+  const companies = normalizeSubjectCatalog(settings?.outbound_subject_companies);
+  const quotations = normalizeSubjectCatalog(settings?.outbound_subject_quotations);
+  const clients = normalizeSubjectCatalog(settings?.outbound_subject_clients);
+  const studies = normalizeSubjectCatalog(settings?.outbound_subject_studies);
+  const adminSubjects = normalizeSubjectCatalog(settings?.outbound_subject_admin_subjects);
+  if (!companies.length) {
+    throw new Error("لا يمكن إرسال رسالة صادرة قبل تعريف قائمة الشركات من الإعدادات > Compose.");
+  }
+  if (!quotations.length) {
+    throw new Error("لا يمكن إرسال رسالة صادرة قبل تعبئة قائمة الكوتيشن من الإعدادات > Compose.");
+  }
+  if (!clients.length) {
+    throw new Error("لا يمكن إرسال رسالة صادرة قبل تعريف قائمة العملاء من الإعدادات > Compose.");
+  }
+  if (!studies.length) {
+    throw new Error("لا يمكن إرسال رسالة صادرة قبل تعبئة قائمة Studies من الإعدادات > Compose.");
+  }
+  if (!adminSubjects.length) {
+    throw new Error("لا يمكن إرسال رسالة صادرة قبل تعبئة قائمة Admin Subjects من الإعدادات > Compose.");
+  }
+
+  const companyValue = String(req.body?.outbound_company || "").trim();
+  const clientValue = String(req.body?.outbound_client || "").trim();
+  const groupType = String(req.body?.outbound_group_type || "").trim().toLowerCase();
+  const referenceValue = String(req.body?.outbound_reference_value || "").trim();
+  const projectId = groupType === "projects" ? (Number(referenceValue || req.body?.project_id || 0) || null) : null;
+  const documentSerial = normalizeSerialToken(req.body?.outbound_document_serial);
+  const internalSerial = normalizeSerialToken(req.body?.outbound_internal_serial);
+  const subjectDate = normalizeStructuredDate(req.body?.outbound_subject_date);
+  const letterTitle = String(req.body?.outbound_letter_title || "").trim();
+
+  if (!companyValue) throw new Error("اختيار الشركة إلزامي قبل إرسال الرسالة.");
+  if (!clientValue) throw new Error("اختيار العميل إلزامي قبل إرسال الرسالة.");
+  if (!groupType || !OUTGOING_GROUP_DEFINITIONS[groupType]) throw new Error("اختيار المجموعة إلزامي قبل إرسال الرسالة.");
+  if (!referenceValue) throw new Error("اختيار Subject Number Reference إلزامي قبل إرسال الرسالة.");
+  if (!letterTitle) throw new Error("عنوان الموضوع الرسمي إلزامي قبل إرسال الرسالة.");
+  if (!documentSerial) throw new Error("حقل Document No. Serial إلزامي قبل إرسال الرسالة.");
+  if (!internalSerial) throw new Error("حقل Serial إلزامي قبل إرسال الرسالة.");
+  if (!subjectDate) throw new Error("حقل Date إلزامي ويجب أن يكون بصيغة صحيحة قبل إرسال الرسالة.");
+
+  const company = parseOutgoingCatalogEntry(companyValue, "generic");
+  if (!company || !companies.includes(companyValue)) {
+    throw new Error("الشركة المختارة غير معرفة داخل إعدادات Compose.");
+  }
+  const client = parseOutgoingCatalogEntry(clientValue, "client");
+  if (!client || !clients.includes(clientValue)) {
+    throw new Error("العميل المختار غير معرف داخل إعدادات Compose.");
+  }
+
+  let reference = null;
+  if (groupType === "projects") {
+    const project = projectId ? await getProjectById(projectId) : null;
+    if (!project) {
+      throw new Error("المشروع المختار غير موجود أو تم حذفه.");
+    }
+    reference = {
+      value: String(project.id),
+      label: `[${project.project_code}] ${project.project_name}`,
+      code: deriveOutgoingCode(project.project_code || project.project_name || `PRJ-${project.id}`)
+    };
+    req.body.project_id = project.id;
+  } else {
+    const sourceList = groupType === "quotations"
+      ? quotations
+      : groupType === "studies"
+        ? studies
+        : adminSubjects;
+    if (!sourceList.includes(referenceValue)) {
+      throw new Error("المرجع المختار غير معرف داخل إعدادات Compose.");
+    }
+    reference = parseOutgoingCatalogEntry(referenceValue, "generic");
+  }
+
+  const groupDefinition = OUTGOING_GROUP_DEFINITIONS[groupType];
+  const yearSuffix = subjectDate.slice(2, 4);
+  const subjectNo = `${company.code}.A.${groupDefinition.code}.${reference.code}`;
+  const documentNo = `${company.code}-LTR-${documentSerial}/${yearSuffix}`;
+  const emailSubjectBase = `${documentNo} | ${letterTitle}`;
+  const baseUrl = getBaseUrl(req);
+  const senderName = req.body?.sender_name || settings?.display_name || "";
+  const companyLabel = company.label;
+  const brandName = settings?.company_name || company.label;
+  const companyAddress = settings?.company_address || "";
+  const companyPhone = settings?.company_phone || "";
+  const companyWebsite = settings?.company_website || "";
+  const companyEmail = settings?.email_address || "";
+  const logoUrl = resolveOutgoingAssetUrl(settings?.logo_url || "", baseUrl);
+  const compiledBody = buildOutgoingLetterBody({
+    companyLabel,
+    clientLabel: client.label,
+    clientDetail: client.detail,
+    subjectNo,
+    documentNo,
+    groupLabel: groupDefinition.label,
+    referenceLabel: reference.label,
+    internalSerial,
+    subjectDate,
+    attachmentsCount: Array.isArray(req.files) ? req.files.length : 0,
+    letterTitle,
+    body: req.body?.body || "",
+    senderName,
+    companyAddress,
+    companyPhone,
+    companyWebsite,
+    companyEmail
+  });
+  const compiledHtml = buildOutgoingLetterHtml({
+    companyLabel,
+    clientLabel: client.label,
+    clientDetail: client.detail,
+    subjectNo,
+    documentNo,
+    groupLabel: groupDefinition.label,
+    referenceLabel: reference.label,
+    internalSerial,
+    subjectDate,
+    attachmentsCount: Array.isArray(req.files) ? req.files.length : 0,
+    letterTitle,
+    body: req.body?.body || "",
+    senderName,
+    companyAddress,
+    companyPhone,
+    companyWebsite,
+    companyEmail,
+    logoUrl,
+    brandName
+  });
+
+  let finalSubject = emailSubjectBase;
+  const selectedKeyId = Number(req.body?.email_key_id || 0) || null;
+  if (selectedKeyId) {
+    const selectedKey = (await getEmailKeys()).find((item) => Number(item.id) === selectedKeyId);
+    if (selectedKey?.key_code) {
+      finalSubject = `${selectedKey.key_code}:${yearSuffix}/${emailSubjectBase}`;
+    }
+  }
+
+  req.body.subject = finalSubject;
+  req.body.body = compiledBody;
+  req.body.body_html = compiledHtml;
+  return {
+    subject: finalSubject,
+    subject_no: subjectNo,
+    document_no: documentNo,
+    body: compiledBody,
+    body_html: compiledHtml
+  };
+}
+
 async function resolveSafeRewriteApprovalLock({ guard, sourceEmail, requestingUser } = {}) {
   const conflicts = Array.isArray(guard?.conflicts) ? guard.conflicts : [];
   const sensitiveConflicts = conflicts.filter((item) => safeRewriteSensitiveConflictTypes.has(String(item?.conflict_type || "").toLowerCase()));
@@ -727,6 +1153,7 @@ async function submitPendingApprovalFromCompose(req, user, employeeId, options =
     bccList: req.body.bcc_list,
     subject: req.body.subject,
     body: req.body.body,
+    bodyHtml: req.body.body_html || "",
     priority: req.body.priority,
     sensitivity: req.body.sensitivity,
     readReceipt: req.body.read_receipt,
@@ -771,6 +1198,7 @@ async function handleComposeSendRoute(req, res) {
   try {
     const employeeId = req.body.user_id || req.user?.id || null;
     const user = employeeId ? await getUserById(employeeId) : null;
+    await enforceOutboundStructuredSubject(req, employeeId || req.user?.id || null);
     const managedUsers = user?.id ? await getEmployeesWithManager() : [];
     const { requiresManagerApproval } = getUserApprovalPolicy(user, managedUsers);
     const forcedManagerApproval = String(req.body?.force_manager_approval || "").trim().toLowerCase() === "true";
@@ -2004,7 +2432,10 @@ app.get("/api/admin/notification-history", authenticateRequest, requireAdminAcce
       from_date: req.query?.from_date,
       to_date: req.query?.to_date,
       category: req.query?.category,
+      actor: req.query?.actor,
       actor_user_id: req.query?.actor_user_id,
+      action_type: req.query?.action_type,
+      tracking_task_id: req.query?.tracking_task_id,
       limit: req.query?.limit
     });
     return res.json(result);

@@ -48,6 +48,404 @@ function escapeCsvCell(value) {
   return stringValue;
 }
 
+function normalizeSubjectCatalog(values = []) {
+  return Array.isArray(values)
+    ? values.map((item) => String(item || "").trim()).filter(Boolean)
+    : [];
+}
+
+function normalizeSubjectSerial(value = "") {
+  return String(value || "").trim().replace(/\s+/g, "-").toUpperCase();
+}
+
+function normalizeStructuredDate(value = "") {
+  const raw = String(value || "").trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(raw) ? raw : "";
+}
+
+function deriveOutgoingCode(value = "") {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "";
+  }
+  const cleaned = raw
+    .replace(/[^\w.\-/\s]+/g, "")
+    .trim()
+    .replace(/\s+/g, "-")
+    .toUpperCase();
+  return cleaned || raw.toUpperCase();
+}
+
+function parseOutgoingCatalogEntry(value = "", mode = "generic") {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return null;
+  }
+  const [labelPart = "", secondPart = "", thirdPart = ""] = raw.split("|").map((item) => String(item || "").trim());
+  const label = labelPart || raw;
+  if (mode === "client") {
+    return {
+      value: raw,
+      label,
+      detail: secondPart,
+      code: thirdPart || deriveOutgoingCode(label)
+    };
+  }
+  return {
+    value: raw,
+    label,
+    code: secondPart || deriveOutgoingCode(label),
+    detail: thirdPart
+  };
+}
+
+function buildOutgoingCatalogOptions(values = [], mode = "generic") {
+  return normalizeSubjectCatalog(values)
+    .map((item) => parseOutgoingCatalogEntry(item, mode))
+    .filter(Boolean);
+}
+
+const OUTGOING_GROUP_DEFINITIONS = {
+  projects: { label: "Projects", code: "PRJ" },
+  quotations: { label: "Quotations", code: "QTN" },
+  studies: { label: "Studies", code: "STD" },
+  admin_subjects: { label: "Admin Subjects", code: "ADM" }
+};
+
+function formatOutgoingLetterDate(value = "") {
+  const normalized = normalizeStructuredDate(value);
+  if (!normalized) {
+    return "";
+  }
+  return normalized;
+}
+
+function buildOutgoingReferenceOptions(groupType = "", projects = [], quotations = [], studies = [], adminSubjects = []) {
+  if (groupType === "projects") {
+    return (Array.isArray(projects) ? projects : []).map((item) => ({
+      value: String(item.id),
+      label: `[${item.project_code}] ${item.project_name}`,
+      code: deriveOutgoingCode(item.project_code || item.project_name || `PRJ-${item.id}`),
+      detail: item.project_name || ""
+    }));
+  }
+  if (groupType === "quotations") {
+    return buildOutgoingCatalogOptions(quotations, "generic");
+  }
+  if (groupType === "studies") {
+    return buildOutgoingCatalogOptions(studies, "generic");
+  }
+  if (groupType === "admin_subjects") {
+    return buildOutgoingCatalogOptions(adminSubjects, "generic");
+  }
+  return [];
+}
+
+function escapeOutgoingHtml(value = "") {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function renderOutgoingBodyHtml(value = "") {
+  const escaped = escapeOutgoingHtml(value).replace(/\r\n/g, "\n");
+  if (!escaped.trim()) {
+    return `<p style="margin:0;color:#6b7280;">........................................................</p>`;
+  }
+  return escaped
+    .split(/\n{2,}/)
+    .map((paragraph) => `<p style="margin:0 0 12px;line-height:1.9;">${paragraph.replace(/\n/g, "<br />")}</p>`)
+    .join("");
+}
+
+function buildOutgoingBrandingLines({ companyAddress = "", companyPhone = "", companyWebsite = "", companyEmail = "" } = {}) {
+  return [
+    companyAddress ? `العنوان\t${companyAddress}` : "",
+    companyPhone ? `الهاتف\t${companyPhone}` : "",
+    companyWebsite ? `الموقع\t${companyWebsite}` : "",
+    companyEmail ? `البريد الإلكتروني\t${companyEmail}` : ""
+  ].filter(Boolean);
+}
+
+function buildProfessionalOutgoingLetterPreview({
+  companyLabel = "",
+  clientLabel = "",
+  clientDetail = "",
+  groupLabel = "",
+  referenceLabel = "",
+  subjectNo = "",
+  documentNo = "",
+  internalSerial = "",
+  subjectDate = "",
+  letterTitle = "",
+  letterTypeLabel = "Letter",
+  body = "",
+  senderName = "",
+  hasAttachments = false,
+  companyAddress = "",
+  companyPhone = "",
+  companyWebsite = "",
+  companyEmail = ""
+} = {}) {
+  const lines = [
+    `إلى السيد / ${clientLabel || "........................................................"} المحترم.`,
+    clientDetail ? `(${clientDetail})` : "",
+    `Subject No.\t${subjectNo || "________________"}\tDocument No.\t${documentNo || "________________"}`,
+    `Total pages including this one\t1\tSerial\t${internalSerial || "________________"}`,
+    `Date\t${formatOutgoingLetterDate(subjectDate) || "________________"}\tAttachments\t${hasAttachments ? "Yes" : "No"}`,
+    `Company\t${companyLabel || "________________"}\tGroup\t${groupLabel || "________________"}`,
+    `Reference\t${referenceLabel || "________________"}\tType\t${letterTypeLabel}`,
+    "Confidential Message; meant for the party listed above only.",
+    "Please refer to Subject No. listed above in your response.",
+    "",
+    `الموضوع : ${letterTitle || "........................................................"}`,
+    "تحية طيبة وبعد،،،،",
+    "",
+    String(body || "").trim(),
+    "",
+    "وتفضلوا بقبول فائق الاحترام،،،",
+    "",
+    senderName || "المدير التنفيذي",
+    "",
+    "أقر أنا ................................................................................................ بالموافقة على ما هو مبين اعلاه.",
+    "التوقيع:\t\tالتاريخ :",
+    "",
+    ...buildOutgoingBrandingLines({ companyAddress, companyPhone, companyWebsite, companyEmail })
+  ];
+
+  return lines.filter((line, index) => line || index === 1 || index === 10).join("\n");
+}
+
+function buildProfessionalOutgoingLetterPreviewHtml({
+  companyLabel = "",
+  clientLabel = "",
+  clientDetail = "",
+  groupLabel = "",
+  referenceLabel = "",
+  subjectNo = "",
+  documentNo = "",
+  internalSerial = "",
+  subjectDate = "",
+  letterTitle = "",
+  body = "",
+  senderName = "",
+  hasAttachments = false,
+  companyAddress = "",
+  companyPhone = "",
+  companyWebsite = "",
+  companyEmail = "",
+  logoUrl = "",
+  brandName = ""
+} = {}) {
+  const metadataRows = [
+    [
+      { label: "Subject No.", value: subjectNo || "________________" },
+      { label: "Document No.", value: documentNo || "________________" }
+    ],
+    [
+      { label: "Total pages including this one", value: "1" },
+      { label: "Serial", value: internalSerial || "________________" }
+    ],
+    [
+      { label: "Date", value: formatOutgoingLetterDate(subjectDate) || "________________" },
+      { label: "Attachments", value: hasAttachments ? "Yes" : "No" }
+    ],
+    [
+      { label: "Company", value: companyLabel || "________________" },
+      { label: "Group", value: groupLabel || "________________" }
+    ],
+    [
+      { label: "Reference", value: referenceLabel || "________________" },
+      { label: "Type", value: "Letter" }
+    ]
+  ];
+
+  const metadataHtml = metadataRows
+    .map((row) => `
+      <tr>
+        <td style="padding:10px 12px;border:1px solid #d8dee8;background:#f8fafc;font-size:12px;font-weight:700;color:#334155;width:23%;">${escapeOutgoingHtml(row[0].label)}</td>
+        <td style="padding:10px 12px;border:1px solid #d8dee8;font-size:12px;color:#0f172a;width:27%;">${escapeOutgoingHtml(row[0].value)}</td>
+        <td style="padding:10px 12px;border:1px solid #d8dee8;background:#f8fafc;font-size:12px;font-weight:700;color:#334155;width:23%;">${escapeOutgoingHtml(row[1].label)}</td>
+        <td style="padding:10px 12px;border:1px solid #d8dee8;font-size:12px;color:#0f172a;width:27%;">${escapeOutgoingHtml(row[1].value)}</td>
+      </tr>
+    `)
+    .join("");
+
+  const footerChips = [
+    companyAddress,
+    companyPhone,
+    companyWebsite,
+    companyEmail
+  ].filter(Boolean).map((item) => (
+    `<span style="display:inline-block;margin:4px 8px 0 0;padding:6px 10px;border-radius:999px;background:#eff4fb;border:1px solid #d7e2f1;font-size:12px;color:#334155;">${escapeOutgoingHtml(item)}</span>`
+  )).join("");
+
+  const effectiveBrandName = brandName || companyLabel || "TECHNO Group";
+  const logoBlock = logoUrl
+    ? `<img src="${escapeOutgoingHtml(logoUrl)}" alt="Company Logo" style="width:74px;height:74px;object-fit:contain;border-radius:14px;background:#ffffff;padding:8px;box-shadow:0 8px 22px rgba(15,23,42,0.14);" />`
+    : `<div style="width:74px;height:74px;border-radius:18px;background:rgba(255,255,255,0.16);display:flex;align-items:center;justify-content:center;font-size:28px;font-weight:700;color:#ffffff;box-shadow:inset 0 0 0 1px rgba(255,255,255,0.18);">${escapeOutgoingHtml(effectiveBrandName.slice(0, 1).toUpperCase())}</div>`;
+
+  return `
+    <div style="font-family:Arial,'Segoe UI',Tahoma,sans-serif;max-width:820px;margin:0 auto;background:#ffffff;color:#0f172a;">
+      <div style="border:1px solid #cfd8e3;border-radius:14px;overflow:hidden;box-shadow:0 18px 40px rgba(15,23,42,0.08);">
+        <div style="padding:20px 24px;background:linear-gradient(135deg,#0b2f5b 0%,#124b8a 55%,#1d6fc1 100%);color:#ffffff;">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;">
+            <div style="min-width:0;">
+              <div style="font-size:12px;letter-spacing:1.2px;text-transform:uppercase;opacity:0.9;">Official Correspondence</div>
+              <div style="margin-top:6px;font-size:24px;font-weight:700;">${escapeOutgoingHtml(effectiveBrandName)}</div>
+              <div style="margin-top:4px;font-size:12px;opacity:0.88;">Confidential Message; meant for the party listed above only.</div>
+            </div>
+            ${logoBlock}
+          </div>
+        </div>
+        <div style="padding:22px 24px 12px;background:#ffffff;">
+          <div style="direction:rtl;text-align:right;font-size:16px;font-weight:700;color:#111827;">إلى السيد / ${escapeOutgoingHtml(clientLabel || "........................................................")} المحترم.</div>
+          ${clientDetail ? `<div style="direction:rtl;text-align:right;margin-top:6px;font-size:13px;color:#475569;">(${escapeOutgoingHtml(clientDetail)})</div>` : ""}
+          <table role="presentation" cellPadding="0" cellSpacing="0" style="width:100%;border-collapse:collapse;margin-top:18px;">
+            ${metadataHtml}
+          </table>
+          <div style="margin-top:14px;padding:10px 12px;border:1px solid #dbe5f0;border-radius:10px;background:#f8fafc;font-size:12px;color:#475569;">
+            Please refer to Subject No. listed above in your response.
+          </div>
+        </div>
+        <div style="padding:0 24px 24px;background:linear-gradient(180deg,#ffffff 0%,#f8fbff 100%);">
+          <div style="direction:rtl;text-align:right;padding:18px 20px;border:1px solid #d8dee8;border-radius:12px;background:#fcfcfd;">
+            <div style="font-size:18px;font-weight:700;color:#0f172a;">الموضوع : ${escapeOutgoingHtml(letterTitle || "........................................................")}</div>
+            <div style="margin-top:18px;font-size:15px;font-weight:700;color:#111827;">تحية طيبة وبعد،،،،</div>
+            <div style="margin-top:18px;font-size:14px;color:#1f2937;">
+              ${renderOutgoingBodyHtml(body)}
+            </div>
+            <div style="margin-top:24px;font-size:15px;font-weight:700;">وتفضلوا بقبول فائق الاحترام،،،</div>
+            <div style="margin-top:18px;font-size:16px;font-weight:700;color:#0f3c78;">${escapeOutgoingHtml(senderName || "المدير التنفيذي")}</div>
+          </div>
+          <div style="margin-top:16px;padding:16px 18px;border:1px dashed #c8d3df;border-radius:12px;background:#f8fafc;direction:rtl;text-align:right;">
+            <div style="font-size:14px;color:#0f172a;">أقر أنا ................................................................................................ بالموافقة على ما هو مبين اعلاه.</div>
+            <div style="margin-top:18px;font-size:13px;color:#334155;">التوقيع: <span style="display:inline-block;min-width:160px;border-bottom:1px solid #94a3b8;">&nbsp;</span> التاريخ : <span style="display:inline-block;min-width:120px;border-bottom:1px solid #94a3b8;">&nbsp;</span></div>
+          </div>
+          <div style="margin-top:18px;padding:16px 18px;border-radius:12px;background:#0f2f57;color:#e5eefb;text-align:center;">
+            <div style="font-size:12px;font-weight:700;letter-spacing:1px;text-transform:uppercase;">Corporate Footer</div>
+            <div style="margin-top:10px;font-size:14px;font-weight:700;color:#ffffff;">${escapeOutgoingHtml(effectiveBrandName)}</div>
+            ${footerChips ? `<div style="margin-top:8px;">${footerChips}</div>` : ""}
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function computeProfessionalOutgoingState(form = {}, options = {}) {
+  const {
+    projects = [],
+    companies = [],
+    quotations = [],
+    studies = [],
+    adminSubjects = [],
+    clients = [],
+    senderName = "",
+    hasAttachments = false,
+    logoUrl = "",
+    companyAddress = "",
+    companyPhone = "",
+    companyWebsite = "",
+    companyEmail = "",
+    companyName = ""
+  } = options;
+  const companyOptions = buildOutgoingCatalogOptions(companies, "generic");
+  const clientOptions = buildOutgoingCatalogOptions(clients, "client");
+  const referenceOptions = buildOutgoingReferenceOptions(
+    form.outbound_group_type,
+    projects,
+    quotations,
+    studies,
+    adminSubjects
+  );
+  const company = companyOptions.find((item) => item.value === form.outbound_company) || null;
+  const client = clientOptions.find((item) => item.value === form.outbound_client) || null;
+  const groupDefinition = OUTGOING_GROUP_DEFINITIONS[form.outbound_group_type] || null;
+  const reference = referenceOptions.find((item) => item.value === String(form.outbound_reference_value || "")) || null;
+  const documentSerial = normalizeSubjectSerial(form.outbound_document_serial);
+  const internalSerial = normalizeSubjectSerial(form.outbound_internal_serial);
+  const subjectDate = normalizeStructuredDate(form.outbound_subject_date);
+  const letterTitle = String(form.outbound_letter_title || "").trim();
+  const missing = [];
+
+  if (!company) missing.push("الشركة");
+  if (!groupDefinition) missing.push("المجموعة");
+  if (!reference) missing.push("Subject Number Reference");
+  if (!client) missing.push("العميل");
+  if (!letterTitle) missing.push("عنوان الموضوع");
+  if (!documentSerial) missing.push("Document No.");
+  if (!internalSerial) missing.push("Serial");
+  if (!subjectDate) missing.push("Date");
+
+  const yearSuffix = subjectDate ? subjectDate.slice(2, 4) : dayjs().format("YY");
+  const subjectNo = company && groupDefinition && reference
+    ? `${company.code}.A.${groupDefinition.code}.${reference.code}`
+    : "";
+  const documentNo = company && documentSerial
+    ? `${company.code}-LTR-${documentSerial}/${yearSuffix}`
+    : "";
+  const emailSubject = [documentNo, letterTitle].filter(Boolean).join(" | ");
+  const preview = buildProfessionalOutgoingLetterPreview({
+    companyLabel: company?.label || "",
+    clientLabel: client?.label || "",
+    clientDetail: client?.detail || "",
+    groupLabel: groupDefinition?.label || "",
+    referenceLabel: reference?.label || "",
+    subjectNo,
+    documentNo,
+    internalSerial,
+    subjectDate,
+    letterTitle,
+    body: form.body,
+    senderName,
+    hasAttachments,
+    companyAddress,
+    companyPhone,
+    companyWebsite,
+    companyEmail
+  });
+  const previewHtml = buildProfessionalOutgoingLetterPreviewHtml({
+    companyLabel: company?.label || "",
+    clientLabel: client?.label || "",
+    clientDetail: client?.detail || "",
+    groupLabel: groupDefinition?.label || "",
+    referenceLabel: reference?.label || "",
+    subjectNo,
+    documentNo,
+    internalSerial,
+    subjectDate,
+    letterTitle,
+    body: form.body,
+    senderName,
+    hasAttachments,
+    logoUrl,
+    companyAddress,
+    companyPhone,
+    companyWebsite,
+    companyEmail,
+    brandName: companyName
+  });
+
+  return {
+    isComplete: missing.length === 0,
+    missing,
+    subjectNo,
+    documentNo,
+    emailSubject,
+    preview,
+    previewHtml,
+    company,
+    client,
+    groupDefinition,
+    reference,
+    referenceOptions
+  };
+}
+
 function buildApprovalConversationItems(history = []) {
   return (history || []).map((item) => {
     const action = String(item.action_type || "").toLowerCase();
@@ -781,6 +1179,10 @@ function App() {
     pop3_password: "",
     signature_text: ""
   });
+  const [composeProjectForm, setComposeProjectForm] = useState({
+    project_code: "",
+    project_name: ""
+  });
   const [selectedEmailId, setSelectedEmailId] = useState(null);
   const [selectedEmailIds, setSelectedEmailIds] = useState([]);
   const [searchQuery, setSearchQuery] = useState("");
@@ -831,6 +1233,11 @@ function App() {
     sender_name: "M. Safadi", sender_email: defaultAdminEmail,
     recipient_name: "", recipient_email: "", cc_list: "", bcc_list: "", subject: "", body: "",
     subject_key: "", approval_source_email_id: "", reply_source_email_id: "", reply_mode: "",
+    project_id: "",
+    outbound_company: "", outbound_group_type: "projects", outbound_reference_value: "",
+    outbound_client: "", outbound_letter_type: "Letter", outbound_letter_title: "",
+    outbound_document_serial: "", outbound_internal_serial: "",
+    outbound_subject_date: dayjs().format("YYYY-MM-DD"),
     manager_comments: "", ai_recommendations: "", draft_context_project_code: "",
     draft_context_project_name: "", draft_context_history_count: "", draft_context_references: "",
     draft_context_memory_count: "", draft_context_memory_references: "",
@@ -842,7 +1249,7 @@ function App() {
   const [moveTarget, setMoveTarget] = useState("Deleted");
   const [bulkMoveTarget, setBulkMoveTarget] = useState("Deleted");
   const [settingsForm, setSettingsForm] = useState({
-    company_name: "TECHNO GROUP", logo_url: "/logo.gif", display_name: "M. Safadi",
+    company_name: "TECHNO GROUP", logo_url: "/logo.gif", company_address: "", company_phone: "", company_website: "", display_name: "M. Safadi",
     email_address: defaultAdminEmail, account_type: "POP3",
     incoming_server: "pop.emailarray.com", incoming_port: 995, incoming_ssl: true,
     outgoing_server: "smtp.emailarray.com", outgoing_port: 465, outgoing_encryption: "SSL/TLS",
@@ -853,6 +1260,8 @@ function App() {
     inbox_folder_name: "Inbox", sent_folder_name: "Sent", sync_sent_items: true,
     graph_tenant_id: "", graph_client_id: "", graph_client_secret: "", graph_mailbox_user: defaultAdminEmail,
     signature: "", sensitivity: "Normal", read_receipt: false, delivery_receipt: false,
+    outbound_subject_companies: [], outbound_subject_quotations: [], outbound_subject_clients: [],
+    outbound_subject_studies: [], outbound_subject_admin_subjects: [], enforce_outbound_subject_schema: true,
     webmail_url: localStorage.getItem("emailarray_webmail_url") || "https://techno-grp--com.w.emailarray.com/#email"
   });
   const [settingsTab, setSettingsTab] = useState("account");
@@ -964,6 +1373,62 @@ function App() {
   const isStandardInboxUser = Boolean(currentUser && !canAccessAdmin);
   const isManager = Boolean(employees.some(e => e.manager_id === currentUser?.id) || canAccessAdmin);
   const requiresManagerApproval = Boolean(currentUser && !canAccessAdmin);
+  const outboundSubjectCompanies = useMemo(() => normalizeSubjectCatalog(settingsForm.outbound_subject_companies), [settingsForm.outbound_subject_companies]);
+  const outboundSubjectQuotations = useMemo(() => normalizeSubjectCatalog(settingsForm.outbound_subject_quotations), [settingsForm.outbound_subject_quotations]);
+  const outboundSubjectClients = useMemo(() => normalizeSubjectCatalog(settingsForm.outbound_subject_clients), [settingsForm.outbound_subject_clients]);
+  const outboundSubjectStudies = useMemo(() => normalizeSubjectCatalog(settingsForm.outbound_subject_studies), [settingsForm.outbound_subject_studies]);
+  const outboundSubjectAdminSubjects = useMemo(() => normalizeSubjectCatalog(settingsForm.outbound_subject_admin_subjects), [settingsForm.outbound_subject_admin_subjects]);
+  const outgoingReferenceOptions = useMemo(
+    () => buildOutgoingReferenceOptions(
+      form.outbound_group_type,
+      projects,
+      outboundSubjectQuotations,
+      outboundSubjectStudies,
+      outboundSubjectAdminSubjects
+    ),
+    [
+      form.outbound_group_type,
+      projects,
+      outboundSubjectQuotations,
+      outboundSubjectStudies,
+      outboundSubjectAdminSubjects
+    ]
+  );
+  const professionalOutgoingState = useMemo(
+    () => computeProfessionalOutgoingState(form, {
+      projects,
+      companies: outboundSubjectCompanies,
+      quotations: outboundSubjectQuotations,
+      studies: outboundSubjectStudies,
+      adminSubjects: outboundSubjectAdminSubjects,
+      clients: outboundSubjectClients,
+      senderName: form.sender_name || currentUser?.name || "",
+      hasAttachments: files.length > 0,
+      logoUrl: settingsForm.logo_url || "",
+      companyAddress: settingsForm.company_address || "",
+      companyPhone: settingsForm.company_phone || "",
+      companyWebsite: settingsForm.company_website || "",
+      companyEmail: settingsForm.email_address || "",
+      companyName: settingsForm.company_name || ""
+    }),
+    [
+      form,
+      projects,
+      outboundSubjectCompanies,
+      outboundSubjectQuotations,
+      outboundSubjectStudies,
+      outboundSubjectAdminSubjects,
+      outboundSubjectClients,
+      currentUser?.name,
+      files.length,
+      settingsForm.logo_url,
+      settingsForm.company_address,
+      settingsForm.company_phone,
+      settingsForm.company_website,
+      settingsForm.email_address,
+      settingsForm.company_name
+    ]
+  );
 
   function createDefaultComposeForm(overrides = {}) {
     return {
@@ -975,6 +1440,15 @@ function App() {
       subject_key: "",
       email_key_id: "",
       project_id: "",
+      outbound_company: "",
+      outbound_group_type: "projects",
+      outbound_reference_value: "",
+      outbound_client: "",
+      outbound_letter_type: "Letter",
+      outbound_letter_title: "",
+      outbound_document_serial: "",
+      outbound_internal_serial: "",
+      outbound_subject_date: dayjs().format("YYYY-MM-DD"),
       approval_source_email_id: "",
       reply_source_email_id: "",
       reply_mode: "",
@@ -996,6 +1470,21 @@ function App() {
       ...overrides
     };
   }
+
+  useEffect(() => {
+    if (currentView !== "compose") {
+      return;
+    }
+    if (form.reply_source_email_id || form.approval_source_email_id) {
+      return;
+    }
+    const nextSubject = professionalOutgoingState.emailSubject;
+    setForm((prev) => (
+      prev.subject === nextSubject
+        ? prev
+        : { ...prev, subject: nextSubject }
+    ));
+  }, [currentView, professionalOutgoingState.emailSubject, form.reply_source_email_id, form.approval_source_email_id]);
 
   function appendRecipientsToField(fieldKey, rawValue, targetForm = form) {
     const existing = splitRecipientList(targetForm[fieldKey] || "");
@@ -2493,6 +2982,26 @@ function App() {
     } catch (e) { /* projects optional */ }
   }
 
+  async function addComposeProjectFromSettings() {
+    const payload = {
+      project_code: String(composeProjectForm.project_code || "").trim().toUpperCase(),
+      project_name: String(composeProjectForm.project_name || "").trim()
+    };
+    if (!payload.project_code || !payload.project_name) {
+      setError("يجب إدخال Project Code وProject Name قبل إضافة المشروع.");
+      return;
+    }
+    try {
+      setError("");
+      await apiFetch("/api/projects", { method: "POST", body: payload });
+      await loadProjects();
+      setComposeProjectForm({ project_code: "", project_name: "" });
+      setSuccessMessage("تمت إضافة المشروع إلى قائمة الاختيار بنجاح.");
+    } catch (e) {
+      setError(e.message || "تعذر إضافة المشروع.");
+    }
+  }
+
   async function addNewAccount() {
     try {
       await apiFetch("/api/accounts", { method: "POST", body: newAccountForm });
@@ -3393,15 +3902,73 @@ function App() {
     const activeAccount = emailAccounts.find(a => a.id === activeAccountId) || emailAccounts[0];
     const currentUserId = Number(currentUser?.id || 0);
     let safeRewriteApprovalLockToUse = null;
+    const shouldUseProfessionalOutgoing = settingsForm.enforce_outbound_subject_schema !== false
+      && !resolvedForm.reply_source_email_id
+      && !resolvedForm.approval_source_email_id;
+    if (shouldUseProfessionalOutgoing) {
+      if (!outboundSubjectCompanies.length) {
+        setError("لا يمكن الإرسال قبل تعريف الشركات في Settings > Compose.");
+        setIsSendingEmail(false);
+        return;
+      }
+      if (!outboundSubjectClients.length) {
+        setError("لا يمكن الإرسال قبل تعريف قائمة العملاء في Settings > Compose.");
+        setIsSendingEmail(false);
+        return;
+      }
+      if (!outboundSubjectQuotations.length) {
+        setError("لا يمكن الإرسال قبل تعبئة الكوتيشن في Settings > Compose.");
+        setIsSendingEmail(false);
+        return;
+      }
+      if (!outboundSubjectStudies.length) {
+        setError("لا يمكن الإرسال قبل تعبئة قائمة Studies في Settings > Compose.");
+        setIsSendingEmail(false);
+        return;
+      }
+      if (!outboundSubjectAdminSubjects.length) {
+        setError("لا يمكن الإرسال قبل تعبئة قائمة Admin Subjects في Settings > Compose.");
+        setIsSendingEmail(false);
+        return;
+      }
+      if (resolvedForm.outbound_company && !outboundSubjectCompanies.includes(String(resolvedForm.outbound_company).trim())) {
+        setError("الشركة المختارة غير معرفة داخل إعدادات Compose.");
+        setIsSendingEmail(false);
+        return;
+      }
+      if (resolvedForm.outbound_client && !outboundSubjectClients.includes(String(resolvedForm.outbound_client).trim())) {
+        setError("العميل المختار غير معرف داخل إعدادات Compose.");
+        setIsSendingEmail(false);
+        return;
+      }
+      const nextOutgoingState = computeProfessionalOutgoingState(resolvedForm, {
+        projects,
+        companies: outboundSubjectCompanies,
+        quotations: outboundSubjectQuotations,
+        studies: outboundSubjectStudies,
+        adminSubjects: outboundSubjectAdminSubjects,
+        clients: outboundSubjectClients,
+        senderName: resolvedForm.sender_name || currentUser?.name || "",
+        hasAttachments: files.length > 0,
+        logoUrl: settingsForm.logo_url || "",
+        companyAddress: settingsForm.company_address || "",
+        companyPhone: settingsForm.company_phone || "",
+        companyWebsite: settingsForm.company_website || "",
+        companyEmail: settingsForm.email_address || "",
+        companyName: settingsForm.company_name || ""
+      });
+      if (!nextOutgoingState.isComplete) {
+        setError(`لا يمكن إرسال الرسالة قبل استكمال بيانات الكتاب الرسمي: ${nextOutgoingState.missing.join("، ")}.`);
+        setIsSendingEmail(false);
+        return;
+      }
+      resolvedForm.subject = nextOutgoingState.emailSubject;
+      resolvedForm.project_id = resolvedForm.outbound_group_type === "projects"
+        ? (resolvedForm.outbound_reference_value || "")
+        : (resolvedForm.project_id || "");
+    }
     if (activeAccount?.signature_text && resolvedForm.body && !resolvedForm.body.includes(activeAccount.signature_text)) {
       resolvedForm.body = resolvedForm.body + "\n\n" + activeAccount.signature_text;
-    }
-    if (resolvedForm.email_key_id && resolvedForm.subject) {
-      const selectedKey = emailKeys.find(k => k.id === Number(resolvedForm.email_key_id));
-      if (selectedKey) {
-        const yy = String(new Date().getFullYear()).slice(-2);
-        resolvedForm.subject = `${selectedKey.key_code}:${yy}/${resolvedForm.subject}`;
-      }
     }
     const replySourceId = Number(resolvedForm.reply_source_email_id || 0);
     if (replySourceId) {
@@ -4028,6 +4595,10 @@ function App() {
                 <h3>Account Information</h3>
                 <div className="o365-settings-body">
                   <div className="o365-setting-row"><label>Company Name</label><input value={settingsForm.company_name} onChange={e => setSettingsForm({ ...settingsForm, company_name: e.target.value })} /></div>
+                  <div className="o365-setting-row"><label>Logo URL</label><input value={settingsForm.logo_url || ""} onChange={e => setSettingsForm({ ...settingsForm, logo_url: e.target.value })} placeholder="/logo.gif or https://..." /></div>
+                  <div className="o365-setting-row"><label>Company Address</label><input value={settingsForm.company_address || ""} onChange={e => setSettingsForm({ ...settingsForm, company_address: e.target.value })} placeholder="Amman, Jordan" /></div>
+                  <div className="o365-setting-row"><label>Company Phone</label><input value={settingsForm.company_phone || ""} onChange={e => setSettingsForm({ ...settingsForm, company_phone: e.target.value })} placeholder="+962 ..." /></div>
+                  <div className="o365-setting-row"><label>Company Website</label><input value={settingsForm.company_website || ""} onChange={e => setSettingsForm({ ...settingsForm, company_website: e.target.value })} placeholder="https://example.com" /></div>
                   <div className="o365-setting-row"><label>Display Name</label><input value={settingsForm.display_name} onChange={e => setSettingsForm({ ...settingsForm, display_name: e.target.value })} /></div>
                   <div className="o365-setting-row"><label>Email Address</label><input type="email" value={settingsForm.email_address} onChange={e => setSettingsForm({ ...settingsForm, email_address: e.target.value })} /></div>
                   <div className="o365-setting-row"><label>Account Type</label><select value={settingsForm.account_type} onChange={e => setSettingsForm((prev) => ({ ...prev, account_type: e.target.value, incoming_port: e.target.value === "IMAP" ? 993 : e.target.value === "GRAPH" ? 993 : 995, incoming_ssl: true, inbox_folder_name: prev.inbox_folder_name || "Inbox", sent_folder_name: prev.sent_folder_name || "Sent", graph_mailbox_user: prev.graph_mailbox_user || prev.email_address || "" }))}><option>POP3</option><option>IMAP</option><option>GRAPH</option></select></div>
@@ -4232,6 +4803,120 @@ function App() {
                 <div className="o365-setting-row"><label>Default Priority</label><select value={settingsForm.priority || "Normal"} onChange={e => setSettingsForm({ ...settingsForm, priority: e.target.value })}><option>Low</option><option>Normal</option><option>High</option></select></div>
                 <div className="o365-setting-check"><input type="checkbox" checked={Boolean(settingsForm.read_receipt)} onChange={e => setSettingsForm({ ...settingsForm, read_receipt: e.target.checked })} /> Always request read receipt</div>
                 <div className="o365-setting-check"><input type="checkbox" checked={Boolean(settingsForm.delivery_receipt)} onChange={e => setSettingsForm({ ...settingsForm, delivery_receipt: e.target.checked })} /> Always request delivery receipt</div>
+                <div className="o365-setting-check"><input type="checkbox" checked={settingsForm.enforce_outbound_subject_schema !== false} onChange={e => setSettingsForm({ ...settingsForm, enforce_outbound_subject_schema: e.target.checked })} /> منع إرسال الرسائل الصادرة إلا بعد اكتمال نموذج الكتاب الرسمي</div>
+                <div style={{ marginTop: 16, borderTop: "1px solid #eee", paddingTop: 16 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>Outgoing Letter Catalogs</div>
+                  <p style={{ fontSize: 12, color: "#666", marginBottom: 10 }}>
+                    عرف القوائم المرجعية التي ستظهر في شاشة إنشاء الكتاب الرسمي. استخدم الصيغة `الاسم|الكود` للقوائم المرجعية، و`اسم العميل|الوصف` لقائمة العملاء.
+                  </p>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                    <div>
+                      <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#555", marginBottom: 6 }}>Companies</label>
+                      <textarea
+                        rows={6}
+                        value={outboundSubjectCompanies.join("\n")}
+                        onChange={(e) => setSettingsForm({
+                          ...settingsForm,
+                          outbound_subject_companies: e.target.value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)
+                        })}
+                        placeholder={"TIG Jordan|TIG.Jo\nJoNi|JoNi"}
+                        style={{ width: "100%", padding: "8px 10px", border: "1px solid #ddd", borderRadius: 4, fontSize: 12, resize: "vertical" }}
+                      />
+                    </div>
+                    <div>
+                      <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#555", marginBottom: 6 }}>Clients</label>
+                      <textarea
+                        rows={6}
+                        value={outboundSubjectClients.join("\n")}
+                        onChange={(e) => setSettingsForm({
+                          ...settingsForm,
+                          outbound_subject_clients: e.target.value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)
+                        })}
+                        placeholder={"حاتم علي محمد النواصره|الرقم الوظيفي:11830 – مساعد فني\nClient B|Department XYZ"}
+                        style={{ width: "100%", padding: "8px 10px", border: "1px solid #ddd", borderRadius: 4, fontSize: 12, resize: "vertical" }}
+                      />
+                    </div>
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginTop: 12 }}>
+                    <div>
+                      <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#555", marginBottom: 6 }}>Quotations</label>
+                      <textarea
+                        rows={6}
+                        value={outboundSubjectQuotations.join("\n")}
+                        onChange={(e) => setSettingsForm({
+                          ...settingsForm,
+                          outbound_subject_quotations: e.target.value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)
+                        })}
+                        placeholder={"General Quotation|GEN\nPricing Review|PRC"}
+                        style={{ width: "100%", padding: "8px 10px", border: "1px solid #ddd", borderRadius: 4, fontSize: 12, resize: "vertical" }}
+                      />
+                    </div>
+                    <div>
+                      <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#555", marginBottom: 6 }}>Studies</label>
+                      <textarea
+                        rows={6}
+                        value={outboundSubjectStudies.join("\n")}
+                        onChange={(e) => setSettingsForm({
+                          ...settingsForm,
+                          outbound_subject_studies: e.target.value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)
+                        })}
+                        placeholder={"Feasibility Study|FES\nTechnical Study|TEC"}
+                        style={{ width: "100%", padding: "8px 10px", border: "1px solid #ddd", borderRadius: 4, fontSize: 12, resize: "vertical" }}
+                      />
+                    </div>
+                    <div>
+                      <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#555", marginBottom: 6 }}>Admin Subjects</label>
+                      <textarea
+                        rows={6}
+                        value={outboundSubjectAdminSubjects.join("\n")}
+                        onChange={(e) => setSettingsForm({
+                          ...settingsForm,
+                          outbound_subject_admin_subjects: e.target.value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)
+                        })}
+                        placeholder={"Contract Extension|CTR\nHR Formal Notice|HRN"}
+                        style={{ width: "100%", padding: "8px 10px", border: "1px solid #ddd", borderRadius: 4, fontSize: 12, resize: "vertical" }}
+                      />
+                    </div>
+                  </div>
+                </div>
+                <div style={{ marginTop: 16, borderTop: "1px solid #eee", paddingTop: 16 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>Projects for Letter Group</div>
+                  <p style={{ fontSize: 12, color: "#666", marginBottom: 10 }}>
+                    عند اختيار المجموعة `Projects` في شاشة الإرسال، سيتم استخدام هذه القائمة كمرجع `Subject Number`.
+                  </p>
+                  {canAccessAdmin ? (
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr auto", gap: 8, alignItems: "end", marginBottom: 12 }}>
+                      <div>
+                        <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#555", marginBottom: 6 }}>Project Code</label>
+                        <input
+                          value={composeProjectForm.project_code}
+                          onChange={(e) => setComposeProjectForm({ ...composeProjectForm, project_code: e.target.value.toUpperCase() })}
+                          placeholder="PRJ-001"
+                        />
+                      </div>
+                      <div>
+                        <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#555", marginBottom: 6 }}>Project Name</label>
+                        <input
+                          value={composeProjectForm.project_name}
+                          onChange={(e) => setComposeProjectForm({ ...composeProjectForm, project_name: e.target.value })}
+                          placeholder="Main Client Project"
+                        />
+                      </div>
+                      <button type="button" onClick={addComposeProjectFromSettings} style={{ padding: "8px 14px", background: "var(--c-primary)", color: "#fff", border: "none", borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
+                        Add Project
+                      </button>
+                    </div>
+                  ) : null}
+                  <div style={{ display: "grid", gap: 6, maxHeight: 180, overflowY: "auto", border: "1px solid #eee", borderRadius: 6, padding: 10, background: "#fafafa" }}>
+                    {projects.length ? projects.map((project) => (
+                      <div key={project.id} style={{ fontSize: 12, color: "#444" }}>
+                        <strong>[{project.project_code}]</strong> {project.project_name}
+                      </div>
+                    )) : (
+                      <div style={{ fontSize: 12, color: "#777" }}>لا توجد مشاريع معرفة بعد.</div>
+                    )}
+                  </div>
+                </div>
               </div>
             </div>
           )}
@@ -4551,7 +5236,11 @@ function App() {
           activeAccountId={activeAccountId}
           setActiveAccountId={setActiveAccountId}
           emailKeys={emailKeys}
-          projects={projects}
+          outboundCompanyOptions={buildOutgoingCatalogOptions(outboundSubjectCompanies, "generic")}
+          outboundClientOptions={buildOutgoingCatalogOptions(outboundSubjectClients, "client")}
+          outgoingReferenceOptions={outgoingReferenceOptions}
+          professionalOutgoingState={professionalOutgoingState}
+          enforceOutboundSubjectSchema={settingsForm.enforce_outbound_subject_schema !== false}
         />
       </Suspense>
     );

@@ -90,6 +90,11 @@ import {
   deleteEmailKey,
   createProject,
   getProjects,
+  getProjectsForUser,
+  getProjectMembers,
+  addProjectMember,
+  removeProjectMember,
+  setProjectMembers,
   getProjectById,
   updateProject,
   deleteProject,
@@ -1280,7 +1285,7 @@ app.get("/api/bootstrap", authenticateRequest, async (req, res) => {
     payload.emailAccounts = await getEmailAccounts(req.user.id);
   } catch (e) { payload.emailAccounts = []; }
   try { payload.emailKeys = await getEmailKeys(); } catch (e) { console.error("[BOOTSTRAP] emailKeys error:", e.message); payload.emailKeys = []; }
-  try { payload.projects = await getProjects(); } catch (e) { payload.projects = []; }
+  try { payload.projects = await getProjectsForUser(req.user.id); } catch (e) { payload.projects = []; }
   try { payload.unclassifiedCount = await getUnclassifiedCount(); } catch (e) { payload.unclassifiedCount = 0; }
   try { payload.taskStats = await getTaskStats(req.user?.id); } catch (e) { payload.taskStats = {}; }
   try { payload.tasks = await getTasks({}); } catch (e) { payload.tasks = []; }
@@ -1721,10 +1726,55 @@ app.delete("/api/keys/:id", authenticateRequest, requireAdminAccess, async (req,
 
 app.get("/api/projects", authenticateRequest, async (req, res) => {
   try {
+    const projects = await getProjectsForUser(req.user.id);
+    return res.json({ projects });
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
+});
+
+app.get("/api/projects/all", authenticateRequest, requireAdminAccess, async (req, res) => {
+  try {
     const projects = await getProjects();
     return res.json({ projects });
   } catch (error) {
-    return res.status(500).json({ error: error.message });
+    return res.status(400).json({ error: error.message });
+  }
+});
+
+app.get("/api/projects/:id/members", authenticateRequest, async (req, res) => {
+  try {
+    const members = await getProjectMembers(Number(req.params.id));
+    return res.json({ members });
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/projects/:id/members", authenticateRequest, requireAdminAccess, async (req, res) => {
+  try {
+    const member = await addProjectMember(Number(req.params.id), req.body.user_id, req.body.role);
+    return res.status(201).json({ member });
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
+});
+
+app.delete("/api/projects/:id/members/:userId", authenticateRequest, requireAdminAccess, async (req, res) => {
+  try {
+    await removeProjectMember(Number(req.params.id), Number(req.params.userId));
+    return res.json({ success: true });
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
+});
+
+app.put("/api/projects/:id/members", authenticateRequest, requireAdminAccess, async (req, res) => {
+  try {
+    await setProjectMembers(Number(req.params.id), req.body.user_ids || []);
+    return res.json({ success: true });
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
   }
 });
 

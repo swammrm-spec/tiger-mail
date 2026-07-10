@@ -201,6 +201,14 @@ export default function AdminDashboard({
   const [notificationHistoryTrackingTaskFilter, setNotificationHistoryTrackingTaskFilter] = useState("");
   const [showNotificationHistory, setShowNotificationHistory] = useState(false);
 
+  const [adminProjects, setAdminProjects] = useState([]);
+  const [adminProjectsLoading, setAdminProjectsLoading] = useState(false);
+  const [selectedProjectId, setSelectedProjectId] = useState(null);
+  const [projectMembers, setProjectMembers] = useState([]);
+  const [projectMembersLoading, setProjectMembersLoading] = useState(false);
+  const [allEmployees, setAllEmployees] = useState([]);
+  const [showAddMemberSelect, setShowAddMemberSelect] = useState(false);
+
   const trackerSummaryCards = [
     { key: "total", label: "Total", value: Number(trackerSummary?.totals?.total || 0), accent: "#44546f" },
     { key: "pending", label: "Pending", value: Number(trackerSummary?.totals?.pending || 0), accent: "#d97706" },
@@ -435,6 +443,58 @@ export default function AdminDashboard({
     loadNotificationHistory();
     return () => { cancelled = true; };
   }, [adminTab, apiFetch, notificationHistoryQuery]);
+
+  const loadAdminProjects = useCallback(async () => {
+    if (adminTab !== "projects") return;
+    setAdminProjectsLoading(true);
+    try {
+      const response = await apiFetch("/api/projects/all");
+      setAdminProjects(Array.isArray(response.projects) ? response.projects : []);
+    } catch (e) { setAdminProjects([]); }
+    setAdminProjectsLoading(false);
+  }, [adminTab, apiFetch]);
+
+  const loadAllEmployees = useCallback(async () => {
+    try {
+      const response = await apiFetch("/api/admin/employees");
+      setAllEmployees(Array.isArray(response.employees) ? response.employees : []);
+    } catch (e) { setAllEmployees([]); }
+  }, [apiFetch]);
+
+  const loadProjectMembers = useCallback(async (projectId) => {
+    if (!projectId) { setProjectMembers([]); return; }
+    setProjectMembersLoading(true);
+    try {
+      const response = await apiFetch(`/api/projects/${projectId}/members`);
+      setProjectMembers(Array.isArray(response.members) ? response.members : []);
+    } catch (e) { setProjectMembers([]); }
+    setProjectMembersLoading(false);
+  }, [apiFetch]);
+
+  const addProjectMember = useCallback(async (projectId, userId) => {
+    try {
+      await apiFetch(`/api/projects/${projectId}/members`, { method: "POST", body: JSON.stringify({ user_id: userId }) });
+      await loadProjectMembers(projectId);
+    } catch (e) { /* ignore */ }
+  }, [apiFetch, loadProjectMembers]);
+
+  const removeProjectMember = useCallback(async (projectId, userId) => {
+    try {
+      await apiFetch(`/api/projects/${projectId}/members/${userId}`, { method: "DELETE" });
+      await loadProjectMembers(projectId);
+    } catch (e) { /* ignore */ }
+  }, [apiFetch, loadProjectMembers]);
+
+  useEffect(() => {
+    if (adminTab === "projects") {
+      loadAdminProjects();
+      loadAllEmployees();
+    }
+  }, [adminTab, loadAdminProjects, loadAllEmployees]);
+
+  useEffect(() => {
+    if (selectedProjectId) loadProjectMembers(selectedProjectId);
+  }, [selectedProjectId, loadProjectMembers]);
 
   useEffect(() => {
     if (adminTab === "tracker") {
@@ -1011,7 +1071,7 @@ export default function AdminDashboard({
             </div>
           </div>
           <div style={{ display: "flex", gap: 4, marginBottom: 16, borderBottom: "1px solid #e1e1e1" }}>
-            {["overview", "tracker", "approval", "employees", "mail-tests", "trail", "archives"].map((tab) => (
+            {["overview", "tracker", "projects", "approval", "employees", "mail-tests", "trail", "archives"].map((tab) => (
               <button key={tab} onClick={() => setAdminTab(tab)} style={{ padding: "8px 16px", fontSize: 12, background: "none", border: "none", borderBottom: adminTab === tab ? "2px solid var(--c-primary)" : "2px solid transparent", color: adminTab === tab ? "var(--c-primary)" : "#333", cursor: "pointer", fontWeight: adminTab === tab ? 600 : 400, textTransform: "capitalize" }}>{tab}</button>
             ))}
           </div>
@@ -1633,6 +1693,115 @@ export default function AdminDashboard({
                 <h3>Thread Tracker</h3>
                 <div className="o365-settings-body">
                   <ThreadTracker apiFetch={apiFetch} />
+                </div>
+              </div>
+            </>
+          )}
+
+          {adminTab === "projects" && (
+            <>
+              <div className="o365-settings-section">
+                <h3>Project Members Management</h3>
+                <div className="o365-settings-body">
+                  <div style={{ fontSize: 12, color: "#666", marginBottom: 12 }}>
+                    Assign employees to projects. Only assigned employees will see the project in Compose dropdown.
+                  </div>
+                  {adminProjectsLoading ? (
+                    <div style={{ padding: 12, color: "#666" }}>Loading projects...</div>
+                  ) : (
+                    <div style={{ display: "grid", gap: 8 }}>
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 2fr", gap: 16, alignItems: "start" }}>
+                        <div style={{ border: "1px solid #e1e1e1", borderRadius: 6, background: "#fff", maxHeight: 400, overflowY: "auto" }}>
+                          <div style={{ padding: "8px 12px", borderBottom: "1px solid #eee", fontSize: 12, fontWeight: 600, background: "#f8f9fa" }}>
+                            Projects ({adminProjects.length})
+                          </div>
+                          {adminProjects.map((project) => (
+                            <div
+                              key={project.id}
+                              onClick={() => setSelectedProjectId(project.id)}
+                              style={{
+                                padding: "8px 12px", fontSize: 12, cursor: "pointer",
+                                borderLeft: selectedProjectId === project.id ? "3px solid #1a237e" : "3px solid transparent",
+                                background: selectedProjectId === project.id ? "#e8f0fe" : "transparent"
+                              }}
+                            >
+                              <div style={{ fontWeight: 600 }}>[{project.project_code}]</div>
+                              <div style={{ color: "#666", fontSize: 11 }}>{project.project_name}</div>
+                            </div>
+                          ))}
+                        </div>
+                        <div style={{ border: "1px solid #e1e1e1", borderRadius: 6, background: "#fff", minHeight: 200 }}>
+                          {selectedProjectId ? (
+                            <div>
+                              <div style={{ padding: "8px 12px", borderBottom: "1px solid #eee", fontSize: 12, fontWeight: 600, background: "#f8f9fa", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                                <span>Members ({projectMembers.length})</span>
+                                <button
+                                  onClick={() => setShowAddMemberSelect(!showAddMemberSelect)}
+                                  style={{ fontSize: 11, padding: "3px 8px", background: "#1a237e", color: "#fff", border: "none", borderRadius: 4, cursor: "pointer" }}
+                                >
+                                  + Add Member
+                                </button>
+                              </div>
+                              {showAddMemberSelect && (
+                                <div style={{ padding: "8px 12px", borderBottom: "1px solid #eee", background: "#f0f7ff" }}>
+                                  <select
+                                    id="add-member-select"
+                                    style={{ fontSize: 12, padding: "4px 8px", borderRadius: 4, border: "1px solid #ccc", width: "80%" }}
+                                  >
+                                    <option value="">Select employee...</option>
+                                    {allEmployees
+                                      .filter(emp => !projectMembers.some(m => m.user_id === emp.id))
+                                      .map(emp => (
+                                        <option key={emp.id} value={emp.id}>{emp.name} ({emp.email})</option>
+                                      ))
+                                    }
+                                  </select>
+                                  <button
+                                    onClick={() => {
+                                      const select = document.getElementById("add-member-select");
+                                      if (select && select.value) {
+                                        addProjectMember(selectedProjectId, Number(select.value));
+                                        setShowAddMemberSelect(false);
+                                      }
+                                    }}
+                                    style={{ fontSize: 11, padding: "4px 8px", background: "#107c10", color: "#fff", border: "none", borderRadius: 4, cursor: "pointer", marginLeft: 6 }}
+                                  >
+                                    Add
+                                  </button>
+                                </div>
+                              )}
+                              <div style={{ padding: 8, display: "grid", gap: 4 }}>
+                                {projectMembersLoading ? (
+                                  <div style={{ fontSize: 12, color: "#666" }}>Loading...</div>
+                                ) : projectMembers.length === 0 ? (
+                                  <div style={{ fontSize: 12, color: "#999", padding: 8 }}>No members assigned. All employees can see this project.</div>
+                                ) : (
+                                  projectMembers.map((member) => (
+                                    <div key={member.user_id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 8px", background: "#f8f9fa", borderRadius: 4, fontSize: 12 }}>
+                                      <div>
+                                        <strong>{member.name || `User ${member.user_id}`}</strong>
+                                        <span style={{ color: "#666", marginLeft: 8 }}>{member.email}</span>
+                                      </div>
+                                      <button
+                                        onClick={() => removeProjectMember(selectedProjectId, member.user_id)}
+                                        style={{ fontSize: 10, padding: "2px 6px", background: "#d13438", color: "#fff", border: "none", borderRadius: 3, cursor: "pointer" }}
+                                      >
+                                        Remove
+                                      </button>
+                                    </div>
+                                  ))
+                                )}
+                              </div>
+                            </div>
+                          ) : (
+                            <div style={{ padding: 24, textAlign: "center", color: "#999", fontSize: 12 }}>
+                              Select a project to manage its members
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             </>

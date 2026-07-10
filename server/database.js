@@ -1515,6 +1515,20 @@ async function runSchema() {
     await query(`ALTER TABLE projects ADD COLUMN IF NOT EXISTS completion_pct INTEGER DEFAULT 0`);
   } catch (e) { /* columns may already exist */ }
 
+  try {
+    await query(`
+      CREATE TABLE IF NOT EXISTS project_members (
+        id SERIAL PRIMARY KEY,
+        project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        role TEXT DEFAULT 'member',
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(project_id, user_id)
+      )
+    `);
+    await query(`CREATE INDEX IF NOT EXISTS idx_project_members_user ON project_members(user_id)`);
+  } catch (e) { /* table may already exist */ }
+
   // Tasks and milestones depend on projects, so ensure they exist only after
   // the projects table has been created successfully.
   await ensureDeferredTable(
@@ -5802,6 +5816,59 @@ async function getProjects() {
   return result.rows;
 }
 
+async function getProjectsForUser(userId) {
+  const userResult = await query(`SELECT role FROM users WHERE id = $1`, [userId]);
+  const user = userResult.rows[0];
+  if (user && (user.role === "admin" || user.role === "Admin")) {
+    return (await query(`SELECT * FROM projects WHERE status != 'Deleted' ORDER BY project_code ASC`)).rows;
+  }
+  const result = await query(
+    `SELECT p.* FROM projects p
+     INNER JOIN project_members pm ON pm.project_id = p.id
+     WHERE pm.user_id = $1 AND p.status != 'Deleted'
+     ORDER BY p.project_code ASC`,
+    [userId]
+  );
+  return result.rows;
+}
+
+async function getProjectMembers(projectId) {
+  const result = await query(
+    `SELECT pm.*, u.name, u.email FROM project_members pm
+     LEFT JOIN users u ON u.id = pm.user_id
+     WHERE pm.project_id = $1`,
+    [projectId]
+  );
+  return result.rows;
+}
+
+async function addProjectMember(projectId, userId, role = "member") {
+  const existing = await query(
+    `SELECT id FROM project_members WHERE project_id = $1 AND user_id = $2`,
+    [projectId, userId]
+  );
+  if (existing.rows.length > 0) return existing.rows[0];
+  const result = await query(
+    `INSERT INTO project_members (project_id, user_id, role) VALUES ($1, $2, $3) RETURNING *`,
+    [projectId, userId, role]
+  );
+  return result.rows[0];
+}
+
+async function removeProjectMember(projectId, userId) {
+  await query(`DELETE FROM project_members WHERE project_id = $1 AND user_id = $2`, [projectId, userId]);
+}
+
+async function setProjectMembers(projectId, memberIds = []) {
+  await query(`DELETE FROM project_members WHERE project_id = $1`, [projectId]);
+  for (const userId of memberIds) {
+    await query(
+      `INSERT INTO project_members (project_id, user_id, role) VALUES ($1, $2, 'member')`,
+      [projectId, userId]
+    );
+  }
+}
+
 async function getProjectById(id) {
   const result = await query(`SELECT * FROM projects WHERE id = $1`, [id]);
   return result.rows[0] || null;
@@ -7516,6 +7583,11 @@ export {
   getThreadAnalytics,
   createProject,
   getProjects,
+  getProjectsForUser,
+  getProjectMembers,
+  addProjectMember,
+  removeProjectMember,
+  setProjectMembers,
   getProjectById,
   getProjectByCode,
   updateProject,

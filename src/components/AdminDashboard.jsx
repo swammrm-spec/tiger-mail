@@ -54,6 +54,26 @@ function formatTrackingHistoryChange(entry = {}) {
   return `${formatTrackingHistoryFieldLabel(fieldName)}: ${previousLabel} -> ${nextLabel}`;
 }
 
+function normalizeCompanyMatchToken(value = "") {
+  return String(value || "").trim().toUpperCase().replace(/[^A-Z0-9]+/g, "");
+}
+
+function resolveCompanyValueForProject(project = {}, companyOptions = []) {
+  const projectCompanyCode = normalizeCompanyMatchToken(project.company_code || "");
+  const projectCompanyName = normalizeCompanyMatchToken(project.company_name || "");
+  const matched = (Array.isArray(companyOptions) ? companyOptions : []).find((item) => {
+    const optionCode = normalizeCompanyMatchToken(item.code || "");
+    const optionLabel = normalizeCompanyMatchToken(item.label || "");
+    return (
+      (projectCompanyCode && optionCode && projectCompanyCode === optionCode)
+      || (projectCompanyName && optionLabel && projectCompanyName === optionLabel)
+      || (projectCompanyName && optionCode && projectCompanyName === optionCode)
+      || (projectCompanyCode && optionLabel && projectCompanyCode === optionLabel)
+    );
+  });
+  return matched?.value || "";
+}
+
 export default function AdminDashboard({
   canAccessAdmin,
   currentUser,
@@ -68,6 +88,7 @@ export default function AdminDashboard({
   dashboardStats,
   analytics,
   approvalAnalytics,
+  calendarAnalytics,
   employeeForm,
   setEmployeeForm,
   editingEmployeeId,
@@ -144,7 +165,8 @@ export default function AdminDashboard({
   onToggleAllArchiveTrackingTaskSelections,
   onMarkSelectedArchiveTrackingTasksDone,
   onAssignSelectedArchiveTrackingTasks,
-  onExportSelectedArchiveTrackingTasks
+  onExportSelectedArchiveTrackingTasks,
+  outboundCompanyOptions = []
 }) {
   const registryRows = archiveExplorerData?.email_registry || [];
   const contentRows = archiveExplorerData?.email_content_archive || [];
@@ -208,6 +230,12 @@ export default function AdminDashboard({
   const [projectMembersLoading, setProjectMembersLoading] = useState(false);
   const [allEmployees, setAllEmployees] = useState([]);
   const [showAddMemberSelect, setShowAddMemberSelect] = useState(false);
+  const [projectCompanyDrafts, setProjectCompanyDrafts] = useState({});
+  const [isRunningProjectCompanyBackfill, setIsRunningProjectCompanyBackfill] = useState(false);
+  const [projectCompanyBackfillSummary, setProjectCompanyBackfillSummary] = useState(null);
+  const [projectCompanyActionError, setProjectCompanyActionError] = useState("");
+  const [projectCompanyActionMessage, setProjectCompanyActionMessage] = useState("");
+  const [activeProjectCompanySaveId, setActiveProjectCompanySaveId] = useState(null);
 
   const trackerSummaryCards = [
     { key: "total", label: "Total", value: Number(trackerSummary?.totals?.total || 0), accent: "#44546f" },
@@ -231,6 +259,14 @@ export default function AdminDashboard({
     }
     return params.toString();
   }, [trackerAssignedFilter, trackerProjectFilter, trackerStatusFilter]);
+  const selectedProject = useMemo(
+    () => adminProjects.find((project) => Number(project.id) === Number(selectedProjectId || 0)) || null,
+    [adminProjects, selectedProjectId]
+  );
+  const unmappedProjectsCount = useMemo(
+    () => adminProjects.filter((project) => !resolveCompanyValueForProject(project, outboundCompanyOptions)).length,
+    [adminProjects, outboundCompanyOptions]
+  );
 
   const filteredTrackerRows = useMemo(() => {
     const normalizedSearch = String(trackerSearch || "").trim().toLowerCase();
@@ -485,12 +521,62 @@ export default function AdminDashboard({
     } catch (e) { /* ignore */ }
   }, [apiFetch, loadProjectMembers]);
 
+  const runProjectCompanyBackfill = useCallback(async () => {
+    setIsRunningProjectCompanyBackfill(true);
+    setProjectCompanyActionError("");
+    setProjectCompanyActionMessage("");
+    try {
+      const response = await apiFetch("/api/admin/projects/company-backfill", { method: "POST", body: {} });
+      setProjectCompanyBackfillSummary(response.summary || null);
+      await loadAdminProjects();
+      setProjectCompanyActionMessage("تم تنفيذ الربط التلقائي للمشاريع بنجاح.");
+    } catch (e) {
+      setProjectCompanyActionError(e.message || "تعذر تنفيذ الربط التلقائي.");
+    } finally {
+      setIsRunningProjectCompanyBackfill(false);
+    }
+  }, [apiFetch, loadAdminProjects]);
+
+  const saveProjectCompanyMapping = useCallback(async (project) => {
+    if (!project?.id) {
+      return;
+    }
+    const selectedValue = projectCompanyDrafts[project.id] || "";
+    const selectedCompany = outboundCompanyOptions.find((item) => item.value === selectedValue) || null;
+    setActiveProjectCompanySaveId(project.id);
+    setProjectCompanyActionError("");
+    setProjectCompanyActionMessage("");
+    try {
+      await apiFetch(`/api/projects/${project.id}`, {
+        method: "PUT",
+        body: {
+          company_name: selectedCompany?.label || "",
+          company_code: selectedCompany?.code || ""
+        }
+      });
+      await loadAdminProjects();
+      setProjectCompanyActionMessage(selectedCompany ? "تم حفظ ربط الشركة للمشروع." : "تمت إزالة ربط الشركة من المشروع.");
+    } catch (e) {
+      setProjectCompanyActionError(e.message || "تعذر حفظ ربط الشركة.");
+    } finally {
+      setActiveProjectCompanySaveId(null);
+    }
+  }, [apiFetch, loadAdminProjects, outboundCompanyOptions, projectCompanyDrafts]);
+
   useEffect(() => {
     if (adminTab === "projects") {
       loadAdminProjects();
       loadAllEmployees();
     }
   }, [adminTab, loadAdminProjects, loadAllEmployees]);
+
+  useEffect(() => {
+    const next = {};
+    for (const project of adminProjects) {
+      next[project.id] = resolveCompanyValueForProject(project, outboundCompanyOptions);
+    }
+    setProjectCompanyDrafts(next);
+  }, [adminProjects, outboundCompanyOptions]);
 
   useEffect(() => {
     if (selectedProjectId) loadProjectMembers(selectedProjectId);
@@ -1071,7 +1157,7 @@ export default function AdminDashboard({
             </div>
           </div>
           <div style={{ display: "flex", gap: 4, marginBottom: 16, borderBottom: "1px solid #e1e1e1" }}>
-            {["overview", "tracker", "projects", "approval", "employees", "mail-tests", "trail", "archives"].map((tab) => (
+            {["overview", "calendar", "tracker", "projects", "approval", "employees", "mail-tests", "trail", "archives"].map((tab) => (
               <button key={tab} onClick={() => setAdminTab(tab)} style={{ padding: "8px 16px", fontSize: 12, background: "none", border: "none", borderBottom: adminTab === tab ? "2px solid var(--c-primary)" : "2px solid transparent", color: adminTab === tab ? "var(--c-primary)" : "#333", cursor: "pointer", fontWeight: adminTab === tab ? 600 : 400, textTransform: "capitalize" }}>{tab}</button>
             ))}
           </div>
@@ -1152,6 +1238,66 @@ export default function AdminDashboard({
                         ))}
                       </>
                     ) : <div style={{ fontSize: 12, color: "#666" }}>Load analytics from Overview tab.</div>}
+                  </div>
+                </div>
+              </div>
+            </>
+          )}
+
+          {adminTab === "calendar" && (
+            <>
+              <div className="o365-admin-grid">
+                {[
+                  { label: "Total Appointments", value: calendarAnalytics?.summary?.total_events ?? 0 },
+                  { label: "Recurring", value: calendarAnalytics?.summary?.recurring_events ?? 0 },
+                  { label: "Reminder Enabled", value: calendarAnalytics?.summary?.reminder_enabled_events ?? 0 },
+                  { label: "Due Reminders", value: calendarAnalytics?.summary?.due_reminders ?? 0 }
+                ].map((item) => (
+                  <div key={item.label} className="o365-admin-card">
+                    <strong>{item.value}</strong>
+                    <span>{item.label}</span>
+                  </div>
+                ))}
+              </div>
+
+              <div className="o365-settings-section" style={{ marginTop: 16 }}>
+                <h3>Calendar Analytics by Employee</h3>
+                <div className="o365-settings-body">
+                  <div style={{ fontSize: 12, color: "#555", marginBottom: 8 }}>
+                    <strong>Upcoming:</strong> {calendarAnalytics?.summary?.upcoming_events ?? 0} &nbsp;|&nbsp;
+                    <strong>Due Reminders:</strong> {calendarAnalytics?.summary?.due_reminders ?? 0}
+                  </div>
+                  <div style={{ display: "grid", gap: 8 }}>
+                    {(calendarAnalytics?.employees || []).map((emp) => (
+                      <div key={emp.id} style={{ border: "1px solid #e5e7eb", borderRadius: 8, background: "#fff", padding: "10px 12px" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                          <div>
+                            <strong style={{ fontSize: 13 }}>{emp.name || emp.email}</strong>
+                            <div style={{ fontSize: 11, color: "#666" }}>{emp.email}{emp.department ? ` • ${emp.department}` : ""}</div>
+                          </div>
+                          <div style={{ fontSize: 11, color: "#666" }}>
+                            Latest: {emp.latest_event_at ? formatJordanDateTime(emp.latest_event_at, { month: "2-digit", day: "2-digit", year: "numeric" }) : "No events"}
+                          </div>
+                        </div>
+                        <div style={{ display: "grid", gridTemplateColumns: "repeat(5, minmax(0, 1fr))", gap: 8, marginTop: 10 }}>
+                          {[
+                            ["Total", emp.total_events],
+                            ["Recurring", emp.recurring_events],
+                            ["Reminder", emp.reminder_enabled_events],
+                            ["Upcoming", emp.upcoming_events],
+                            ["Due", emp.due_reminders]
+                          ].map(([label, value]) => (
+                            <div key={`${emp.id}-${label}`} style={{ border: "1px solid #f1f5f9", background: "#f8fafc", borderRadius: 6, padding: "8px 10px", fontSize: 11 }}>
+                              <div style={{ color: "#64748b", marginBottom: 4 }}>{label}</div>
+                              <strong style={{ fontSize: 16, color: "#0f172a" }}>{value ?? 0}</strong>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                    {!calendarAnalytics?.employees?.length ? (
+                      <div style={{ fontSize: 12, color: "#666" }}>No calendar analytics available yet.</div>
+                    ) : null}
                   </div>
                 </div>
               </div>
@@ -1701,11 +1847,66 @@ export default function AdminDashboard({
           {adminTab === "projects" && (
             <>
               <div className="o365-settings-section">
-                <h3>Project Members Management</h3>
+                <h3>Project Company Mapping</h3>
                 <div className="o365-settings-body">
                   <div style={{ fontSize: 12, color: "#666", marginBottom: 12 }}>
-                    Assign employees to projects. Only assigned employees will see the project in Compose dropdown.
+                    Run automatic backfill first, then review ambiguous or unmatched projects manually. Company mapping controls which projects appear for each company inside Compose.
                   </div>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
+                    <button
+                      type="button"
+                      onClick={runProjectCompanyBackfill}
+                      disabled={isRunningProjectCompanyBackfill || !outboundCompanyOptions.length}
+                      style={{ fontSize: 12, padding: "6px 12px", background: "#1a237e", color: "#fff", border: "none", borderRadius: 4, cursor: isRunningProjectCompanyBackfill || !outboundCompanyOptions.length ? "not-allowed" : "pointer", opacity: isRunningProjectCompanyBackfill || !outboundCompanyOptions.length ? 0.6 : 1 }}
+                    >
+                      {isRunningProjectCompanyBackfill ? "Running Backfill..." : "Run Company Backfill"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={loadAdminProjects}
+                      disabled={adminProjectsLoading}
+                      style={{ fontSize: 12, padding: "6px 12px", background: "#fff", color: "#333", border: "1px solid #ddd", borderRadius: 4, cursor: adminProjectsLoading ? "not-allowed" : "pointer", opacity: adminProjectsLoading ? 0.6 : 1 }}
+                    >
+                      Refresh Projects
+                    </button>
+                  </div>
+                  {!outboundCompanyOptions.length ? (
+                    <div style={{ marginBottom: 12, padding: 10, borderRadius: 6, background: "#fff4ce", color: "#8a5a00", fontSize: 12 }}>
+                      {"No company catalog is configured yet. Define companies in Settings > Compose before using backfill or manual mapping."}
+                    </div>
+                  ) : null}
+                  {projectCompanyActionError ? (
+                    <div style={{ marginBottom: 12, padding: 10, borderRadius: 6, background: "#fde7e9", color: "#a4262c", fontSize: 12 }}>
+                      {projectCompanyActionError}
+                    </div>
+                  ) : null}
+                  {projectCompanyActionMessage ? (
+                    <div style={{ marginBottom: 12, padding: 10, borderRadius: 6, background: "#e6f4ea", color: "#107c10", fontSize: 12 }}>
+                      {projectCompanyActionMessage}
+                    </div>
+                  ) : null}
+                  <div className="o365-admin-grid" style={{ marginBottom: 12 }}>
+                    <div className="o365-admin-card"><strong>{adminProjects.length}</strong><span>Total Projects</span></div>
+                    <div className="o365-admin-card"><strong>{adminProjects.length - unmappedProjectsCount}</strong><span>Mapped</span></div>
+                    <div className="o365-admin-card"><strong>{unmappedProjectsCount}</strong><span>Unmapped</span></div>
+                    <div className="o365-admin-card"><strong>{projectCompanyBackfillSummary?.updated_count || 0}</strong><span>Last Backfill Updates</span></div>
+                  </div>
+                  {projectCompanyBackfillSummary ? (
+                    <div style={{ marginBottom: 12, padding: 12, borderRadius: 6, background: "#f8fafc", border: "1px solid #e2e8f0", fontSize: 12, color: "#334155" }}>
+                      <div style={{ fontWeight: 600, marginBottom: 6 }}>Last Backfill Summary</div>
+                      <div>Total: {projectCompanyBackfillSummary.total_projects || 0} | Updated: {projectCompanyBackfillSummary.updated_count || 0} | Already Linked: {projectCompanyBackfillSummary.already_linked_count || 0} | Ambiguous: {projectCompanyBackfillSummary.ambiguous_count || 0} | Unmatched: {projectCompanyBackfillSummary.unmatched_count || 0}</div>
+                      {(projectCompanyBackfillSummary.ambiguous_projects || []).length ? (
+                        <div style={{ marginTop: 8, color: "#8a5a00" }}>
+                          Ambiguous: {projectCompanyBackfillSummary.ambiguous_projects.slice(0, 5).map((item) => `[${item.project_code}] ${item.project_name}`).join(" | ")}
+                        </div>
+                      ) : null}
+                      {(projectCompanyBackfillSummary.unmatched_projects || []).length ? (
+                        <div style={{ marginTop: 6, color: "#a4262c" }}>
+                          Unmatched: {projectCompanyBackfillSummary.unmatched_projects.slice(0, 5).map((item) => `[${item.project_code}] ${item.project_name}`).join(" | ")}
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
                   {adminProjectsLoading ? (
                     <div style={{ padding: 12, color: "#666" }}>Loading projects...</div>
                   ) : (
@@ -1727,12 +1928,54 @@ export default function AdminDashboard({
                             >
                               <div style={{ fontWeight: 600 }}>[{project.project_code}]</div>
                               <div style={{ color: "#666", fontSize: 11 }}>{project.project_name}</div>
+                              <div style={{ marginTop: 4, fontSize: 10, color: resolveCompanyValueForProject(project, outboundCompanyOptions) ? "#107c10" : "#a4262c" }}>
+                                {project.company_name || "Unmapped company"}
+                              </div>
                             </div>
                           ))}
                         </div>
                         <div style={{ border: "1px solid #e1e1e1", borderRadius: 6, background: "#fff", minHeight: 200 }}>
-                          {selectedProjectId ? (
+                          {selectedProject ? (
                             <div>
+                              <div style={{ padding: "12px", borderBottom: "1px solid #eee", background: "#f8f9fa" }}>
+                                <div style={{ fontSize: 13, fontWeight: 700, color: "#1f2937" }}>[{selectedProject.project_code}] {selectedProject.project_name}</div>
+                                <div style={{ marginTop: 4, fontSize: 11, color: "#666" }}>
+                                  Client: {selectedProject.client_name || "-"} | Current Company: {selectedProject.company_name || "Not linked"}
+                                </div>
+                              </div>
+                              <div style={{ padding: 12, borderBottom: "1px solid #eee", display: "grid", gap: 10 }}>
+                                <div>
+                                  <label style={{ display: "block", fontSize: 11, fontWeight: 600, color: "#555", marginBottom: 6 }}>Company Mapping</label>
+                                  <select
+                                    value={projectCompanyDrafts[selectedProject.id] ?? resolveCompanyValueForProject(selectedProject, outboundCompanyOptions)}
+                                    onChange={(e) => setProjectCompanyDrafts((prev) => ({ ...prev, [selectedProject.id]: e.target.value }))}
+                                    style={{ width: "100%", fontSize: 12, padding: "6px 8px", borderRadius: 4, border: "1px solid #ccc" }}
+                                  >
+                                    <option value="">No company mapping</option>
+                                    {outboundCompanyOptions.map((item) => (
+                                      <option key={item.value} value={item.value}>{item.label} [{item.code}]</option>
+                                    ))}
+                                  </select>
+                                </div>
+                                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                                  <button
+                                    type="button"
+                                    onClick={() => saveProjectCompanyMapping(selectedProject)}
+                                    disabled={activeProjectCompanySaveId === selectedProject.id}
+                                    style={{ fontSize: 11, padding: "5px 10px", background: "#107c10", color: "#fff", border: "none", borderRadius: 4, cursor: activeProjectCompanySaveId === selectedProject.id ? "not-allowed" : "pointer", opacity: activeProjectCompanySaveId === selectedProject.id ? 0.6 : 1 }}
+                                  >
+                                    {activeProjectCompanySaveId === selectedProject.id ? "Saving..." : "Save Mapping"}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setProjectCompanyDrafts((prev) => ({ ...prev, [selectedProject.id]: "" }))}
+                                    disabled={activeProjectCompanySaveId === selectedProject.id}
+                                    style={{ fontSize: 11, padding: "5px 10px", background: "#fff", color: "#333", border: "1px solid #ddd", borderRadius: 4, cursor: activeProjectCompanySaveId === selectedProject.id ? "not-allowed" : "pointer", opacity: activeProjectCompanySaveId === selectedProject.id ? 0.6 : 1 }}
+                                  >
+                                    Clear Selection
+                                  </button>
+                                </div>
+                              </div>
                               <div style={{ padding: "8px 12px", borderBottom: "1px solid #eee", fontSize: 12, fontWeight: 600, background: "#f8f9fa", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                                 <span>Members ({projectMembers.length})</span>
                                 <button
@@ -1795,7 +2038,7 @@ export default function AdminDashboard({
                             </div>
                           ) : (
                             <div style={{ padding: 24, textAlign: "center", color: "#999", fontSize: 12 }}>
-                              Select a project to manage its members
+                              Select a project to manage its company mapping and members
                             </div>
                           )}
                         </div>

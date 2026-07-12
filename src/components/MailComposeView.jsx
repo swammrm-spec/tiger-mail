@@ -570,7 +570,13 @@ export default function MailComposeView({
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))", gap: 6, padding: "4px 8px 4px 80px", borderTop: "1px solid #eee" }}>
                 <select
                   value={form.outbound_company || ""}
-                  onChange={(e) => setForm({ ...form, outbound_company: e.target.value })}
+                  onChange={(e) => setForm({
+                    ...form,
+                    outbound_company: e.target.value,
+                    outbound_client: "",
+                    outbound_reference_value: "",
+                    project_id: ""
+                  })}
                   style={{ padding: "4px 6px", fontSize: 12, borderRadius: 4, border: "1px solid #ccc" }}
                 >
                   <option value="">Company</option>
@@ -617,6 +623,14 @@ export default function MailComposeView({
             {enforceOutboundSubjectSchema ? (
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))", gap: 6, padding: "4px 8px 4px 80px", borderTop: "1px solid #eee" }}>
                 <input value={form.outbound_letter_type || "Letter"} readOnly style={{ padding: "4px 6px", fontSize: 12, borderRadius: 4, border: "1px solid #ccc", background: "#f8f8f8" }} />
+                <select
+                  value={form.outbound_template_language || "arabic"}
+                  onChange={(e) => setForm({ ...form, outbound_template_language: e.target.value })}
+                  style={{ padding: "4px 6px", fontSize: 12, borderRadius: 4, border: "1px solid #ccc" }}
+                >
+                  <option value="arabic">Arabic Template</option>
+                  <option value="english">English Template</option>
+                </select>
                 <input
                   value={form.outbound_letter_title || ""}
                   onChange={(e) => setForm({ ...form, outbound_letter_title: e.target.value })}

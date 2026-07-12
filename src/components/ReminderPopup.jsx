@@ -28,9 +28,11 @@ export default function ReminderPopup({ calendarEvents = [], tasks = [], onDismi
     const items = [];
 
     calendarEvents.forEach(evt => {
-      if (!evt.start) return;
-      const eventTime = new Date(evt.start);
-      const diffMs = eventTime.getTime() - now.getTime();
+      const eventStart = evt.starts_at || evt.start;
+      if (!eventStart) return;
+      const eventTime = new Date(eventStart);
+      const reminderAt = evt.reminder_at || eventStart;
+      const diffMs = new Date(reminderAt).getTime() - now.getTime();
       const diffMin = Math.round(diffMs / 60000);
 
       if (diffMin <= 15 && diffMin >= -1440) {
@@ -48,9 +50,9 @@ export default function ReminderPopup({ calendarEvents = [], tasks = [], onDismi
         }
 
         items.push({
-          id: `cal-${evt.id || evt.summary}`,
+          id: `cal-${evt.occurrence_key || evt.id || evt.summary}`,
           type: "calendar",
-          title: evt.summary || "Meeting",
+          title: evt.title || evt.summary || "Meeting",
           time: eventTime,
           timeLabel,
           location: evt.location || "",

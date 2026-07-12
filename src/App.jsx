@@ -2,18 +2,27 @@ import { Fragment, Suspense, lazy, useEffect, useMemo, useRef, useState } from "
 import dayjs from "dayjs";
 import {
   Archive, Bell, Building2, CalendarDays, ChevronDown, ChevronLeft, ChevronRight,
-  Check, FilePenLine, Forward, Inbox, LayoutDashboard, Lock, LogOut, Mail,
-  MoreHorizontal, OctagonAlert, Paperclip, Pen, Play, Plus, RefreshCw, Reply, ReplyAll,
+  Check, FilePenLine, Forward, Inbox, LayoutDashboard, Lock, LogOut, Mail, MailOpen,
+  MoreHorizontal, OctagonAlert, Paperclip, Pen, Play, Plus, RefreshCw, Reply, ReplyAll, Video,
   Search, Send, ShieldAlert, Settings, Download, Trash2, Upload, UserCog,
   Globe, FileText, SpellCheck, Wrench, Clock, AlertTriangle, Eye, EyeOff,
   Printer, Bookmark, Star, Filter, Menu, X, Copy, Flag, ExternalLink, MessageSquare,
   List, Grid3X3, Users, Calendar, Clock as ClockIcon, MessageCircle, CheckCircle, Sparkles
 } from "lucide-react";
-import { formatJordanDateOnly, formatJordanDateTime, getJordanDateKey } from "./utils/timezone.js";
+import {
+  formatJordanDateOnly,
+  formatJordanDateTime,
+  formatJordanDateTimeInput,
+  getJordanDateKey,
+  getJordanNowDateKey,
+  getJordanNowDateTimeInput,
+  parseJordanDateOnlyToISOString,
+  parseJordanDateTimeInputToISOString
+} from "./utils/timezone.js";
 
 const folderIcons = { Inbox, Sent: Send, Outbox: Send, Drafts: FilePenLine, Deleted: Trash2, Junk: ShieldAlert, Spam: OctagonAlert, Archive };
 const folderDisplayNames = { Sent: "Sent Items", Deleted: "Deleted Items", Junk: "Junk Email" };
-const weekdayLabels = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const weekdayLabels = ["Sat", "Sun", "Mon", "Tue", "Wed", "Thu", "Fri"];
 const defaultAdminEmail = "m.safadi@audit.techno-grp.com";
 const AdminDashboard = lazy(() => import("./components/AdminDashboard"));
 const MailComposeView = lazy(() => import("./components/MailComposeView"));
@@ -28,9 +37,545 @@ const deviceMailboxDbName = "emailarray-device-cache";
 const deviceMailboxStoreName = "mailboxes";
 const emptyBootstrap = { currentUser: null, settings: null, folders: [], emails: [], attachments: [], reminders: [], recommendations: [], reports: [], calendar: [] };
 const approvalReminderHours = [9, 13, 17];
+const OUTLOOK_CONTEXT_CATEGORIES = [
+  { value: "Blue Category", label: "Blue Category", color: "#2563eb" },
+  { value: "Green Category", label: "Green Category", color: "#16a34a" },
+  { value: "Orange Category", label: "Orange Category", color: "#ea580c" },
+  { value: "Purple Category", label: "Purple Category", color: "#9333ea" },
+  { value: "Red Category", label: "Red Category", color: "#dc2626" }
+];
+const OUTLOOK_FOLLOW_UP_PRESETS = [
+  { value: "today", label: "Today", getDate: () => dayjs(getJordanNowDateTimeInput()).endOf("day").toISOString() },
+  { value: "tomorrow", label: "Tomorrow", getDate: () => dayjs(getJordanNowDateTimeInput()).add(1, "day").endOf("day").toISOString() },
+  { value: "this_week", label: "This Week", getDate: () => dayjs().endOf("week").hour(17).minute(0).second(0).millisecond(0).toISOString() },
+  { value: "next_week", label: "Next Week", getDate: () => dayjs().add(1, "week").endOf("week").hour(17).minute(0).second(0).millisecond(0).toISOString() },
+  { value: "no_date", label: "No Date", getDate: () => null }
+];
+const CALENDAR_REMINDER_OPTIONS = [
+  { value: 0, label: "At start time" },
+  { value: 5, label: "5 minutes before" },
+  { value: 10, label: "10 minutes before" },
+  { value: 15, label: "15 minutes before" },
+  { value: 30, label: "30 minutes before" },
+  { value: 60, label: "1 hour before" },
+  { value: 120, label: "2 hours before" },
+  { value: 1440, label: "1 day before" }
+];
+const CALENDAR_WEEK_START_HOUR = 6;
+const CALENDAR_WEEK_END_HOUR = 22;
+const CALENDAR_WEEK_SLOT_MINUTES = 15;
+const CALENDAR_WEEK_SLOT_HEIGHT = 16;
+const CALENDAR_WEEK_ALLDAY_ROW_HEIGHT = 28;
+const CALENDAR_WEEK_ALLDAY_VISIBLE_ROWS = 3;
+
+function formatDateTimeLocalInput(value) {
+  if (!value) {
+    return "";
+  }
+  return formatJordanDateTimeInput(value);
+}
+
+function computeCalendarReminderAt(startsAt, reminderEnabled, reminderMinutes, isAllDay = false) {
+  if (!startsAt || !reminderEnabled) {
+    return null;
+  }
+  let start = dayjs(startsAt);
+  if (!start.isValid()) {
+    return null;
+  }
+  if (isAllDay) {
+    start = start.hour(9).minute(0).second(0).millisecond(0);
+  }
+  return start.subtract(Math.max(0, Number(reminderMinutes || 0)), "minute").toISOString();
+}
+
+function createDefaultCalendarForm(baseDate = dayjs(), event = null) {
+  const start = event?.starts_at ? dayjs(event.starts_at) : dayjs(baseDate).hour(9).minute(0).second(0).millisecond(0);
+  const end = event?.ends_at ? dayjs(event.ends_at) : start.add(1, "hour");
+  return {
+    title: event?.title || "",
+    starts_at: formatDateTimeLocalInput(start),
+    ends_at: formatDateTimeLocalInput(end),
+    location: event?.location || "",
+    category: event?.category || "Appointment",
+    description: event?.description || "",
+    status: event?.status || "Busy",
+    is_all_day: Boolean(event?.is_all_day),
+    reminder_enabled: event?.reminder_enabled !== false,
+    reminder_minutes: Number(event?.reminder_minutes ?? 0),
+    color: event?.color || "#0f6cbd",
+    recurrence_pattern: event?.recurrence_pattern || "none",
+    recurrence_interval: Number(event?.recurrence_interval ?? 1),
+    recurrence_days: Array.isArray(event?.recurrence_days)
+      ? event.recurrence_days
+      : String(event?.recurrence_days || "").split(",").map((item) => String(item || "").trim().toUpperCase()).filter(Boolean),
+    recurrence_until: event?.recurrence_until ? dayjs(event.recurrence_until).format("YYYY-MM-DD") : "",
+    recurrence_count: event?.recurrence_count ? Number(event.recurrence_count) : ""
+  };
+}
+
+function buildMiniCalendarCells(baseDate) {
+  const monthStart = dayjs(baseDate).startOf("month");
+  const start = monthStart.subtract((monthStart.day() + 1) % 7, "day").startOf("day");
+  return Array.from({ length: 42 }, (_, index) => start.add(index, "day"));
+}
+
+const RECURRENCE_DAY_KEYS = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"];
+
+function getRecurrenceDaysList(event = {}) {
+  const raw = Array.isArray(event?.recurrence_days)
+    ? event.recurrence_days
+    : String(event?.recurrence_days || "").split(",");
+  const normalized = raw
+    .map((item) => String(item || "").trim().toUpperCase())
+    .filter((item) => RECURRENCE_DAY_KEYS.includes(item));
+  if (normalized.length) {
+    return normalized;
+  }
+  const baseStart = dayjs(event?.starts_at || event?.start || null);
+  return baseStart.isValid() ? [RECURRENCE_DAY_KEYS[baseStart.day()]] : ["MO"];
+}
+
+function normalizeCalendarExceptionMode(event = {}) {
+  const normalized = String(event?.exception_mode || "").trim().toLowerCase();
+  if (normalized === "detached" || normalized === "skip") {
+    return normalized;
+  }
+  return "none";
+}
+
+function getCalendarSeriesEventId(event = {}) {
+  return Number(event?.series_master_id || event?.master_event_id || event?.id || 0) || null;
+}
+
+function isCalendarOccurrenceEditable(event = {}) {
+  return Boolean(
+    event?.occurrence_original_start
+    && (
+      Number(event?.series_master_id || event?.master_event_id || 0) > 0
+      || String(event?.recurrence_pattern || "none").trim().toLowerCase() !== "none"
+    )
+  );
+}
+
+function buildCalendarOccurrence(baseEvent, startValue, endValue, occurrenceIndex = 0, overrides = {}) {
+  const start = dayjs(startValue);
+  const end = dayjs(endValue);
+  const masterEventId = overrides.master_event_id || getCalendarSeriesEventId(baseEvent);
+  const occurrenceOriginalStart = overrides.occurrence_original_start || start.toISOString();
+  const occurrenceKey = `${masterEventId}:${occurrenceOriginalStart}`;
+  return {
+    ...baseEvent,
+    starts_at: start.toISOString(),
+    ends_at: end.toISOString(),
+    master_event_id: masterEventId,
+    occurrence_original_start: occurrenceOriginalStart,
+    occurrence_index: occurrenceIndex,
+    occurrence_key: occurrenceKey,
+    is_occurrence_instance: occurrenceIndex > 0 || String(baseEvent.recurrence_pattern || "none").toLowerCase() !== "none"
+  };
+}
+
+function clampCalendarValue(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function snapCalendarMinutes(totalMinutes, stepMinutes = CALENDAR_WEEK_SLOT_MINUTES) {
+  const safeStep = Math.max(1, Number(stepMinutes || CALENDAR_WEEK_SLOT_MINUTES));
+  return Math.round(Number(totalMinutes || 0) / safeStep) * safeStep;
+}
+
+function getWeekDropDateTime(dayStart, clientY, containerElement) {
+  const rect = containerElement?.getBoundingClientRect?.();
+  if (!rect) {
+    return dayStart;
+  }
+  const totalDayMinutes = (CALENDAR_WEEK_END_HOUR - CALENDAR_WEEK_START_HOUR) * 60;
+  const relativeY = clampCalendarValue(clientY - rect.top, 0, rect.height);
+  const rawMinutes = (relativeY / Math.max(rect.height, 1)) * totalDayMinutes;
+  const snappedMinutes = clampCalendarValue(
+    snapCalendarMinutes(rawMinutes, CALENDAR_WEEK_SLOT_MINUTES),
+    0,
+    totalDayMinutes
+  );
+  return dayStart.add(snappedMinutes, "minute").second(0).millisecond(0);
+}
+
+function getCalendarEventTimeRange(event = {}) {
+  const start = dayjs(event?.starts_at || event?.start || null);
+  const end = dayjs(event?.ends_at || event?.end || event?.starts_at || event?.start || null);
+  if (!start.isValid() || !end.isValid()) {
+    return null;
+  }
+  return { start, end: end.isAfter(start) ? end : start.add(30, "minute") };
+}
+
+function isCalendarMultiDayEvent(event = {}) {
+  const range = getCalendarEventTimeRange(event);
+  if (!range) {
+    return false;
+  }
+  const visibleEnd = range.end.subtract(1, "minute");
+  return !range.start.isSame(visibleEnd, "day");
+}
+
+function shouldRenderWeekAllDayBar(event = {}) {
+  return Boolean(event?.is_all_day) || isCalendarMultiDayEvent(event);
+}
+
+function buildWeekAllDayLayout(events = [], weekStart) {
+  const startOfWeek = dayjs(weekStart).startOf("day");
+  const endOfWeek = startOfWeek.add(6, "day").endOf("day");
+  const rows = [];
+  const items = (Array.isArray(events) ? events : [])
+    .filter((event) => shouldRenderWeekAllDayBar(event))
+    .map((event) => {
+      const range = getCalendarEventTimeRange(event);
+      if (!range) {
+        return null;
+      }
+      const visibleEnd = range.end.subtract(1, "minute");
+      const clippedStart = range.start.isBefore(startOfWeek) ? startOfWeek : range.start.startOf("day");
+      const clippedEnd = visibleEnd.isAfter(endOfWeek) ? endOfWeek.startOf("day") : visibleEnd.startOf("day");
+      if (clippedEnd.isBefore(startOfWeek) || clippedStart.isAfter(endOfWeek) || clippedEnd.isBefore(clippedStart)) {
+        return null;
+      }
+      return {
+        ...event,
+        startIndex: clampCalendarValue(clippedStart.diff(startOfWeek, "day"), 0, 6),
+        endIndex: clampCalendarValue(clippedEnd.diff(startOfWeek, "day"), 0, 6),
+        continuesBefore: range.start.isBefore(startOfWeek),
+        continuesAfter: visibleEnd.isAfter(endOfWeek)
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => {
+      if (a.startIndex !== b.startIndex) {
+        return a.startIndex - b.startIndex;
+      }
+      const spanDiff = (b.endIndex - b.startIndex) - (a.endIndex - a.startIndex);
+      if (spanDiff !== 0) {
+        return spanDiff;
+      }
+      return new Date(a.starts_at).getTime() - new Date(b.starts_at).getTime();
+    })
+    .map((event) => {
+      let rowIndex = rows.findIndex((lastEndIndex) => event.startIndex > lastEndIndex);
+      if (rowIndex === -1) {
+        rowIndex = rows.length;
+        rows.push(-1);
+      }
+      rows[rowIndex] = event.endIndex;
+      return {
+        ...event,
+        rowIndex,
+        spanDays: Math.max(1, event.endIndex - event.startIndex + 1)
+      };
+    });
+  return {
+    rowCount: Math.max(rows.length, 1),
+    items
+  };
+}
+
+function buildWeekAllDayOverflow(layout, visibleRows = CALENDAR_WEEK_ALLDAY_VISIBLE_ROWS) {
+  const overflowByDay = Array.from({ length: 7 }, (_, dayIndex) => ({
+    dayIndex,
+    count: 0
+  }));
+  for (const event of Array.isArray(layout?.items) ? layout.items : []) {
+    if (event.rowIndex < visibleRows) {
+      continue;
+    }
+    for (let dayIndex = event.startIndex; dayIndex <= event.endIndex; dayIndex += 1) {
+      if (overflowByDay[dayIndex]) {
+        overflowByDay[dayIndex].count += 1;
+      }
+    }
+  }
+  return overflowByDay.filter((item) => item.count > 0);
+}
+
+function getWeekAllDayOverflowEvents(layout, dayIndex, visibleRows = CALENDAR_WEEK_ALLDAY_VISIBLE_ROWS) {
+  return (Array.isArray(layout?.items) ? layout.items : [])
+    .filter((event) => event.rowIndex >= visibleRows && dayIndex >= event.startIndex && dayIndex <= event.endIndex)
+    .sort((a, b) => {
+      if (a.rowIndex !== b.rowIndex) {
+        return a.rowIndex - b.rowIndex;
+      }
+      return new Date(a.starts_at).getTime() - new Date(b.starts_at).getTime();
+    });
+}
+
+function buildWeekTimedEventColumns(events = []) {
+  const clusters = [];
+  let active = [];
+  let currentCluster = [];
+  let currentClusterEnd = null;
+  let currentClusterColumnCount = 0;
+
+  const finalizeCluster = () => {
+    if (!currentCluster.length) {
+      return;
+    }
+    const totalColumns = Math.max(1, currentClusterColumnCount);
+    const expandedCluster = currentCluster.map((item) => {
+      let spanColumns = 1;
+      for (let nextColumn = item.columnIndex + 1; nextColumn < totalColumns; nextColumn += 1) {
+        const hasBlockingEvent = currentCluster.some((other) => (
+          other.columnIndex === nextColumn
+          && other.rangeStart.isBefore(item.rangeEnd)
+          && item.rangeStart.isBefore(other.rangeEnd)
+        ));
+        if (hasBlockingEvent) {
+          break;
+        }
+        spanColumns += 1;
+      }
+      return {
+        ...item,
+        totalColumns,
+        spanColumns
+      };
+    });
+    clusters.push(...expandedCluster);
+    currentCluster = [];
+    currentClusterEnd = null;
+    currentClusterColumnCount = 0;
+  };
+
+  const sortedEvents = (Array.isArray(events) ? events : [])
+    .filter((event) => !shouldRenderWeekAllDayBar(event))
+    .sort((a, b) => {
+      const startDiff = new Date(a.starts_at).getTime() - new Date(b.starts_at).getTime();
+      if (startDiff !== 0) {
+        return startDiff;
+      }
+      return new Date(a.ends_at || a.starts_at).getTime() - new Date(b.ends_at || b.starts_at).getTime();
+    });
+
+  for (const event of sortedEvents) {
+    const range = getCalendarEventTimeRange(event);
+    if (!range) {
+      continue;
+    }
+    if (currentCluster.length && currentClusterEnd && !range.start.isBefore(currentClusterEnd)) {
+      finalizeCluster();
+      active = [];
+    }
+    active = active.filter((item) => item.end.isAfter(range.start));
+    const occupied = new Set(active.map((item) => item.columnIndex));
+    let columnIndex = 0;
+    while (occupied.has(columnIndex)) {
+      columnIndex += 1;
+    }
+    currentCluster.push({
+      ...event,
+      columnIndex,
+      rangeStart: range.start,
+      rangeEnd: range.end
+    });
+    active.push({ columnIndex, end: range.end });
+    currentClusterColumnCount = Math.max(currentClusterColumnCount, columnIndex + 1);
+    currentClusterEnd = currentClusterEnd && currentClusterEnd.isAfter(range.end) ? currentClusterEnd : range.end;
+  }
+
+  finalizeCluster();
+  return clusters;
+}
+
+function expandCalendarOccurrences(events = [], { from, to, maxOccurrences = 400 } = {}) {
+  const startBoundary = dayjs(from || dayjs().subtract(30, "day")).startOf("day");
+  const endBoundary = dayjs(to || dayjs().add(365, "day")).endOf("day");
+  const expanded = [];
+  const baseEvents = [];
+  const occurrenceExceptions = new Map();
+
+  for (const event of Array.isArray(events) ? events : []) {
+    const exceptionMode = normalizeCalendarExceptionMode(event);
+    const seriesEventId = Number(event?.series_master_id || 0) || null;
+    const occurrenceOriginalStart = dayjs(event?.occurrence_original_start || event?.starts_at || null);
+    if (seriesEventId && exceptionMode !== "none" && occurrenceOriginalStart.isValid()) {
+      occurrenceExceptions.set(`${seriesEventId}:${occurrenceOriginalStart.toISOString()}`, event);
+      continue;
+    }
+    baseEvents.push(event);
+  }
+
+  for (const event of baseEvents) {
+    const baseStart = dayjs(event?.starts_at || event?.start || null);
+    const baseEnd = dayjs(event?.ends_at || event?.end || event?.starts_at || event?.start || null);
+    if (!baseStart.isValid() || !baseEnd.isValid()) {
+      continue;
+    }
+    const pattern = String(event?.recurrence_pattern || "none").trim().toLowerCase();
+    const interval = Math.max(1, Number(event?.recurrence_interval || 1));
+    const recurrenceUntil = event?.recurrence_until ? dayjs(event.recurrence_until).endOf("day") : null;
+    const recurrenceCount = event?.recurrence_count ? Math.max(1, Number(event.recurrence_count)) : null;
+    const durationMinutes = Math.max(15, Math.max(1, baseEnd.diff(baseStart, "minute")));
+
+    const pushOccurrence = (occurrenceStart, occurrenceIndex) => {
+      const occurrenceEnd = occurrenceStart.add(durationMinutes, "minute");
+      if (occurrenceEnd.isBefore(startBoundary) || occurrenceStart.isAfter(endBoundary)) {
+        return;
+      }
+      const masterEventId = getCalendarSeriesEventId(event);
+      const occurrenceOriginalStart = occurrenceStart.toISOString();
+      const exceptionKey = `${masterEventId}:${occurrenceOriginalStart}`;
+      const occurrenceException = occurrenceExceptions.get(exceptionKey);
+      const exceptionMode = normalizeCalendarExceptionMode(occurrenceException);
+      if (exceptionMode === "skip") {
+        return;
+      }
+      if (exceptionMode === "detached") {
+        const detachedStart = dayjs(occurrenceException?.starts_at || occurrenceStart);
+        const detachedEnd = dayjs(occurrenceException?.ends_at || occurrenceEnd);
+        if (!detachedStart.isValid() || !detachedEnd.isValid()) {
+          return;
+        }
+        if (detachedEnd.isBefore(startBoundary) || detachedStart.isAfter(endBoundary)) {
+          return;
+        }
+        expanded.push(
+          buildCalendarOccurrence(
+            occurrenceException,
+            detachedStart,
+            detachedEnd,
+            occurrenceIndex,
+            {
+              master_event_id: masterEventId,
+              occurrence_original_start: occurrenceOriginalStart
+            }
+          )
+        );
+        return;
+      }
+      expanded.push(
+        buildCalendarOccurrence(
+          event,
+          occurrenceStart,
+          occurrenceEnd,
+          occurrenceIndex,
+          {
+            master_event_id: masterEventId,
+            occurrence_original_start: occurrenceOriginalStart
+          }
+        )
+      );
+    };
+
+    if (pattern === "none") {
+      pushOccurrence(baseStart, 0);
+      continue;
+    }
+
+    if (pattern === "daily") {
+      let occurrenceStart = baseStart;
+      let occurrenceIndex = 0;
+      while (occurrenceStart.isBefore(endBoundary.add(1, "day")) && occurrenceIndex < maxOccurrences) {
+        if ((!recurrenceUntil || !occurrenceStart.isAfter(recurrenceUntil)) && (!recurrenceCount || occurrenceIndex < recurrenceCount)) {
+          pushOccurrence(occurrenceStart, occurrenceIndex);
+        } else {
+          break;
+        }
+        occurrenceIndex += 1;
+        occurrenceStart = baseStart.add(occurrenceIndex * interval, "day");
+      }
+      continue;
+    }
+
+    if (pattern === "weekly") {
+      const days = getRecurrenceDaysList(event);
+      let cursor = startBoundary.startOf("week");
+      let occurrenceIndex = 0;
+      while (cursor.isBefore(endBoundary.add(1, "week")) && occurrenceIndex < maxOccurrences) {
+        for (const dayKey of days) {
+          const weekday = RECURRENCE_DAY_KEYS.indexOf(dayKey);
+          if (weekday < 0) {
+            continue;
+          }
+          const occurrenceStart = cursor.day(weekday).hour(baseStart.hour()).minute(baseStart.minute()).second(baseStart.second()).millisecond(baseStart.millisecond());
+          if (occurrenceStart.isBefore(baseStart)) {
+            continue;
+          }
+          const diffWeeks = occurrenceStart.startOf("week").diff(baseStart.startOf("week"), "week");
+          if (diffWeeks < 0 || diffWeeks % interval !== 0) {
+            continue;
+          }
+          if (recurrenceUntil && occurrenceStart.isAfter(recurrenceUntil)) {
+            continue;
+          }
+          if (recurrenceCount && occurrenceIndex >= recurrenceCount) {
+            break;
+          }
+          pushOccurrence(occurrenceStart, occurrenceIndex);
+          occurrenceIndex += 1;
+        }
+        if (recurrenceCount && occurrenceIndex >= recurrenceCount) {
+          break;
+        }
+        cursor = cursor.add(1, "week");
+      }
+      continue;
+    }
+
+    if (pattern === "monthly") {
+      let occurrenceIndex = 0;
+      while (occurrenceIndex < maxOccurrences) {
+        const occurrenceStart = baseStart.add(occurrenceIndex * interval, "month");
+        if (occurrenceStart.isAfter(endBoundary)) {
+          break;
+        }
+        if (recurrenceUntil && occurrenceStart.isAfter(recurrenceUntil)) {
+          break;
+        }
+        if (recurrenceCount && occurrenceIndex >= recurrenceCount) {
+          break;
+        }
+        pushOccurrence(occurrenceStart, occurrenceIndex);
+        occurrenceIndex += 1;
+      }
+      continue;
+    }
+
+    pushOccurrence(baseStart, 0);
+  }
+
+  return expanded.sort((a, b) => new Date(a.starts_at).getTime() - new Date(b.starts_at).getTime());
+}
+
+function playReminderSound() {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) {
+    return;
+  }
+  const context = new AudioContextClass();
+  const oscillator = context.createOscillator();
+  const gain = context.createGain();
+  oscillator.type = "sine";
+  oscillator.frequency.setValueAtTime(880, context.currentTime);
+  gain.gain.setValueAtTime(0.001, context.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.08, context.currentTime + 0.03);
+  gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.45);
+  oscillator.connect(gain);
+  gain.connect(context.destination);
+  oscillator.start();
+  oscillator.stop(context.currentTime + 0.5);
+  oscillator.onended = () => {
+    context.close().catch(() => {});
+  };
+}
 
 function getFolderDisplayName(fn) { return folderDisplayNames[fn] || fn; }
 function escapeRegExp(v) { return String(v).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+function escapeHtmlText(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
 
 function safeJsonParse(value, fallback = null) {
   try {
@@ -81,29 +626,131 @@ function parseOutgoingCatalogEntry(value = "", mode = "generic") {
   if (!raw) {
     return null;
   }
-  const [labelPart = "", secondPart = "", thirdPart = ""] = raw.split("|").map((item) => String(item || "").trim());
+  const parts = raw.split("|").map((item) => String(item || "").trim());
+  if (mode === "client" && parts.length >= 4) {
+    const [companyScope = "", labelPart = "", detailPart = "", codePart = ""] = parts;
+    const label = labelPart || raw;
+    return {
+      value: raw,
+      label,
+      detail: detailPart,
+      code: codePart || deriveOutgoingCode(label),
+      companyScope,
+      isScoped: Boolean(companyScope)
+    };
+  }
+  if (mode !== "client" && parts.length >= 4) {
+    const [companyScope = "", labelPart = "", codePart = "", detailPart = ""] = parts;
+    const label = labelPart || raw;
+    return {
+      value: raw,
+      label,
+      code: codePart || deriveOutgoingCode(label),
+      detail: detailPart,
+      companyScope,
+      isScoped: Boolean(companyScope)
+    };
+  }
+  const [labelPart = "", secondPart = "", thirdPart = ""] = parts;
   const label = labelPart || raw;
   if (mode === "client") {
     return {
       value: raw,
       label,
       detail: secondPart,
-      code: thirdPart || deriveOutgoingCode(label)
+      code: thirdPart || deriveOutgoingCode(label),
+      companyScope: "",
+      isScoped: false
     };
   }
   return {
     value: raw,
     label,
     code: secondPart || deriveOutgoingCode(label),
-    detail: thirdPart
+    detail: thirdPart,
+    companyScope: "",
+    isScoped: false
   };
 }
 
-function buildOutgoingCatalogOptions(values = [], mode = "generic") {
+function normalizeOutgoingScopeToken(value = "") {
+  return String(value || "").trim().replace(/\s+/g, " ").toUpperCase();
+}
+
+function buildOutgoingCompanyScopeCandidates(company = null) {
+  if (!company) {
+    return new Set();
+  }
+  return new Set(
+    [company.value, company.label, company.code]
+      .map((item) => normalizeOutgoingScopeToken(item))
+      .filter(Boolean)
+  );
+}
+
+function matchesOutgoingCompanyScope(scopeValue = "", company = null, allowUnscoped = true) {
+  const normalizedScope = normalizeOutgoingScopeToken(scopeValue);
+  if (!normalizedScope) {
+    return allowUnscoped;
+  }
+  if (!company) {
+    return false;
+  }
+  return buildOutgoingCompanyScopeCandidates(company).has(normalizedScope);
+}
+
+function buildOutgoingCatalogOptions(values = [], mode = "generic", company = null) {
   return normalizeSubjectCatalog(values)
     .map((item) => parseOutgoingCatalogEntry(item, mode))
+    .filter((item) => matchesOutgoingCompanyScope(item?.companyScope, company, true))
     .filter(Boolean);
 }
+
+function formatScopedOutgoingCatalogEntry(entry = {}, company = null, mode = "generic") {
+  if (!entry) {
+    return "";
+  }
+  if (!company) {
+    return String(entry.value || "").trim();
+  }
+  if (mode === "client") {
+    return [
+      company.label || "",
+      entry.label || "",
+      entry.detail || "",
+      entry.code || deriveOutgoingCode(entry.label || "")
+    ].map((item) => String(item || "").trim()).join("|");
+  }
+  return [
+    company.label || "",
+    entry.label || "",
+    entry.code || deriveOutgoingCode(entry.label || ""),
+    entry.detail || ""
+  ].map((item) => String(item || "").trim()).join("|");
+}
+
+const OUTGOING_CATALOG_REVIEW_CONFIG = {
+  clients: {
+    label: "Clients",
+    settingsKey: "outbound_subject_clients",
+    mode: "client"
+  },
+  quotations: {
+    label: "Quotations",
+    settingsKey: "outbound_subject_quotations",
+    mode: "generic"
+  },
+  studies: {
+    label: "Studies",
+    settingsKey: "outbound_subject_studies",
+    mode: "generic"
+  },
+  admin_subjects: {
+    label: "Admin Subjects",
+    settingsKey: "outbound_subject_admin_subjects",
+    mode: "generic"
+  }
+};
 
 const OUTGOING_GROUP_DEFINITIONS = {
   projects: { label: "Projects", code: "PRJ" },
@@ -120,23 +767,26 @@ function formatOutgoingLetterDate(value = "") {
   return normalized;
 }
 
-function buildOutgoingReferenceOptions(groupType = "", projects = [], quotations = [], studies = [], adminSubjects = []) {
+function buildOutgoingReferenceOptions(groupType = "", projects = [], quotations = [], studies = [], adminSubjects = [], company = null) {
   if (groupType === "projects") {
-    return (Array.isArray(projects) ? projects : []).map((item) => ({
-      value: String(item.id),
-      label: `[${item.project_code}] ${item.project_name}`,
-      code: deriveOutgoingCode(item.project_code || item.project_name || `PRJ-${item.id}`),
-      detail: item.project_name || ""
-    }));
+    return (Array.isArray(projects) ? projects : [])
+      .filter((item) => matchesOutgoingCompanyScope(item?.company_code || item?.company_name || "", company, true))
+      .map((item) => ({
+        value: String(item.id),
+        label: `[${item.project_code}] ${item.project_name}`,
+        code: deriveOutgoingCode(item.project_code || item.project_name || `PRJ-${item.id}`),
+        detail: item.project_name || "",
+        companyScope: item.company_code || item.company_name || ""
+      }));
   }
   if (groupType === "quotations") {
-    return buildOutgoingCatalogOptions(quotations, "generic");
+    return buildOutgoingCatalogOptions(quotations, "generic", company);
   }
   if (groupType === "studies") {
-    return buildOutgoingCatalogOptions(studies, "generic");
+    return buildOutgoingCatalogOptions(studies, "generic", company);
   }
   if (groupType === "admin_subjects") {
-    return buildOutgoingCatalogOptions(adminSubjects, "generic");
+    return buildOutgoingCatalogOptions(adminSubjects, "generic", company);
   }
   return [];
 }
@@ -161,12 +811,30 @@ function renderOutgoingBodyHtml(value = "") {
     .join("");
 }
 
-function buildOutgoingBrandingLines({ companyAddress = "", companyPhone = "", companyWebsite = "", companyEmail = "" } = {}) {
+function estimateOutgoingPageCount({ body = "", clientLabel = "", clientDetail = "", letterTitle = "" } = {}) {
+  const normalized = [
+    String(clientLabel || "").trim(),
+    String(clientDetail || "").trim(),
+    String(letterTitle || "").trim(),
+    String(body || "").trim()
+  ].filter(Boolean).join("\n");
+  const charBasedPages = Math.ceil((normalized.length || 1) / 1600);
+  const lineBasedPages = Math.ceil(((normalized.split(/\n/).length || 1) + 18) / 28);
+  return Math.max(1, charBasedPages, lineBasedPages);
+}
+
+function normalizeOutgoingTemplateLanguage(value = "") {
+  const normalized = String(value || "").trim().toLowerCase();
+  return normalized === "english" ? "english" : "arabic";
+}
+
+function buildOutgoingBrandingLines({ companyAddress = "", companyPhone = "", companyWebsite = "", companyEmail = "", templateLanguage = "arabic" } = {}) {
+  const isEnglish = normalizeOutgoingTemplateLanguage(templateLanguage) === "english";
   return [
-    companyAddress ? `العنوان\t${companyAddress}` : "",
-    companyPhone ? `الهاتف\t${companyPhone}` : "",
-    companyWebsite ? `الموقع\t${companyWebsite}` : "",
-    companyEmail ? `البريد الإلكتروني\t${companyEmail}` : ""
+    companyAddress ? `${isEnglish ? "Address" : "العنوان"}\t${companyAddress}` : "",
+    companyPhone ? `${isEnglish ? "Phone" : "الهاتف"}\t${companyPhone}` : "",
+    companyWebsite ? `${isEnglish ? "Website" : "الموقع"}\t${companyWebsite}` : "",
+    companyEmail ? `${isEnglish ? "Email" : "البريد الإلكتروني"}\t${companyEmail}` : ""
   ].filter(Boolean);
 }
 
@@ -188,32 +856,45 @@ function buildProfessionalOutgoingLetterPreview({
   companyAddress = "",
   companyPhone = "",
   companyWebsite = "",
-  companyEmail = ""
+  companyEmail = "",
+  templateLanguage = "arabic"
 } = {}) {
+  const normalizedLanguage = normalizeOutgoingTemplateLanguage(templateLanguage);
+  const isEnglish = normalizedLanguage === "english";
+  const pageCount = estimateOutgoingPageCount({ body, clientLabel, clientDetail, letterTitle });
   const lines = [
-    `إلى السيد / ${clientLabel || "........................................................"} المحترم.`,
+    "============================================================",
+    isEnglish ? "OFFICIAL CORRESPONDENCE" : "مراسلة رسمية",
+    "============================================================",
+    isEnglish
+      ? `To: ${clientLabel || "........................................................"}`
+      : `إلى السيد / ${clientLabel || "........................................................"} المحترم.`,
     clientDetail ? `(${clientDetail})` : "",
     `Subject No.\t${subjectNo || "________________"}\tDocument No.\t${documentNo || "________________"}`,
-    `Total pages including this one\t1\tSerial\t${internalSerial || "________________"}`,
+    `Total pages including this one\t${pageCount}\tSerial\t${internalSerial || "________________"}`,
     `Date\t${formatOutgoingLetterDate(subjectDate) || "________________"}\tAttachments\t${hasAttachments ? "Yes" : "No"}`,
     `Company\t${companyLabel || "________________"}\tGroup\t${groupLabel || "________________"}`,
     `Reference\t${referenceLabel || "________________"}\tType\t${letterTypeLabel}`,
-    "Confidential Message; meant for the party listed above only.",
-    "Please refer to Subject No. listed above in your response.",
+    isEnglish ? "Confidential Message; meant for the party listed above only." : "رسالة سرية ومخصصة للطرف المذكور أعلاه فقط.",
+    isEnglish ? "Please refer to Subject No. listed above in your response." : "يرجى الإشارة إلى رقم الموضوع أعلاه في الرد.",
     "",
-    `الموضوع : ${letterTitle || "........................................................"}`,
-    "تحية طيبة وبعد،،،،",
+    `${isEnglish ? "Subject" : "الموضوع"} : ${letterTitle || "........................................................"}`,
+    isEnglish ? "Dear Sir/Madam," : "تحية طيبة وبعد،،،،",
     "",
     String(body || "").trim(),
     "",
-    "وتفضلوا بقبول فائق الاحترام،،،",
+    isEnglish ? "Yours faithfully," : "وتفضلوا بقبول فائق الاحترام،،،",
     "",
     senderName || "المدير التنفيذي",
     "",
-    "أقر أنا ................................................................................................ بالموافقة على ما هو مبين اعلاه.",
-    "التوقيع:\t\tالتاريخ :",
+    isEnglish
+      ? "I, ................................................................................................, acknowledge approval of the above."
+      : "أقر أنا ................................................................................................ بالموافقة على ما هو مبين اعلاه.",
+    `${isEnglish ? "Signature" : "التوقيع"}:\t\t${isEnglish ? "Date" : "التاريخ"} :`,
+    `${isEnglish ? "Official Stamp" : "الختم الرسمي"}:\t________________________________________`,
     "",
-    ...buildOutgoingBrandingLines({ companyAddress, companyPhone, companyWebsite, companyEmail })
+    ...buildOutgoingBrandingLines({ companyAddress, companyPhone, companyWebsite, companyEmail, templateLanguage: normalizedLanguage }),
+    "============================================================"
   ];
 
   return lines.filter((line, index) => line || index === 1 || index === 10).join("\n");
@@ -238,28 +919,34 @@ function buildProfessionalOutgoingLetterPreviewHtml({
   companyWebsite = "",
   companyEmail = "",
   logoUrl = "",
-  brandName = ""
+  brandName = "",
+  signatureImageUrl = "",
+  stampImageUrl = "",
+  templateLanguage = "arabic"
 } = {}) {
+  const normalizedLanguage = normalizeOutgoingTemplateLanguage(templateLanguage);
+  const isEnglish = normalizedLanguage === "english";
+  const pageCount = estimateOutgoingPageCount({ body, clientLabel, clientDetail, letterTitle });
   const metadataRows = [
     [
-      { label: "Subject No.", value: subjectNo || "________________" },
-      { label: "Document No.", value: documentNo || "________________" }
+      { label: isEnglish ? "Subject No." : "رقم الموضوع", value: subjectNo || "________________" },
+      { label: isEnglish ? "Document No." : "رقم الكتاب", value: documentNo || "________________" }
     ],
     [
-      { label: "Total pages including this one", value: "1" },
-      { label: "Serial", value: internalSerial || "________________" }
+      { label: isEnglish ? "Total Pages" : "عدد الصفحات", value: String(pageCount) },
+      { label: isEnglish ? "Serial" : "التسلسل", value: internalSerial || "________________" }
     ],
     [
-      { label: "Date", value: formatOutgoingLetterDate(subjectDate) || "________________" },
-      { label: "Attachments", value: hasAttachments ? "Yes" : "No" }
+      { label: isEnglish ? "Date" : "التاريخ", value: formatOutgoingLetterDate(subjectDate) || "________________" },
+      { label: isEnglish ? "Attachments" : "المرفقات", value: hasAttachments ? "Yes" : "No" }
     ],
     [
-      { label: "Company", value: companyLabel || "________________" },
-      { label: "Group", value: groupLabel || "________________" }
+      { label: isEnglish ? "Company" : "الشركة", value: companyLabel || "________________" },
+      { label: isEnglish ? "Group" : "المجموعة", value: groupLabel || "________________" }
     ],
     [
-      { label: "Reference", value: referenceLabel || "________________" },
-      { label: "Type", value: "Letter" }
+      { label: isEnglish ? "Reference" : "المرجع", value: referenceLabel || "________________" },
+      { label: isEnglish ? "Type" : "النوع", value: "Letter" }
     ]
   ];
 
@@ -284,6 +971,12 @@ function buildProfessionalOutgoingLetterPreviewHtml({
   )).join("");
 
   const effectiveBrandName = brandName || companyLabel || "TECHNO Group";
+  const signatureBlock = signatureImageUrl
+    ? `<img src="${escapeOutgoingHtml(signatureImageUrl)}" alt="Signature" style="max-width:180px;max-height:72px;object-fit:contain;display:block;margin-top:14px;" />`
+    : "";
+  const stampBlock = stampImageUrl
+    ? `<img src="${escapeOutgoingHtml(stampImageUrl)}" alt="Official Stamp" style="width:126px;height:126px;object-fit:contain;display:block;margin:12px auto 10px;" />`
+    : `<div style="margin:18px auto 10px;width:126px;height:126px;border:2px dashed #c59b45;border-radius:50%;display:flex;align-items:center;justify-content:center;color:#8a6424;font-size:13px;font-weight:700;line-height:1.6;">Company Seal<br />&amp; Signature</div>`;
   const logoBlock = logoUrl
     ? `<img src="${escapeOutgoingHtml(logoUrl)}" alt="Company Logo" style="width:74px;height:74px;object-fit:contain;border-radius:14px;background:#ffffff;padding:8px;box-shadow:0 8px 22px rgba(15,23,42,0.14);" />`
     : `<div style="width:74px;height:74px;border-radius:18px;background:rgba(255,255,255,0.16);display:flex;align-items:center;justify-content:center;font-size:28px;font-weight:700;color:#ffffff;box-shadow:inset 0 0 0 1px rgba(255,255,255,0.18);">${escapeOutgoingHtml(effectiveBrandName.slice(0, 1).toUpperCase())}</div>`;
@@ -294,37 +987,52 @@ function buildProfessionalOutgoingLetterPreviewHtml({
         <div style="padding:20px 24px;background:linear-gradient(135deg,#0b2f5b 0%,#124b8a 55%,#1d6fc1 100%);color:#ffffff;">
           <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;">
             <div style="min-width:0;">
-              <div style="font-size:12px;letter-spacing:1.2px;text-transform:uppercase;opacity:0.9;">Official Correspondence</div>
+              <div style="font-size:12px;letter-spacing:1.2px;text-transform:uppercase;opacity:0.9;">${isEnglish ? "Official Correspondence" : "Arabic Official Correspondence"}</div>
               <div style="margin-top:6px;font-size:24px;font-weight:700;">${escapeOutgoingHtml(effectiveBrandName)}</div>
-              <div style="margin-top:4px;font-size:12px;opacity:0.88;">Confidential Message; meant for the party listed above only.</div>
+              <div style="margin-top:4px;font-size:12px;opacity:0.88;">${isEnglish ? "Confidential Message; meant for the party listed above only." : "رسالة سرية ومخصصة للطرف المذكور أعلاه فقط."}</div>
             </div>
             ${logoBlock}
           </div>
         </div>
+        <div style="height:8px;background:linear-gradient(90deg,#c59b45 0%,#f0d58a 48%,#c59b45 100%);"></div>
         <div style="padding:22px 24px 12px;background:#ffffff;">
-          <div style="direction:rtl;text-align:right;font-size:16px;font-weight:700;color:#111827;">إلى السيد / ${escapeOutgoingHtml(clientLabel || "........................................................")} المحترم.</div>
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:14px;padding-bottom:12px;border-bottom:2px solid #d7e2f1;">
+            <div style="font-size:12px;color:#475569;">Ref: <strong style="color:#0f2f57;">${escapeOutgoingHtml(documentNo || "Pending")}</strong></div>
+            <div style="font-size:12px;color:#475569;">Page <strong style="color:#0f2f57;">1</strong> of <strong style="color:#0f2f57;">${pageCount}</strong></div>
+          </div>
+          <div style="direction:${isEnglish ? "ltr" : "rtl"};text-align:${isEnglish ? "left" : "right"};font-size:16px;font-weight:700;color:#111827;">${isEnglish ? `To: ${escapeOutgoingHtml(clientLabel || "........................................................")}` : `إلى السيد / ${escapeOutgoingHtml(clientLabel || "........................................................")} المحترم.`}</div>
           ${clientDetail ? `<div style="direction:rtl;text-align:right;margin-top:6px;font-size:13px;color:#475569;">(${escapeOutgoingHtml(clientDetail)})</div>` : ""}
-          <table role="presentation" cellPadding="0" cellSpacing="0" style="width:100%;border-collapse:collapse;margin-top:18px;">
+          <table role="presentation" cellPadding="0" cellSpacing="0" style="width:100%;border-collapse:separate;border-spacing:0;margin-top:18px;border:1px solid #d8dee8;border-radius:12px;overflow:hidden;">
             ${metadataHtml}
           </table>
           <div style="margin-top:14px;padding:10px 12px;border:1px solid #dbe5f0;border-radius:10px;background:#f8fafc;font-size:12px;color:#475569;">
-            Please refer to Subject No. listed above in your response.
+            ${isEnglish ? "Please refer to Subject No. listed above in your response." : "يرجى الإشارة إلى رقم الموضوع أعلاه في الرد."}
           </div>
         </div>
         <div style="padding:0 24px 24px;background:linear-gradient(180deg,#ffffff 0%,#f8fbff 100%);">
-          <div style="direction:rtl;text-align:right;padding:18px 20px;border:1px solid #d8dee8;border-radius:12px;background:#fcfcfd;">
-            <div style="font-size:18px;font-weight:700;color:#0f172a;">الموضوع : ${escapeOutgoingHtml(letterTitle || "........................................................")}</div>
-            <div style="margin-top:18px;font-size:15px;font-weight:700;color:#111827;">تحية طيبة وبعد،،،،</div>
+          <div style="height:2px;background:linear-gradient(90deg,transparent 0%,#0f3c78 16%,#c59b45 50%,#0f3c78 84%,transparent 100%);margin-bottom:16px;"></div>
+          <div style="direction:${isEnglish ? "ltr" : "rtl"};text-align:${isEnglish ? "left" : "right"};padding:18px 20px;border:1px solid #d8dee8;border-radius:12px;background:#fcfcfd;">
+            <div style="font-size:18px;font-weight:700;color:#0f172a;">${isEnglish ? "Subject" : "الموضوع"} : ${escapeOutgoingHtml(letterTitle || "........................................................")}</div>
+            <div style="margin-top:18px;font-size:15px;font-weight:700;color:#111827;">${isEnglish ? "Dear Sir/Madam," : "تحية طيبة وبعد،،،،"}</div>
             <div style="margin-top:18px;font-size:14px;color:#1f2937;">
               ${renderOutgoingBodyHtml(body)}
             </div>
-            <div style="margin-top:24px;font-size:15px;font-weight:700;">وتفضلوا بقبول فائق الاحترام،،،</div>
+            <div style="margin-top:24px;font-size:15px;font-weight:700;">${isEnglish ? "Yours faithfully," : "وتفضلوا بقبول فائق الاحترام،،،"}</div>
             <div style="margin-top:18px;font-size:16px;font-weight:700;color:#0f3c78;">${escapeOutgoingHtml(senderName || "المدير التنفيذي")}</div>
+            ${signatureBlock}
           </div>
-          <div style="margin-top:16px;padding:16px 18px;border:1px dashed #c8d3df;border-radius:12px;background:#f8fafc;direction:rtl;text-align:right;">
-            <div style="font-size:14px;color:#0f172a;">أقر أنا ................................................................................................ بالموافقة على ما هو مبين اعلاه.</div>
-            <div style="margin-top:18px;font-size:13px;color:#334155;">التوقيع: <span style="display:inline-block;min-width:160px;border-bottom:1px solid #94a3b8;">&nbsp;</span> التاريخ : <span style="display:inline-block;min-width:120px;border-bottom:1px solid #94a3b8;">&nbsp;</span></div>
+          <div style="margin-top:16px;display:grid;grid-template-columns:minmax(0,1.2fr) minmax(220px,0.8fr);gap:14px;">
+            <div style="padding:16px 18px;border:1px dashed #c8d3df;border-radius:12px;background:#f8fafc;direction:${isEnglish ? "ltr" : "rtl"};text-align:${isEnglish ? "left" : "right"};">
+              <div style="font-size:14px;color:#0f172a;">${isEnglish ? "I, ................................................................................................, acknowledge approval of the above." : "أقر أنا ................................................................................................ بالموافقة على ما هو مبين اعلاه."}</div>
+              <div style="margin-top:18px;font-size:13px;color:#334155;">${isEnglish ? "Signature" : "التوقيع"}: <span style="display:inline-block;min-width:160px;border-bottom:1px solid #94a3b8;">&nbsp;</span> ${isEnglish ? "Date" : "التاريخ"} : <span style="display:inline-block;min-width:120px;border-bottom:1px solid #94a3b8;">&nbsp;</span></div>
+            </div>
+            <div style="padding:16px;border:1px dashed #c8a96a;border-radius:12px;background:linear-gradient(180deg,#fffdf7 0%,#fff8e7 100%);text-align:center;">
+              <div style="font-size:12px;font-weight:700;letter-spacing:1px;color:#8a6424;text-transform:uppercase;">${isEnglish ? "Official Stamp" : "الختم الرسمي"}</div>
+              ${stampBlock}
+              <div style="font-size:12px;color:#7c5a1d;">${isEnglish ? "Authorized validation area" : "منطقة الختم والتوثيق الرسمي"}</div>
+            </div>
           </div>
+          <div style="height:2px;background:linear-gradient(90deg,transparent 0%,#0f3c78 16%,#c59b45 50%,#0f3c78 84%,transparent 100%);margin:18px 0 0;"></div>
           <div style="margin-top:18px;padding:16px 18px;border-radius:12px;background:#0f2f57;color:#e5eefb;text-align:center;">
             <div style="font-size:12px;font-weight:700;letter-spacing:1px;text-transform:uppercase;">Corporate Footer</div>
             <div style="margin-top:10px;font-size:14px;font-weight:700;color:#ffffff;">${escapeOutgoingHtml(effectiveBrandName)}</div>
@@ -351,18 +1059,22 @@ function computeProfessionalOutgoingState(form = {}, options = {}) {
     companyPhone = "",
     companyWebsite = "",
     companyEmail = "",
-    companyName = ""
+    companyName = "",
+    signatureImageUrl = "",
+    stampImageUrl = "",
+    templateLanguage = "arabic"
   } = options;
   const companyOptions = buildOutgoingCatalogOptions(companies, "generic");
-  const clientOptions = buildOutgoingCatalogOptions(clients, "client");
+  const company = companyOptions.find((item) => item.value === form.outbound_company) || null;
+  const clientOptions = buildOutgoingCatalogOptions(clients, "client", company);
   const referenceOptions = buildOutgoingReferenceOptions(
     form.outbound_group_type,
     projects,
     quotations,
     studies,
-    adminSubjects
+    adminSubjects,
+    company
   );
-  const company = companyOptions.find((item) => item.value === form.outbound_company) || null;
   const client = clientOptions.find((item) => item.value === form.outbound_client) || null;
   const groupDefinition = OUTGOING_GROUP_DEFINITIONS[form.outbound_group_type] || null;
   const reference = referenceOptions.find((item) => item.value === String(form.outbound_reference_value || "")) || null;
@@ -370,6 +1082,7 @@ function computeProfessionalOutgoingState(form = {}, options = {}) {
   const internalSerial = normalizeSubjectSerial(form.outbound_internal_serial);
   const subjectDate = normalizeStructuredDate(form.outbound_subject_date);
   const letterTitle = String(form.outbound_letter_title || "").trim();
+  const normalizedLanguage = normalizeOutgoingTemplateLanguage(form.outbound_template_language || templateLanguage);
   const missing = [];
 
   if (!company) missing.push("الشركة");
@@ -406,7 +1119,8 @@ function computeProfessionalOutgoingState(form = {}, options = {}) {
     companyAddress,
     companyPhone,
     companyWebsite,
-    companyEmail
+    companyEmail,
+    templateLanguage: normalizedLanguage
   });
   const previewHtml = buildProfessionalOutgoingLetterPreviewHtml({
     companyLabel: company?.label || "",
@@ -427,7 +1141,10 @@ function computeProfessionalOutgoingState(form = {}, options = {}) {
     companyPhone,
     companyWebsite,
     companyEmail,
-    brandName: companyName
+    brandName: companyName,
+    signatureImageUrl,
+    stampImageUrl,
+    templateLanguage: normalizedLanguage
   });
 
   return {
@@ -438,6 +1155,7 @@ function computeProfessionalOutgoingState(form = {}, options = {}) {
     emailSubject,
     preview,
     previewHtml,
+    templateLanguage: normalizedLanguage,
     company,
     client,
     groupDefinition,
@@ -1181,10 +1899,12 @@ function App() {
   });
   const [composeProjectForm, setComposeProjectForm] = useState({
     project_code: "",
-    project_name: ""
+    project_name: "",
+    company_value: ""
   });
   const [selectedEmailId, setSelectedEmailId] = useState(null);
   const [selectedEmailIds, setSelectedEmailIds] = useState([]);
+  const [emailContextMenu, setEmailContextMenu] = useState({ visible: false, x: 0, y: 0, emailId: null, submenu: null });
   const [searchQuery, setSearchQuery] = useState("");
   const [searchScope, setSearchScope] = useState("Current");
   const [activeFilter, setActiveFilter] = useState("All");
@@ -1204,6 +1924,10 @@ function App() {
   const [isSavingSettings, setIsSavingSettings] = useState(false);
   const [isTestingSettings, setIsTestingSettings] = useState(false);
   const [isApplyingSettings, setIsApplyingSettings] = useState(false);
+  const [isRunningCatalogCompanyBackfill, setIsRunningCatalogCompanyBackfill] = useState(false);
+  const [catalogCompanyBackfillSummary, setCatalogCompanyBackfillSummary] = useState(null);
+  const [catalogReviewSelections, setCatalogReviewSelections] = useState({});
+  const [isApplyingAllCatalogSuggestions, setIsApplyingAllCatalogSuggestions] = useState(false);
   const [isRunningCycle, setIsRunningCycle] = useState(false);
   const [isRunningFullMailSync, setIsRunningFullMailSync] = useState(false);
   const [isRunningAdminMailTests, setIsRunningAdminMailTests] = useState(false);
@@ -1235,9 +1959,9 @@ function App() {
     subject_key: "", approval_source_email_id: "", reply_source_email_id: "", reply_mode: "",
     project_id: "",
     outbound_company: "", outbound_group_type: "projects", outbound_reference_value: "",
-    outbound_client: "", outbound_letter_type: "Letter", outbound_letter_title: "",
+    outbound_client: "", outbound_letter_type: "Letter", outbound_template_language: "arabic", outbound_letter_title: "",
     outbound_document_serial: "", outbound_internal_serial: "",
-    outbound_subject_date: dayjs().format("YYYY-MM-DD"),
+    outbound_subject_date: getJordanNowDateKey(),
     manager_comments: "", ai_recommendations: "", draft_context_project_code: "",
     draft_context_project_name: "", draft_context_history_count: "", draft_context_references: "",
     draft_context_memory_count: "", draft_context_memory_references: "",
@@ -1249,7 +1973,7 @@ function App() {
   const [moveTarget, setMoveTarget] = useState("Deleted");
   const [bulkMoveTarget, setBulkMoveTarget] = useState("Deleted");
   const [settingsForm, setSettingsForm] = useState({
-    company_name: "TECHNO GROUP", logo_url: "/logo.gif", company_address: "", company_phone: "", company_website: "", display_name: "M. Safadi",
+    company_name: "TECHNO GROUP", logo_url: "/logo.gif", signature_image_url: "", stamp_image_url: "", company_address: "Business Park, Amman, Jordan", company_phone: "+962 6 000 0000", company_website: "https://www.example.com", display_name: "M. Safadi",
     email_address: defaultAdminEmail, account_type: "POP3",
     incoming_server: "pop.emailarray.com", incoming_port: 995, incoming_ssl: true,
     outgoing_server: "smtp.emailarray.com", outgoing_port: 465, outgoing_encryption: "SSL/TLS",
@@ -1267,8 +1991,26 @@ function App() {
   const [settingsTab, setSettingsTab] = useState("account");
 
   // Calendar state
-  const [calDate, setCalDate] = useState(() => dayjs());
+  const [calDate, setCalDate] = useState(() => dayjs(getJordanNowDateTimeInput()));
   const [calView, setCalView] = useState("month"); // month | week | day
+  const [selectedCalendarEventId, setSelectedCalendarEventId] = useState(null);
+  const [selectedCalendarOccurrenceKey, setSelectedCalendarOccurrenceKey] = useState("");
+  const [calendarEditor, setCalendarEditor] = useState({
+    open: false,
+    mode: "create",
+    eventId: null,
+    seriesEventId: null,
+    scope: "series",
+    occurrenceStart: "",
+    canEditOccurrence: false,
+    form: createDefaultCalendarForm(dayjs(getJordanNowDateTimeInput()))
+  });
+  const [isSavingCalendarEvent, setIsSavingCalendarEvent] = useState(false);
+  const [isDeletingCalendarEvent, setIsDeletingCalendarEvent] = useState(false);
+  const [calendarContextMenu, setCalendarContextMenu] = useState({ visible: false, x: 0, y: 0, dateKey: "", eventId: null, occurrenceKey: "", submenu: null });
+  const [calendarDragState, setCalendarDragState] = useState(null);
+  const [calendarResizeState, setCalendarResizeState] = useState(null);
+  const [weekAllDayPopover, setWeekAllDayPopover] = useState({ visible: false, dayIndex: null, x: 0, y: 0 });
 
   // Undo Send
   const [undoState, setUndoState] = useState(null); // { email, timer }
@@ -1322,6 +2064,7 @@ function App() {
   const [archiveBackfillDetailsSearch, setArchiveBackfillDetailsSearch] = useState("");
   const [archiveBackfillDetailsFailedOnly, setArchiveBackfillDetailsFailedOnly] = useState(false);
   const [analytics, setAnalytics] = useState(null);
+  const [calendarAnalytics, setCalendarAnalytics] = useState(null);
   const [isSavingEmployee, setIsSavingEmployee] = useState(false);
   const [isLoadingTrail, setIsLoadingTrail] = useState(false);
   const [isLoadingArchiveExplorer, setIsLoadingArchiveExplorer] = useState(false);
@@ -1349,6 +2092,10 @@ function App() {
   const toInputRef = useRef(null);
   const ccInputRef = useRef(null);
   const bccInputRef = useRef(null);
+  const emailContextMenuRef = useRef(null);
+  const calendarContextMenuRef = useRef(null);
+  const weekAllDayPopoverRef = useRef(null);
+  const reminderNotificationKeysRef = useRef(new Set());
   const readingHtmlFrameRef = useRef(null);
   const readingHtmlFrameCleanupRef = useRef(null);
   const readingHtmlFrameHeightRef = useRef(640);
@@ -1378,20 +2125,34 @@ function App() {
   const outboundSubjectClients = useMemo(() => normalizeSubjectCatalog(settingsForm.outbound_subject_clients), [settingsForm.outbound_subject_clients]);
   const outboundSubjectStudies = useMemo(() => normalizeSubjectCatalog(settingsForm.outbound_subject_studies), [settingsForm.outbound_subject_studies]);
   const outboundSubjectAdminSubjects = useMemo(() => normalizeSubjectCatalog(settingsForm.outbound_subject_admin_subjects), [settingsForm.outbound_subject_admin_subjects]);
+  const outboundCompanyOptions = useMemo(
+    () => buildOutgoingCatalogOptions(outboundSubjectCompanies, "generic"),
+    [outboundSubjectCompanies]
+  );
+  const selectedOutboundCompany = useMemo(
+    () => outboundCompanyOptions.find((item) => item.value === form.outbound_company) || null,
+    [outboundCompanyOptions, form.outbound_company]
+  );
+  const outboundClientOptions = useMemo(
+    () => buildOutgoingCatalogOptions(outboundSubjectClients, "client", selectedOutboundCompany),
+    [outboundSubjectClients, selectedOutboundCompany]
+  );
   const outgoingReferenceOptions = useMemo(
     () => buildOutgoingReferenceOptions(
       form.outbound_group_type,
       projects,
       outboundSubjectQuotations,
       outboundSubjectStudies,
-      outboundSubjectAdminSubjects
+      outboundSubjectAdminSubjects,
+      selectedOutboundCompany
     ),
     [
       form.outbound_group_type,
       projects,
       outboundSubjectQuotations,
       outboundSubjectStudies,
-      outboundSubjectAdminSubjects
+      outboundSubjectAdminSubjects,
+      selectedOutboundCompany
     ]
   );
   const professionalOutgoingState = useMemo(
@@ -1405,11 +2166,14 @@ function App() {
       senderName: form.sender_name || currentUser?.name || "",
       hasAttachments: files.length > 0,
       logoUrl: settingsForm.logo_url || "",
+      signatureImageUrl: settingsForm.signature_image_url || "",
+      stampImageUrl: settingsForm.stamp_image_url || "",
       companyAddress: settingsForm.company_address || "",
       companyPhone: settingsForm.company_phone || "",
       companyWebsite: settingsForm.company_website || "",
       companyEmail: settingsForm.email_address || "",
-      companyName: settingsForm.company_name || ""
+      companyName: settingsForm.company_name || "",
+      templateLanguage: form.outbound_template_language || "arabic"
     }),
     [
       form,
@@ -1422,13 +2186,77 @@ function App() {
       currentUser?.name,
       files.length,
       settingsForm.logo_url,
+      settingsForm.signature_image_url,
+      settingsForm.stamp_image_url,
       settingsForm.company_address,
       settingsForm.company_phone,
       settingsForm.company_website,
       settingsForm.email_address,
-      settingsForm.company_name
+      settingsForm.company_name,
+      form.outbound_template_language
     ]
   );
+  useEffect(() => {
+    const nextSelections = {};
+    for (const [sectionKey, config] of Object.entries(OUTGOING_CATALOG_REVIEW_CONFIG)) {
+      const section = catalogCompanyBackfillSummary?.[sectionKey];
+      const reviewItems = [
+        ...(Array.isArray(section?.ambiguous_entries) ? section.ambiguous_entries : []),
+        ...(Array.isArray(section?.unmatched_entries) ? section.unmatched_entries : [])
+      ];
+      for (const item of reviewItems) {
+        const reviewKey = `${sectionKey}::${String(item?.value || "").trim()}`;
+        const suggestedCandidate = Array.isArray(item?.candidates) && item.candidates.length
+          ? item.candidates[0]
+          : null;
+        const suggestedCompany = suggestedCandidate
+          ? outboundCompanyOptions.find((option) => (
+            normalizeOutgoingScopeToken(option.code) === normalizeOutgoingScopeToken(suggestedCandidate.company_code)
+            || normalizeOutgoingScopeToken(option.label) === normalizeOutgoingScopeToken(suggestedCandidate.company_name)
+          )) || null
+          : null;
+        nextSelections[reviewKey] = suggestedCompany?.value || "";
+      }
+    }
+    setCatalogReviewSelections(nextSelections);
+  }, [catalogCompanyBackfillSummary, outboundCompanyOptions]);
+  useEffect(() => {
+    setForm((prev) => {
+      const validCompanyValues = new Set(outboundCompanyOptions.map((item) => item.value));
+      const validClientValues = new Set(outboundClientOptions.map((item) => item.value));
+      const validReferenceValues = new Set(outgoingReferenceOptions.map((item) => String(item.value)));
+      let changed = false;
+      const next = { ...prev };
+
+      if (next.outbound_company && !validCompanyValues.has(next.outbound_company)) {
+        next.outbound_company = "";
+        next.outbound_client = "";
+        next.outbound_reference_value = "";
+        next.project_id = "";
+        changed = true;
+      }
+      if (next.outbound_client && !validClientValues.has(next.outbound_client)) {
+        next.outbound_client = "";
+        changed = true;
+      }
+      if (next.outbound_reference_value && !validReferenceValues.has(String(next.outbound_reference_value))) {
+        next.outbound_reference_value = "";
+        if (next.outbound_group_type === "projects") {
+          next.project_id = "";
+        }
+        changed = true;
+      }
+      if (
+        next.outbound_group_type === "projects"
+        && next.outbound_reference_value
+        && String(next.project_id || "") !== String(next.outbound_reference_value)
+      ) {
+        next.project_id = next.outbound_reference_value;
+        changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [outboundCompanyOptions, outboundClientOptions, outgoingReferenceOptions]);
 
   function createDefaultComposeForm(overrides = {}) {
     return {
@@ -1445,10 +2273,11 @@ function App() {
       outbound_reference_value: "",
       outbound_client: "",
       outbound_letter_type: "Letter",
+      outbound_template_language: "arabic",
       outbound_letter_title: "",
       outbound_document_serial: "",
       outbound_internal_serial: "",
-      outbound_subject_date: dayjs().format("YYYY-MM-DD"),
+      outbound_subject_date: getJordanNowDateKey(),
       approval_source_email_id: "",
       reply_source_email_id: "",
       reply_mode: "",
@@ -1923,6 +2752,7 @@ function App() {
   }
 
   function onEmailClick(email) {
+    setEmailContextMenu((prev) => (prev.visible ? { visible: false, x: 0, y: 0, emailId: null, submenu: null } : prev));
     setSelectedEmailId(email.id);
     if (!email.is_read) {
       apiFetch("/api/emails/read-state", { method: "PATCH", body: { email_ids: [email.id], is_read: true } }).then(() => {
@@ -1948,6 +2778,310 @@ function App() {
     setSuccessMessage(newReadState ? "Marked as read." : "Marked as unread."); setError("");
   }
 
+  function closeEmailContextMenu() {
+    setEmailContextMenu((prev) => (
+      prev.visible || prev.emailId || prev.submenu
+        ? { visible: false, x: 0, y: 0, emailId: null, submenu: null }
+        : prev
+    ));
+  }
+
+  function openEmailContextMenu(event, email) {
+    event.preventDefault();
+    event.stopPropagation();
+    const estimatedWidth = 250;
+    const estimatedHeight = 340;
+    const x = Math.max(8, Math.min(event.clientX, window.innerWidth - estimatedWidth - 8));
+    const y = Math.max(8, Math.min(event.clientY, window.innerHeight - estimatedHeight - 8));
+    setSelectedEmailId(email.id);
+    setEmailContextMenu({ visible: true, x, y, emailId: email.id, submenu: null });
+  }
+
+  async function handleContextReadState(email, isRead) {
+    if (!email?.id) return;
+    closeEmailContextMenu();
+    setError("");
+    setSuccessMessage("");
+    try {
+      await apiFetch("/api/emails/read-state", { method: "PATCH", body: { email_ids: [email.id], is_read: isRead } });
+      await loadBootstrap();
+      setSelectedEmailId(email.id);
+      setSuccessMessage(isRead ? "Email marked as read." : "Email marked as unread.");
+    } catch (e) {
+      setError(e.message);
+    }
+  }
+
+  async function moveSingleEmailToFolder(email, folderName, successText = "") {
+    if (!email?.id || !folderName) return;
+    closeEmailContextMenu();
+    setIsMovingEmail(true);
+    setError("");
+    setSuccessMessage("");
+    try {
+      const response = await apiFetch(`/api/emails/${email.id}/move`, { method: "PUT", body: { folder_name: folderName } });
+      await loadBootstrap();
+      setSelectedFolder(response?.email?.folder_name || folderName);
+      setSelectedEmailId(response?.email?.id || email.id);
+      setSuccessMessage(successText || `Email moved to ${folderName}.`);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setIsMovingEmail(false);
+    }
+  }
+
+  async function updateEmailContextMeta(emailId, payload, successText = "Message updated.") {
+    if (!emailId) return;
+    setError("");
+    setSuccessMessage("");
+    try {
+      const response = await apiFetch(`/api/emails/${emailId}/context-meta`, { method: "PATCH", body: payload });
+      const updatedEmail = response?.email || null;
+      if (updatedEmail?.id) {
+        setData((prev) => ({
+          ...prev,
+          emails: prev.emails.map((item) => (item.id === updatedEmail.id ? { ...item, ...updatedEmail } : item))
+        }));
+      } else {
+        await loadBootstrap();
+      }
+      setSelectedEmailId(emailId);
+      setSuccessMessage(successText);
+    } catch (e) {
+      setError(e.message);
+      setSuccessMessage("");
+    }
+  }
+
+  function getContextMenuCategoryColor(categoryValue = "") {
+    return OUTLOOK_CONTEXT_CATEGORIES.find((item) => item.value === categoryValue)?.color || "#64748b";
+  }
+
+  function buildEmailPrintDocument(email) {
+    const metadata = [
+      ["From", email.sender_name || email.sender_email || "-"],
+      ["To", email.recipient_email || "-"],
+      ["Date", formatJordanTimeValue(email.sent_at || email.received_at, { month: "2-digit", day: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" })],
+      ["Category", email.user_category || "-"],
+      ["Follow Up", email.follow_up_status ? `${email.follow_up_status}${email.follow_up_due_at ? ` - ${formatJordanTimeValue(email.follow_up_due_at, { month: "2-digit", day: "2-digit", year: "numeric" })}` : ""}` : "-"]
+    ];
+    const metaHtml = metadata.map(([label, value]) => `
+      <div style="display:grid;grid-template-columns:88px 1fr;gap:10px;padding:5px 0;border-bottom:1px solid #eef2f7;">
+        <strong style="color:#475569;">${escapeHtmlText(label)}</strong>
+        <span>${escapeHtmlText(value)}</span>
+      </div>
+    `).join("");
+    const bodyHtml = email.body_html
+      ? sanitizeEmailHtml(email.body_html)
+      : `<pre style="white-space:pre-wrap;font-family:'Segoe UI',Arial,sans-serif;margin:0;">${escapeHtmlText(email.body || email.preview || "")}</pre>`;
+    return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>${escapeHtmlText(email.subject || "Email Print")}</title>
+  </head>
+  <body style="font-family:'Segoe UI',Arial,sans-serif;color:#0f172a;padding:26px 30px;">
+    <h1 style="font-size:24px;margin:0 0 8px;">${escapeHtmlText(email.subject || "(No subject)")}</h1>
+    <div style="font-size:12px;color:#64748b;margin-bottom:18px;">Printed from EmailArray Outlook</div>
+    <div style="border:1px solid #dbe2ea;border-radius:10px;padding:14px 16px;margin-bottom:20px;background:#f8fafc;">${metaHtml}</div>
+    <div>${bodyHtml}</div>
+  </body>
+</html>`;
+  }
+
+  function handleQuickPrint(email) {
+    if (!email) return;
+    closeEmailContextMenu();
+    const popup = window.open("", "_blank", "width=980,height=760,noopener,noreferrer");
+    if (!popup) {
+      setError("Unable to open print window.");
+      setSuccessMessage("");
+      return;
+    }
+    popup.document.open();
+    popup.document.write(buildEmailPrintDocument(email));
+    popup.document.close();
+    popup.focus();
+    setTimeout(() => {
+      popup.print();
+    }, 150);
+  }
+
+  function buildOneNotePayload(email) {
+    return [
+      `Subject: ${email.subject || "(No subject)"}`,
+      `From: ${email.sender_name || "-"} <${email.sender_email || "-"}>`,
+      `To: ${email.recipient_email || "-"}`,
+      `Date: ${formatJordanTimeValue(email.sent_at || email.received_at, { month: "2-digit", day: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" })}`,
+      email.user_category ? `Category: ${email.user_category}` : "",
+      email.follow_up_status ? `Follow Up: ${email.follow_up_status}${email.follow_up_due_at ? ` (${formatJordanTimeValue(email.follow_up_due_at, { month: "2-digit", day: "2-digit", year: "numeric" })})` : ""}` : "",
+      "",
+      email.body || email.preview || ""
+    ].filter(Boolean).join("\n");
+  }
+
+  function openSendToOneNoteDialog(email) {
+    if (!email) return;
+    closeEmailContextMenu();
+    const notePayload = buildOneNotePayload(email);
+    setDialog({
+      title: "Send to OneNote",
+      body: (
+        <div style={{ display: "grid", gap: 10 }}>
+          <div style={{ fontSize: 12, color: "#555" }}>
+            Creates a clean note package from this message. You can copy it directly or open OneNote Web.
+          </div>
+          <textarea readOnly rows={12} value={notePayload} style={{ width: "100%", resize: "vertical", fontSize: 12, lineHeight: 1.5 }} />
+        </div>
+      ),
+      actions: [
+        { label: "Close", onClick: () => setDialog(null), style: "secondary" },
+        { label: "Copy Note", onClick: async () => { await copyTextToClipboard(notePayload, "OneNote payload copied."); setDialog(null); }, style: "primary" },
+        { label: "Open OneNote Web", onClick: () => { window.open("https://www.onenote.com/notebooks", "_blank", "noopener,noreferrer"); setDialog(null); }, style: "secondary" }
+      ]
+    });
+  }
+
+  async function applyRuleAction(email, action) {
+    if (!email?.sender_email) return;
+    closeEmailContextMenu();
+    const senderEmail = String(email.sender_email || "").trim().toLowerCase();
+    const matchingIds = data.emails
+      .filter((item) => String(item.sender_email || "").trim().toLowerCase() === senderEmail)
+      .map((item) => item.id);
+    if (!matchingIds.length) {
+      setError("No matching emails were found for this sender.");
+      setSuccessMessage("");
+      return;
+    }
+    try {
+      if (action === "search_sender") {
+        setSearchScope("All");
+        setSearchQuery(email.sender_email || "");
+        setShowAdvancedSearch(true);
+        setSuccessMessage(`Search filtered by ${email.sender_email || "sender"}.`);
+        setError("");
+        return;
+      }
+      if (action === "mark_sender_read") {
+        await apiFetch("/api/emails/read-state", { method: "PATCH", body: { email_ids: matchingIds, is_read: true } });
+        await loadBootstrap();
+        setSuccessMessage(`Marked ${matchingIds.length} email(s) from this sender as read.`);
+        setError("");
+        return;
+      }
+      const folderName = action === "move_sender_archive"
+        ? "Archive"
+        : action === "move_sender_junk"
+          ? "Junk"
+          : "Deleted";
+      await apiFetch("/api/emails/bulk/move", { method: "PUT", body: { email_ids: matchingIds, folder_name: folderName } });
+      await loadBootstrap();
+      setSelectedFolder(folderName);
+      setSuccessMessage(`Moved ${matchingIds.length} email(s) from this sender to ${folderName}.`);
+      setError("");
+    } catch (e) {
+      setError(e.message);
+      setSuccessMessage("");
+    }
+  }
+
+  async function handleQuickStep(email, action) {
+    if (!email?.id) return;
+    closeEmailContextMenu();
+    try {
+      if (action === "reply_archive") {
+        prepareReplyDraft("reply");
+        await moveSingleEmailToFolder(email, "Archive", "Reply draft opened and original email archived.");
+        return;
+      }
+      if (action === "archive_read") {
+        await apiFetch("/api/emails/read-state", { method: "PATCH", body: { email_ids: [email.id], is_read: true } });
+        await moveSingleEmailToFolder(email, "Archive", "Email marked as read and archived.");
+        return;
+      }
+      if (action === "flag_tomorrow") {
+        await updateEmailContextMeta(
+          email.id,
+          {
+            user_category: email.user_category || "",
+            follow_up_status: "Tomorrow",
+            follow_up_due_at: dayjs(getJordanNowDateTimeInput()).add(1, "day").endOf("day").toISOString(),
+            follow_up_note: email.follow_up_note || ""
+          },
+          "Quick Step applied: Flag for tomorrow."
+        );
+        return;
+      }
+      if (action === "copy_sender_subject") {
+        await copyTextToClipboard(
+          `${email.subject || "(No subject)"}\n${email.sender_name || "-"} <${email.sender_email || "-"}>`,
+          "Sender and subject copied."
+        );
+      }
+    } catch (e) {
+      setError(e.message || "Unable to apply quick step.");
+      setSuccessMessage("");
+    }
+  }
+
+  async function handleFindRelated(email, mode) {
+    if (!email?.id) return;
+    closeEmailContextMenu();
+    if (mode === "serial_thread") {
+      if (!email.serial) {
+        setError("This email has no serial to search by.");
+        setSuccessMessage("");
+        return;
+      }
+      setCurrentView("archive");
+      setArchiveSearch(email.serial);
+      setArchiveResults([]);
+      await loadArchiveThread(email.serial);
+      setSuccessMessage(`Opened related thread for ${email.serial}.`);
+      setError("");
+      return;
+    }
+    if (mode === "serial_search") {
+      if (!email.serial) {
+        setError("This email has no serial to search by.");
+        setSuccessMessage("");
+        return;
+      }
+      setCurrentView("archive");
+      setArchiveThread(null);
+      setArchiveSearch(email.serial);
+      await searchArchive(email.serial);
+      setSuccessMessage(`Archive search opened for ${email.serial}.`);
+      setError("");
+      return;
+    }
+    if (mode === "sender_search") {
+      setCurrentView("mail");
+      setSearchScope("All");
+      setSearchQuery(email.sender_email || "");
+      setShowAdvancedSearch(true);
+      setSuccessMessage(`Showing related mail from ${email.sender_email || "sender"}.`);
+      setError("");
+      return;
+    }
+    if (mode === "project_search") {
+      const projectTerm = email.project_code || email.project_name || email.subject_key || "";
+      if (!projectTerm) {
+        setError("No project reference found for this message.");
+        setSuccessMessage("");
+        return;
+      }
+      setCurrentView("mail");
+      setSearchScope("All");
+      setSearchQuery(projectTerm);
+      setShowAdvancedSearch(true);
+      setSuccessMessage(`Showing related mail for ${projectTerm}.`);
+      setError("");
+    }
+  }
+
   function handleRibbonTabChange(tab) {
     setActiveRibbonTab(tab);
     setCurrentView("mail");
@@ -1957,13 +3091,27 @@ function App() {
   }
 
   async function apiFetch(url, options = {}, activeToken = token) {
+    const runtimeOrigin = typeof window !== "undefined" ? window.location.origin : "";
+    const runtimeProtocol = typeof window !== "undefined" ? window.location.protocol : "http:";
+    const runtimeHostname = typeof window !== "undefined" ? window.location.hostname : "";
+    const runtimePort = typeof window !== "undefined" ? window.location.port : "";
+    const configuredBackendOrigin = String(import.meta.env.VITE_API_BASE_URL || "").trim();
+    const inferredBackendPort = String(import.meta.env.VITE_API_BACKEND_PORT || "3001").trim() || "3001";
+    const isLikelyDevFrontend = /^(5173|5174|5175|5176)$/.test(runtimePort);
+    const sameHostBackendOrigin = runtimeHostname && isLikelyDevFrontend && runtimePort !== inferredBackendPort
+      ? `${runtimeProtocol}//${runtimeHostname}:${inferredBackendPort}`
+      : "";
+    const backendOrigin = configuredBackendOrigin || sameHostBackendOrigin;
+    const requestUrl = String(url || "").startsWith("/") && backendOrigin
+      ? `${backendOrigin}${url}`
+      : url;
     const headers = new Headers(options.headers || {});
     if (activeToken) headers.set("Authorization", `Bearer ${activeToken}`);
     const request = { ...options, headers };
     if (options.body && !(options.body instanceof FormData) && !headers.has("Content-Type")) { headers.set("Content-Type", "application/json"); request.body = JSON.stringify(options.body); }
     let response;
     try {
-      response = await fetch(url, request);
+      response = await fetch(requestUrl, request);
     } catch (fetchError) {
       throw fetchError;
     }
@@ -2983,19 +4131,26 @@ function App() {
   }
 
   async function addComposeProjectFromSettings() {
+    const selectedCompany = outboundCompanyOptions.find((item) => item.value === composeProjectForm.company_value) || null;
     const payload = {
       project_code: String(composeProjectForm.project_code || "").trim().toUpperCase(),
-      project_name: String(composeProjectForm.project_name || "").trim()
+      project_name: String(composeProjectForm.project_name || "").trim(),
+      company_name: selectedCompany?.label || "",
+      company_code: selectedCompany?.code || ""
     };
     if (!payload.project_code || !payload.project_name) {
       setError("يجب إدخال Project Code وProject Name قبل إضافة المشروع.");
+      return;
+    }
+    if (outboundCompanyOptions.length > 0 && !selectedCompany) {
+      setError("يجب اختيار الشركة قبل إضافة المشروع حتى يتم ربطه بمرجعياتها.");
       return;
     }
     try {
       setError("");
       await apiFetch("/api/projects", { method: "POST", body: payload });
       await loadProjects();
-      setComposeProjectForm({ project_code: "", project_name: "" });
+      setComposeProjectForm({ project_code: "", project_name: "", company_value: "" });
       setSuccessMessage("تمت إضافة المشروع إلى قائمة الاختيار بنجاح.");
     } catch (e) {
       setError(e.message || "تعذر إضافة المشروع.");
@@ -3275,6 +4430,10 @@ function App() {
     try { const r = await apiFetch("/api/admin/analytics"); setAnalytics(r); } catch (e) { setError(e.message); }
   }
 
+  async function loadCalendarAnalytics() {
+    try { const r = await apiFetch("/api/admin/calendar-analytics"); setCalendarAnalytics(r); } catch (e) { setError(e.message); }
+  }
+
   async function loadApprovalAnalytics() {
     try {
       const r = await apiFetch("/api/admin/approval-analytics");
@@ -3307,6 +4466,7 @@ function App() {
     if (currentView === "admin" && token && canAccessAdmin) {
       loadAdminSummary();
       if (adminTab === "overview") loadAnalytics();
+      if (adminTab === "calendar") loadCalendarAnalytics();
       if (adminTab === "employees") loadEmployees();
       if (adminTab === "trail") loadEmailTrailData();
       if (adminTab === "archives") { loadArchives(); loadArchiveExplorer(); loadArchiveBackfillHistory(); }
@@ -3336,16 +4496,43 @@ function App() {
   useEffect(() => { if (currentView === "settings" && token) loadMailServiceStatus(); }, [currentView, token]);
   useEffect(() => { if (currentView === "settings" && token && (currentUser || lastKnownUser)) loadDeviceCacheInfo(currentUser || lastKnownUser); }, [currentView, token, currentUser, lastKnownUser, data.emails.length, data.attachments.length, data.folders.length]);
 
+  const timelineCalendarEvents = useMemo(
+    () => expandCalendarOccurrences(data.calendar, { from: dayjs().subtract(30, "day"), to: dayjs().add(365, "day"), maxOccurrences: 1000 }),
+    [data.calendar]
+  );
+
+  const activeCalendarReminderEvents = useMemo(() => {
+    const now = Date.now();
+    return (timelineCalendarEvents || []).filter((evt) => {
+      if (!evt?.starts_at || evt.reminder_enabled === false) {
+        return false;
+      }
+      const reminderAt = evt.reminder_at || computeCalendarReminderAt(evt.starts_at, evt.reminder_enabled !== false, evt.reminder_minutes, evt.is_all_day);
+      if (!reminderAt) {
+        return false;
+      }
+      const reminderTime = new Date(reminderAt).getTime();
+      if (Number.isNaN(reminderTime)) {
+        return false;
+      }
+      const reminderId = `cal-${evt.occurrence_key || evt.id}`;
+      if (dismissedReminders[reminderId] && dismissedReminders[reminderId] >= reminderTime) {
+        return false;
+      }
+      if (snoozedReminders[reminderId] && snoozedReminders[reminderId] > now) {
+        return false;
+      }
+      const startTime = new Date(evt.starts_at).getTime();
+      return reminderTime <= now && startTime >= now - 24 * 60 * 60 * 1000;
+    });
+  }, [timelineCalendarEvents, dismissedReminders, snoozedReminders]);
+
   // Reminder popup check - checks every 30 seconds for upcoming events/tasks
   useEffect(() => {
     if (!token) return;
     const checkReminders = () => {
       const now = new Date();
-      const hasUpcoming = (data.calendar || []).some(evt => {
-        if (!evt.start) return false;
-        const diff = (new Date(evt.start).getTime() - now.getTime()) / 60000;
-        return diff <= 15 && diff >= -1440;
-      });
+      const hasUpcoming = activeCalendarReminderEvents.length > 0;
       const hasOverdueTasks = (data.tasks || []).some(t => {
         if (!t.due_date || t.status === "completed") return false;
         const diff = (new Date(t.due_date).getTime() - now.getTime()) / 60000;
@@ -3358,7 +4545,188 @@ function App() {
     checkReminders();
     const interval = setInterval(checkReminders, 30000);
     return () => clearInterval(interval);
-  }, [token, data.calendar, data.tasks]);
+  }, [token, activeCalendarReminderEvents, data.tasks]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof Notification === "undefined") {
+      return;
+    }
+    if (!activeCalendarReminderEvents.length) {
+      return;
+    }
+    if (Notification.permission === "default") {
+      Notification.requestPermission().catch(() => {});
+    }
+    if (Notification.permission !== "granted") {
+      return;
+    }
+    const freshEvents = activeCalendarReminderEvents.filter((event) => {
+      const key = event.occurrence_key || `${event.id}:${event.starts_at}`;
+      return !reminderNotificationKeysRef.current.has(key);
+    });
+    if (!freshEvents.length) {
+      return;
+    }
+    playReminderSound();
+    freshEvents.forEach((event) => {
+      const key = event.occurrence_key || `${event.id}:${event.starts_at}`;
+      reminderNotificationKeysRef.current.add(key);
+      new Notification(`Reminder: ${event.title}`, {
+        body: `${formatJordanDateValue(event.starts_at, { month: "2-digit", day: "2-digit", year: "numeric" })} ${event.is_all_day ? "All day" : formatJordanTimeValue(event.starts_at, { month: undefined, day: undefined, year: undefined })}${event.location ? `\n${event.location}` : ""}`,
+        icon: "/logo.gif",
+        tag: `calendar-reminder-${key}`
+      });
+    });
+  }, [activeCalendarReminderEvents]);
+
+  useEffect(() => {
+    if (!calendarContextMenu.visible) return undefined;
+    const handlePointerDown = (event) => {
+      if (calendarContextMenuRef.current?.contains(event.target)) {
+        return;
+      }
+      closeCalendarContextMenu();
+    };
+    const handleKeyDown = (event) => {
+      if (event.key === "Escape") {
+        closeCalendarContextMenu();
+      }
+    };
+    window.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("resize", closeCalendarContextMenu);
+    return () => {
+      window.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("resize", closeCalendarContextMenu);
+    };
+  }, [calendarContextMenu.visible]);
+
+  useEffect(() => {
+    if (!weekAllDayPopover.visible) {
+      return undefined;
+    }
+    const handlePointerDown = (event) => {
+      if (weekAllDayPopoverRef.current?.contains(event.target)) {
+        return;
+      }
+      setWeekAllDayPopover({ visible: false, dayIndex: null, x: 0, y: 0 });
+    };
+    const handleKeyDown = (event) => {
+      if (event.key === "Escape") {
+        setWeekAllDayPopover({ visible: false, dayIndex: null, x: 0, y: 0 });
+      }
+    };
+    window.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("resize", handleKeyDown);
+    return () => {
+      window.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("resize", handleKeyDown);
+    };
+  }, [weekAllDayPopover.visible]);
+
+  useEffect(() => {
+    if (!calendarResizeState) {
+      return undefined;
+    }
+    let latestY = calendarResizeState.startY;
+    let latestX = calendarResizeState.startX ?? 0;
+    const handleMouseMove = (event) => {
+      latestY = event.clientY;
+      latestX = event.clientX;
+    };
+    const handleMouseUp = async () => {
+      const resizeState = calendarResizeState;
+      setCalendarResizeState(null);
+      if (!resizeState) {
+        return;
+      }
+      const sourceEvent = timelineCalendarEvents.find((item) => item.occurrence_key === resizeState.occurrenceKey)
+        || timelineCalendarEvents.find((item) => Number(item.id) === Number(resizeState.eventId))
+        || null;
+      if (!sourceEvent) {
+        return;
+      }
+      if (resizeState.mode === "horizontal") {
+        const dayWidth = Math.max(1, Number(resizeState.dayWidth || 0));
+        const dayDelta = Math.round((latestX - Number(resizeState.startX || 0)) / dayWidth);
+        if (!dayDelta) {
+          return;
+        }
+        const sourceRange = getCalendarEventTimeRange(sourceEvent);
+        if (!sourceRange) {
+          return;
+        }
+        const sourceStart = sourceRange.start;
+        const sourceDisplayEnd = sourceRange.end.subtract(1, "minute");
+        let nextStart = sourceStart;
+        let nextEnd = sourceRange.end;
+        if (resizeState.edge === "start") {
+          const maxStartDay = sourceDisplayEnd.startOf("day");
+          const nextStartDay = sourceStart.startOf("day").add(dayDelta, "day");
+          const clampedStartDay = nextStartDay.isAfter(maxStartDay) ? maxStartDay : nextStartDay;
+          nextStart = clampedStartDay
+            .hour(sourceStart.hour())
+            .minute(sourceStart.minute())
+            .second(sourceStart.second())
+            .millisecond(sourceStart.millisecond());
+        } else if (resizeState.edge === "end") {
+          const minDisplayEndDay = sourceStart.startOf("day");
+          const nextDisplayEndDay = sourceDisplayEnd.startOf("day").add(dayDelta, "day");
+          const clampedDisplayEndDay = nextDisplayEndDay.isBefore(minDisplayEndDay) ? minDisplayEndDay : nextDisplayEndDay;
+          const endMinuteOffset = sourceDisplayEnd.diff(sourceDisplayEnd.startOf("day"), "minute");
+          nextEnd = clampedDisplayEndDay.startOf("day").add(endMinuteOffset + 1, "minute")
+            .second(sourceRange.end.second())
+            .millisecond(sourceRange.end.millisecond());
+        }
+        if (!nextEnd.isAfter(nextStart)) {
+          nextEnd = nextStart.add(1, "day");
+        }
+        try {
+          await persistCalendarEventUpdate(
+            sourceEvent,
+            {
+              starts_at: nextStart.toISOString(),
+              ends_at: nextEnd.toISOString()
+            },
+            "Appointment span updated."
+          );
+        } catch (e) {
+          setError(e.message);
+          setSuccessMessage("");
+        }
+        return;
+      }
+      const deltaPixels = latestY - resizeState.startY;
+      const slotDelta = Math.round(deltaPixels / CALENDAR_WEEK_SLOT_HEIGHT);
+      if (!slotDelta) {
+        return;
+      }
+      const newEnd = dayjs(sourceEvent.ends_at).add(slotDelta * CALENDAR_WEEK_SLOT_MINUTES, "minute");
+      const minimumEnd = dayjs(sourceEvent.starts_at).add(30, "minute");
+      const safeEnd = newEnd.isBefore(minimumEnd) ? minimumEnd : newEnd;
+      try {
+        await persistCalendarEventUpdate(
+          sourceEvent,
+          {
+            ends_at: safeEnd.toISOString()
+          },
+          "Appointment duration updated."
+        );
+      } catch (e) {
+        setError(e.message);
+        setSuccessMessage("");
+      }
+    };
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp, { once: true });
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
+  }, [calendarResizeState, timelineCalendarEvents]);
 
   // Auto-refresh emails every 60 seconds + browser notification for new emails
   useEffect(() => {
@@ -3493,9 +4861,39 @@ function App() {
   const highlightTerms = useMemo(() => [searchQuery, advancedSearch.from, advancedSearch.to, advancedSearch.subject].map(t => t.trim()).filter(Boolean), [searchQuery, advancedSearch.from, advancedSearch.to, advancedSearch.subject]);
 
   const selectedEmail = filteredEmails.find(e => e.id === selectedEmailId) || data.emails.find(e => e.id === selectedEmailId) || filteredEmails[0] || null;
+  const contextMenuEmail = useMemo(
+    () => data.emails.find((email) => email.id === emailContextMenu.emailId) || null,
+    [data.emails, emailContextMenu.emailId]
+  );
+  const contextMoveTargets = useMemo(() => {
+    if (!contextMenuEmail) return [];
+    return data.folders
+      .map((folder) => folder.name)
+      .filter((name) => name && name !== contextMenuEmail.folder_name && !["Outbox", "Drafts"].includes(name));
+  }, [data.folders, contextMenuEmail]);
   useEffect(() => {
     if (!token || !currentUser?.email) return;
   }, [token, currentUser?.email, selectedFolder, activeFilter, searchScope, searchQuery, filteredEmails, data.emails, selectedEmail?.id]);
+  useEffect(() => {
+    if (!emailContextMenu.visible) return undefined;
+    function handlePointerDown(event) {
+      if (emailContextMenuRef.current?.contains(event.target)) return;
+      closeEmailContextMenu();
+    }
+    function handleKeyDown(event) {
+      if (event.key === "Escape") {
+        closeEmailContextMenu();
+      }
+    }
+    window.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("resize", closeEmailContextMenu);
+    return () => {
+      window.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("resize", closeEmailContextMenu);
+    };
+  }, [emailContextMenu.visible]);
 
   useEffect(() => {
     if (!selectedEmail?.id) {
@@ -3740,21 +5138,142 @@ function App() {
     }
   ]), [data.emails.length, data.folders.length, deviceCacheInfo]);
 
+  const calendarVisibleRange = useMemo(() => {
+    if (calView === "day") {
+      return {
+        from: calDate.startOf("day"),
+        to: calDate.endOf("day")
+      };
+    }
+    if (calView === "week") {
+      const from = calDate.subtract((calDate.day() + 1) % 7, "day").startOf("day");
+      return {
+        from,
+        to: from.add(6, "day").endOf("day")
+      };
+    }
+    const monthStart = calDate.startOf("month");
+    const from = monthStart.subtract((monthStart.day() + 1) % 7, "day").startOf("day");
+    return {
+      from,
+      to: from.add(41, "day").endOf("day")
+    };
+  }, [calDate, calView]);
+  const visibleCalendarEvents = useMemo(
+    () => expandCalendarOccurrences(data.calendar, { from: calendarVisibleRange.from, to: calendarVisibleRange.to, maxOccurrences: 500 }),
+    [data.calendar, calendarVisibleRange]
+  );
   const monthlyCalendar = useMemo(() => {
-    const start = calDate.startOf("month").startOf("week");
+    const monthStart = calDate.startOf("month");
+    const start = monthStart.subtract((monthStart.day() + 1) % 7, "day").startOf("day");
     return Array.from({ length: 42 }, (_, i) => {
       const d = start.add(i, "day");
-      return { date: d, events: data.calendar.filter(ev => getJordanDateKey(ev.starts_at) === d.format("YYYY-MM-DD")) };
+      return { date: d, events: visibleCalendarEvents.filter(ev => getJordanDateKey(ev.starts_at) === d.format("YYYY-MM-DD")) };
     });
-  }, [data.calendar, calDate]);
+  }, [visibleCalendarEvents, calDate]);
 
+  const weekStartDate = useMemo(() => calDate.subtract((calDate.day() + 1) % 7, "day").startOf("day"), [calDate]);
+  const weekEndDate = useMemo(() => weekStartDate.add(6, "day").endOf("day"), [weekStartDate]);
+  const weekVisibleEvents = useMemo(
+    () => visibleCalendarEvents.filter((event) => {
+      const range = getCalendarEventTimeRange(event);
+      if (!range) {
+        return false;
+      }
+      return range.end.isAfter(weekStartDate.startOf("day")) && range.start.isBefore(weekEndDate);
+    }),
+    [visibleCalendarEvents, weekStartDate, weekEndDate]
+  );
   const weeklyCalendar = useMemo(() => {
-    const start = calDate.startOf("week");
     return Array.from({ length: 7 }, (_, i) => {
-      const d = start.add(i, "day");
-      return { date: d, events: data.calendar.filter(ev => getJordanDateKey(ev.starts_at) === d.format("YYYY-MM-DD")) };
+      const d = weekStartDate.add(i, "day");
+      const dateKey = d.format("YYYY-MM-DD");
+      const dayTimedEvents = weekVisibleEvents
+        .filter((event) => (
+          !shouldRenderWeekAllDayBar(event)
+          && getJordanDateKey(event.starts_at) === dateKey
+        ));
+      return {
+        date: d,
+        timedEvents: buildWeekTimedEventColumns(dayTimedEvents)
+      };
     });
-  }, [data.calendar, calDate]);
+  }, [weekStartDate, weekVisibleEvents]);
+  const weekAllDayLayout = useMemo(
+    () => buildWeekAllDayLayout(weekVisibleEvents, weekStartDate),
+    [weekVisibleEvents, weekStartDate]
+  );
+  const weekAllDayVisibleRowCount = useMemo(
+    () => Math.max(1, Math.min(weekAllDayLayout.rowCount, CALENDAR_WEEK_ALLDAY_VISIBLE_ROWS)),
+    [weekAllDayLayout.rowCount]
+  );
+  const weekAllDayOverflow = useMemo(
+    () => buildWeekAllDayOverflow(weekAllDayLayout, CALENDAR_WEEK_ALLDAY_VISIBLE_ROWS),
+    [weekAllDayLayout]
+  );
+  const weekTimeSlots = useMemo(
+    () => Array.from({ length: ((CALENDAR_WEEK_END_HOUR - CALENDAR_WEEK_START_HOUR) * 60) / CALENDAR_WEEK_SLOT_MINUTES }, (_, index) => {
+      const slotDate = dayjs().hour(CALENDAR_WEEK_START_HOUR).minute(0).add(index * CALENDAR_WEEK_SLOT_MINUTES, "minute");
+      return {
+        index,
+        label: slotDate.format("HH:mm")
+      };
+    }),
+    []
+  );
+  const weekGridHeight = useMemo(
+    () => weekTimeSlots.length * CALENDAR_WEEK_SLOT_HEIGHT,
+    [weekTimeSlots]
+  );
+  const selectedCalendarOccurrence = useMemo(
+    () => timelineCalendarEvents.find((item) => item.occurrence_key === selectedCalendarOccurrenceKey) || null,
+    [timelineCalendarEvents, selectedCalendarOccurrenceKey]
+  );
+  const selectedCalendarEvent = useMemo(
+    () => selectedCalendarOccurrence
+      || timelineCalendarEvents.find((item) => Number(item.id) === Number(selectedCalendarEventId))
+      || data.calendar.find((item) => Number(item.id) === Number(selectedCalendarEventId))
+      || null,
+    [selectedCalendarOccurrence, timelineCalendarEvents, data.calendar, selectedCalendarEventId]
+  );
+  const currentDayStart = useMemo(
+    () => calDate.startOf("day"),
+    [calDate]
+  );
+  const currentDayEnd = useMemo(
+    () => currentDayStart.endOf("day"),
+    [currentDayStart]
+  );
+  const currentDayEvents = useMemo(
+    () => visibleCalendarEvents
+      .filter((event) => {
+        const range = getCalendarEventTimeRange(event);
+        if (!range) {
+          return false;
+        }
+        return range.end.isAfter(currentDayStart) && range.start.isBefore(currentDayEnd);
+      })
+      .sort((a, b) => new Date(a.starts_at).getTime() - new Date(b.starts_at).getTime()),
+    [visibleCalendarEvents, currentDayStart, currentDayEnd]
+  );
+  const currentDayAllDayEvents = useMemo(
+    () => currentDayEvents.filter((event) => shouldRenderWeekAllDayBar(event)),
+    [currentDayEvents]
+  );
+  const currentDayTimedEvents = useMemo(
+    () => buildWeekTimedEventColumns(currentDayEvents.filter((event) => !shouldRenderWeekAllDayBar(event))),
+    [currentDayEvents]
+  );
+  const weekAllDayPopoverEvents = useMemo(
+    () => weekAllDayPopover.visible && Number.isInteger(weekAllDayPopover.dayIndex)
+      ? getWeekAllDayOverflowEvents(weekAllDayLayout, weekAllDayPopover.dayIndex, CALENDAR_WEEK_ALLDAY_VISIBLE_ROWS)
+      : [],
+    [weekAllDayPopover, weekAllDayLayout]
+  );
+  const calendarSidebarMonths = useMemo(
+    () => [calDate.startOf("month"), calDate.add(1, "month").startOf("month")],
+    [calDate]
+  );
 
   const dashboardStats = useMemo(() => {
     const total = data.emails.length;
@@ -3931,13 +5450,18 @@ function App() {
         setIsSendingEmail(false);
         return;
       }
-      if (resolvedForm.outbound_company && !outboundSubjectCompanies.includes(String(resolvedForm.outbound_company).trim())) {
+      if (resolvedForm.outbound_company && !outboundCompanyOptions.some((item) => item.value === String(resolvedForm.outbound_company).trim())) {
         setError("الشركة المختارة غير معرفة داخل إعدادات Compose.");
         setIsSendingEmail(false);
         return;
       }
-      if (resolvedForm.outbound_client && !outboundSubjectClients.includes(String(resolvedForm.outbound_client).trim())) {
-        setError("العميل المختار غير معرف داخل إعدادات Compose.");
+      if (resolvedForm.outbound_client && !outboundClientOptions.some((item) => item.value === String(resolvedForm.outbound_client).trim())) {
+        setError("العميل المختار لا يتبع للشركة المختارة أو غير معرف داخل إعدادات Compose.");
+        setIsSendingEmail(false);
+        return;
+      }
+      if (resolvedForm.outbound_reference_value && !outgoingReferenceOptions.some((item) => String(item.value) === String(resolvedForm.outbound_reference_value).trim())) {
+        setError("المرجع المختار لا يتبع للشركة المختارة أو غير معرف داخل إعدادات Compose.");
         setIsSendingEmail(false);
         return;
       }
@@ -3951,11 +5475,14 @@ function App() {
         senderName: resolvedForm.sender_name || currentUser?.name || "",
         hasAttachments: files.length > 0,
         logoUrl: settingsForm.logo_url || "",
+        signatureImageUrl: settingsForm.signature_image_url || "",
+        stampImageUrl: settingsForm.stamp_image_url || "",
         companyAddress: settingsForm.company_address || "",
         companyPhone: settingsForm.company_phone || "",
         companyWebsite: settingsForm.company_website || "",
         companyEmail: settingsForm.email_address || "",
-        companyName: settingsForm.company_name || ""
+        companyName: settingsForm.company_name || "",
+        templateLanguage: resolvedForm.outbound_template_language || "arabic"
       });
       if (!nextOutgoingState.isComplete) {
         setError(`لا يمكن إرسال الرسالة قبل استكمال بيانات الكتاب الرسمي: ${nextOutgoingState.missing.join("، ")}.`);
@@ -4097,6 +5624,194 @@ function App() {
     } catch (e) { setError(e.message); } finally { setIsSavingSettings(false); }
   }
 
+  async function handleRunCatalogCompanyBackfill() {
+    setIsRunningCatalogCompanyBackfill(true);
+    setError("");
+    setSuccessMessage("");
+    try {
+      const response = await apiFetch("/api/admin/outbound-catalogs/company-backfill", { method: "POST", body: {} });
+      if (response.settings) {
+        setSettingsForm((prev) => ({
+          ...prev,
+          ...response.settings,
+          webmail_url: prev.webmail_url
+        }));
+      }
+      setCatalogCompanyBackfillSummary(response.summary || null);
+      setSuccessMessage("تم تنفيذ backfill لمرجعيات Compose بنجاح. راجع النتائج ثم احفظ الإعدادات إذا لزم.");
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setIsRunningCatalogCompanyBackfill(false);
+    }
+  }
+
+  function removeCatalogReviewItem(sectionKey, entryValue, bucket = "") {
+    const normalizedValue = String(entryValue || "").trim();
+    if (!sectionKey || !normalizedValue) {
+      return;
+    }
+    setCatalogCompanyBackfillSummary((prev) => {
+      if (!prev?.[sectionKey]) {
+        return prev;
+      }
+      const section = prev[sectionKey];
+      const nextSection = { ...section };
+      const removeFromBucket = (bucketName) => {
+        const current = Array.isArray(nextSection[bucketName]) ? nextSection[bucketName] : [];
+        const next = current.filter((item) => String(item?.value || "").trim() !== normalizedValue);
+        if (next.length !== current.length) {
+          nextSection[bucketName] = next;
+          if (bucketName === "ambiguous_entries") {
+            nextSection.ambiguous_count = Math.max(0, Number(nextSection.ambiguous_count || 0) - 1);
+          }
+          if (bucketName === "unmatched_entries") {
+            nextSection.unmatched_count = Math.max(0, Number(nextSection.unmatched_count || 0) - 1);
+          }
+          return true;
+        }
+        return false;
+      };
+
+      const removed = bucket ? removeFromBucket(bucket) : (removeFromBucket("ambiguous_entries") || removeFromBucket("unmatched_entries"));
+      if (!removed) {
+        return prev;
+      }
+      return {
+        ...prev,
+        [sectionKey]: nextSection
+      };
+    });
+    setCatalogReviewSelections((prev) => {
+      const next = { ...prev };
+      delete next[`${sectionKey}::${normalizedValue}`];
+      return next;
+    });
+  }
+
+  function handleApplyCatalogReview(sectionKey, item, bucket = "") {
+    const config = OUTGOING_CATALOG_REVIEW_CONFIG[sectionKey];
+    const reviewValue = String(item?.value || "").trim();
+    if (!config || !reviewValue) {
+      return;
+    }
+    const selectedCompanyValue = catalogReviewSelections[`${sectionKey}::${reviewValue}`] || "";
+    const selectedCompany = outboundCompanyOptions.find((option) => option.value === selectedCompanyValue) || null;
+    if (!selectedCompany) {
+      setError("اختر الشركة أولًا قبل تطبيق السطر على الكتالوج.");
+      setSuccessMessage("");
+      return;
+    }
+
+    const parsedEntry = parseOutgoingCatalogEntry(reviewValue, config.mode);
+    if (!parsedEntry) {
+      setError("تعذر تحليل السطر المحدد.");
+      setSuccessMessage("");
+      return;
+    }
+
+    const formattedValue = formatScopedOutgoingCatalogEntry(parsedEntry, selectedCompany, config.mode);
+    setSettingsForm((prev) => {
+      const sourceValues = normalizeSubjectCatalog(prev[config.settingsKey]);
+      const nextValues = sourceValues.map((value) => (
+        String(value || "").trim() === reviewValue ? formattedValue : value
+      ));
+      return {
+        ...prev,
+        [config.settingsKey]: nextValues
+      };
+    });
+    removeCatalogReviewItem(sectionKey, reviewValue, bucket);
+    setError("");
+    setSuccessMessage(`تم تطبيق الربط على ${config.label}: ${parsedEntry.label}.`);
+  }
+
+  function handleApplyAllCatalogSuggestions() {
+    if (!catalogCompanyBackfillSummary) {
+      return;
+    }
+    setIsApplyingAllCatalogSuggestions(true);
+    try {
+      const nextSettings = { ...settingsForm };
+      const nextSummary = { ...catalogCompanyBackfillSummary };
+      const nextSelections = { ...catalogReviewSelections };
+      let appliedCount = 0;
+
+      for (const [sectionKey, config] of Object.entries(OUTGOING_CATALOG_REVIEW_CONFIG)) {
+        const section = nextSummary?.[sectionKey];
+        if (!section) {
+          continue;
+        }
+
+        const sourceValues = normalizeSubjectCatalog(nextSettings[config.settingsKey]);
+        const reviewBuckets = ["ambiguous_entries", "unmatched_entries"];
+        const entriesToRemove = new Set();
+
+        for (const bucketName of reviewBuckets) {
+          const items = Array.isArray(section[bucketName]) ? section[bucketName] : [];
+          for (const item of items) {
+            const reviewValue = String(item?.value || "").trim();
+            if (!reviewValue) {
+              continue;
+            }
+            const selectedCompanyValue = nextSelections[`${sectionKey}::${reviewValue}`] || "";
+            const selectedCompany = outboundCompanyOptions.find((option) => option.value === selectedCompanyValue) || null;
+            if (!selectedCompany) {
+              continue;
+            }
+            const parsedEntry = parseOutgoingCatalogEntry(reviewValue, config.mode);
+            if (!parsedEntry) {
+              continue;
+            }
+            const formattedValue = formatScopedOutgoingCatalogEntry(parsedEntry, selectedCompany, config.mode);
+            let changedInSource = false;
+            for (let index = 0; index < sourceValues.length; index += 1) {
+              if (String(sourceValues[index] || "").trim() === reviewValue) {
+                sourceValues[index] = formattedValue;
+                changedInSource = true;
+              }
+            }
+            if (!changedInSource) {
+              continue;
+            }
+            entriesToRemove.add(reviewValue);
+            delete nextSelections[`${sectionKey}::${reviewValue}`];
+            appliedCount += 1;
+          }
+        }
+
+        nextSettings[config.settingsKey] = sourceValues;
+        if (entriesToRemove.size) {
+          const nextAmbiguous = (Array.isArray(section.ambiguous_entries) ? section.ambiguous_entries : [])
+            .filter((item) => !entriesToRemove.has(String(item?.value || "").trim()));
+          const nextUnmatched = (Array.isArray(section.unmatched_entries) ? section.unmatched_entries : [])
+            .filter((item) => !entriesToRemove.has(String(item?.value || "").trim()));
+          nextSummary[sectionKey] = {
+            ...section,
+            ambiguous_entries: nextAmbiguous,
+            unmatched_entries: nextUnmatched,
+            ambiguous_count: nextAmbiguous.length,
+            unmatched_count: nextUnmatched.length
+          };
+        }
+      }
+
+      if (!appliedCount) {
+        setError("لا توجد اقتراحات محددة حاليًا لتطبيقها دفعة واحدة.");
+        setSuccessMessage("");
+        return;
+      }
+
+      setSettingsForm(nextSettings);
+      setCatalogCompanyBackfillSummary(nextSummary);
+      setCatalogReviewSelections(nextSelections);
+      setError("");
+      setSuccessMessage(`تم تطبيق ${appliedCount} اقتراح/اقتراحات دفعة واحدة على مرجعيات Compose.`);
+    } finally {
+      setIsApplyingAllCatalogSuggestions(false);
+    }
+  }
+
   async function loadMailServiceStatus() {
     try { const r = await apiFetch("/api/settings/status"); setMailServiceStatus(r.status); } catch (e) { setError(e.message); }
   }
@@ -4153,6 +5868,9 @@ function App() {
       if (adminTab === "overview") {
         await loadAnalytics();
       }
+      if (adminTab === "calendar") {
+        await loadCalendarAnalytics();
+      }
       const totals = r.summary?.totals || {};
       setSuccessMessage(`Full mail sync completed. Accounts: ${Number(totals.accounts || 0)}, received: ${Number(totals.received || 0)}, sent: ${Number(totals.sent || 0)}, skipped: ${Number(totals.skipped || 0)}.`);
     } catch (e) { setError(e.message); } finally { setIsRunningFullMailSync(false); }
@@ -4161,6 +5879,7 @@ function App() {
   function handleRefreshAdminDashboard() {
     loadAdminSummary();
     if (adminTab === "overview") loadAnalytics();
+    if (adminTab === "calendar") loadCalendarAnalytics();
     if (adminTab === "employees") loadEmployees();
     if (adminTab === "trail") loadEmailTrailData();
     if (adminTab === "archives") { loadArchives(); loadArchiveExplorer(); loadArchiveBackfillHistory(); }
@@ -4285,7 +6004,530 @@ function App() {
     } catch (e) { setError(e.message); } finally { setIsMovingEmail(false); }
   }
 
-  function openCalendarView() { setCurrentView("calendar"); setActiveRibbonTab("home"); setError(""); setSuccessMessage(""); }
+  function closeCalendarContextMenu() {
+    setCalendarContextMenu((prev) => (
+      prev.visible || prev.eventId || prev.dateKey || prev.occurrenceKey || prev.submenu
+        ? { visible: false, x: 0, y: 0, dateKey: "", eventId: null, occurrenceKey: "", submenu: null }
+        : prev
+    ));
+  }
+
+  function openCalendarView() {
+    setCurrentView("calendar");
+    setActiveRibbonTab("home");
+    setError("");
+    setSuccessMessage("");
+    closeCalendarContextMenu();
+  }
+
+  function openCalendarEditor(baseDate = dayjs(), event = null, options = {}) {
+    const targetDate = event?.starts_at ? dayjs(event.starts_at) : dayjs(baseDate);
+    const canEditOccurrence = isCalendarOccurrenceEditable(event);
+    const requestedScope = options.scope || (canEditOccurrence ? "occurrence" : "series");
+    const scope = requestedScope === "occurrence" && canEditOccurrence ? "occurrence" : "series";
+    const seriesEventId = getCalendarSeriesEventId(event);
+    const seriesEvent = seriesEventId
+      ? data.calendar.find((item) => Number(item.id) === Number(seriesEventId)) || event
+      : event;
+    const sourceEvent = scope === "series" ? seriesEvent : event;
+    const nextForm = createDefaultCalendarForm(targetDate, sourceEvent);
+    if (scope === "occurrence") {
+      nextForm.recurrence_pattern = "none";
+      nextForm.recurrence_interval = 1;
+      nextForm.recurrence_days = [];
+      nextForm.recurrence_until = "";
+      nextForm.recurrence_count = "";
+    }
+    setCalDate(targetDate);
+    setSelectedCalendarEventId(seriesEventId || event?.id || null);
+    setSelectedCalendarOccurrenceKey(event?.occurrence_key || "");
+    setCalendarEditor({
+      open: true,
+      mode: event ? "edit" : "create",
+      eventId: sourceEvent?.id || event?.id || null,
+      seriesEventId: seriesEventId || sourceEvent?.id || null,
+      scope,
+      occurrenceStart: event?.occurrence_original_start || event?.starts_at || "",
+      canEditOccurrence,
+      form: nextForm
+    });
+    closeCalendarContextMenu();
+    setError("");
+    setSuccessMessage("");
+  }
+
+  function openCalendarSeriesEditor(event) {
+    if (!event) {
+      return;
+    }
+    const seriesEventId = getCalendarSeriesEventId(event);
+    const seriesEvent = data.calendar.find((item) => Number(item.id) === Number(seriesEventId)) || event;
+    openCalendarEditor(dayjs(seriesEvent?.starts_at || event?.starts_at || calDate), seriesEvent, { scope: "series" });
+  }
+
+  function switchCalendarEditorScope(nextScope) {
+    if (!calendarEditor.canEditOccurrence) {
+      return;
+    }
+    const scope = nextScope === "occurrence" ? "occurrence" : "series";
+    const occurrenceEvent = timelineCalendarEvents.find((item) => item.occurrence_key === selectedCalendarOccurrenceKey)
+      || timelineCalendarEvents.find((item) => (
+        Number(getCalendarSeriesEventId(item)) === Number(calendarEditor.seriesEventId || calendarEditor.eventId)
+        && String(item.occurrence_original_start || "") === String(calendarEditor.occurrenceStart || "")
+      ))
+      || selectedCalendarEvent
+      || null;
+    const seriesEvent = data.calendar.find((item) => Number(item.id) === Number(calendarEditor.seriesEventId || calendarEditor.eventId))
+      || occurrenceEvent;
+    const sourceEvent = scope === "series" ? seriesEvent : occurrenceEvent;
+    const baseDate = dayjs(sourceEvent?.starts_at || calendarEditor.form.starts_at || calDate);
+    const nextForm = createDefaultCalendarForm(baseDate, sourceEvent);
+    if (scope === "occurrence") {
+      nextForm.recurrence_pattern = "none";
+      nextForm.recurrence_interval = 1;
+      nextForm.recurrence_days = [];
+      nextForm.recurrence_until = "";
+      nextForm.recurrence_count = "";
+    }
+    setCalendarEditor((prev) => ({
+      ...prev,
+      scope,
+      eventId: sourceEvent?.id || prev.eventId,
+      form: nextForm
+    }));
+  }
+
+  function closeCalendarEditor() {
+    setCalendarEditor((prev) => ({ ...prev, open: false, eventId: null, seriesEventId: null, occurrenceStart: "", scope: "series", canEditOccurrence: false }));
+  }
+
+  function updateCalendarEditorField(key, value) {
+    setCalendarEditor((prev) => {
+      const nextForm = { ...prev.form, [key]: value };
+      if (key === "recurrence_pattern" && value !== "weekly") {
+        nextForm.recurrence_days = [];
+      }
+      if (key === "recurrence_pattern" && value === "none") {
+        nextForm.recurrence_until = "";
+        nextForm.recurrence_count = "";
+      }
+      if (key === "is_all_day" && value) {
+        const startDate = dayjs(nextForm.starts_at || dayjs());
+        const endDate = dayjs(nextForm.ends_at || startDate);
+        nextForm.starts_at = startDate.hour(9).minute(0).second(0).millisecond(0).format("YYYY-MM-DDTHH:mm");
+        nextForm.ends_at = endDate.hour(10).minute(0).second(0).millisecond(0).format("YYYY-MM-DDTHH:mm");
+      }
+      return { ...prev, form: nextForm };
+    });
+  }
+
+  async function handleSaveCalendarEvent() {
+    const payload = { ...calendarEditor.form };
+    const startsAtIso = parseJordanDateTimeInputToISOString(payload.starts_at);
+    const endsAtIso = parseJordanDateTimeInputToISOString(payload.ends_at);
+    if (!String(payload.title || "").trim()) {
+      setError("Appointment title is required.");
+      setSuccessMessage("");
+      return;
+    }
+    if (!payload.starts_at || !payload.ends_at) {
+      setError("Start and end time are required.");
+      setSuccessMessage("");
+      return;
+    }
+    if (!startsAtIso || !endsAtIso) {
+      setError("Invalid Jordan time value.");
+      setSuccessMessage("");
+      return;
+    }
+    if (new Date(endsAtIso).getTime() < new Date(startsAtIso).getTime()) {
+      setError("End time must be after start time.");
+      setSuccessMessage("");
+      return;
+    }
+
+    setIsSavingCalendarEvent(true);
+    setError("");
+    setSuccessMessage("");
+    try {
+      const requestPayload = {
+        ...payload,
+        starts_at: startsAtIso,
+        ends_at: endsAtIso,
+        reminder_enabled: Boolean(payload.reminder_enabled),
+        reminder_minutes: Number(payload.reminder_minutes || 0),
+        recurrence_pattern: payload.recurrence_pattern || "none",
+        recurrence_interval: Math.max(1, Number(payload.recurrence_interval || 1)),
+        recurrence_days: Array.isArray(payload.recurrence_days) ? payload.recurrence_days : [],
+        recurrence_until: payload.recurrence_pattern && payload.recurrence_pattern !== "none" && payload.recurrence_until
+          ? parseJordanDateOnlyToISOString(payload.recurrence_until, true)
+          : null,
+        recurrence_count: payload.recurrence_pattern && payload.recurrence_pattern !== "none" && payload.recurrence_count
+          ? Number(payload.recurrence_count)
+          : null,
+        reminder_at: computeCalendarReminderAt(
+          startsAtIso,
+          Boolean(payload.reminder_enabled),
+          Number(payload.reminder_minutes || 0),
+          Boolean(payload.is_all_day)
+        )
+      };
+      const isOccurrenceScope = calendarEditor.scope === "occurrence" && calendarEditor.canEditOccurrence && calendarEditor.occurrenceStart;
+      if (isOccurrenceScope) {
+        requestPayload.scope = "occurrence";
+        requestPayload.occurrence_start = calendarEditor.occurrenceStart;
+        requestPayload.recurrence_pattern = "none";
+        requestPayload.recurrence_interval = 1;
+        requestPayload.recurrence_days = [];
+        requestPayload.recurrence_until = null;
+        requestPayload.recurrence_count = null;
+      }
+      if (calendarEditor.mode === "edit" && calendarEditor.eventId) {
+        const targetId = calendarEditor.scope === "series"
+          ? (calendarEditor.seriesEventId || calendarEditor.eventId)
+          : (calendarEditor.seriesEventId || calendarEditor.eventId);
+        await apiFetch(`/api/calendar/${targetId}`, { method: "PUT", body: requestPayload });
+        setSuccessMessage(isOccurrenceScope ? "Occurrence updated." : "Appointment updated.");
+      } else {
+        await apiFetch("/api/calendar", { method: "POST", body: requestPayload });
+        setSuccessMessage("Appointment created.");
+      }
+      await loadBootstrap();
+      closeCalendarEditor();
+    } catch (e) {
+      setError(e.message);
+      setSuccessMessage("");
+    } finally {
+      setIsSavingCalendarEvent(false);
+    }
+  }
+
+  async function handleDeleteCalendarEvent(target, options = {}) {
+    const targetEvent = typeof target === "object" && target
+      ? target
+      : timelineCalendarEvents.find((item) => Number(item.id) === Number(target))
+        || data.calendar.find((item) => Number(item.id) === Number(target))
+        || null;
+    if (!targetEvent) {
+      return;
+    }
+    const deleteScope = options.scope || "series";
+    const isOccurrenceDelete = deleteScope === "occurrence" && isCalendarOccurrenceEditable(targetEvent);
+    const confirmText = options.confirmText || (isOccurrenceDelete ? "Skip this occurrence from the series?" : "Delete this appointment?");
+    if (!window.confirm(confirmText)) {
+      return;
+    }
+    setIsDeletingCalendarEvent(true);
+    setError("");
+    setSuccessMessage("");
+    try {
+      const deleteId = isOccurrenceDelete
+        ? Number(targetEvent.id)
+        : Number(targetEvent.series_master_id || targetEvent.master_event_id || targetEvent.id);
+      const deleteBody = isOccurrenceDelete
+        ? {
+          scope: "occurrence",
+          occurrence_start: targetEvent.occurrence_original_start || targetEvent.starts_at
+        }
+        : undefined;
+      await apiFetch(`/api/calendar/${deleteId}`, { method: "DELETE", body: deleteBody });
+      await loadBootstrap();
+      if (isOccurrenceDelete) {
+        setSelectedCalendarOccurrenceKey((prev) => (prev === targetEvent.occurrence_key ? "" : prev));
+      } else {
+        setSelectedCalendarEventId((prev) => (Number(prev) === Number(deleteId) ? null : prev));
+        setSelectedCalendarOccurrenceKey("");
+      }
+      closeCalendarContextMenu();
+      closeCalendarEditor();
+      setSuccessMessage(options.successText || (isOccurrenceDelete ? "Occurrence skipped." : "Appointment deleted."));
+    } catch (e) {
+      setError(e.message);
+      setSuccessMessage("");
+    } finally {
+      setIsDeletingCalendarEvent(false);
+    }
+  }
+
+  function openCalendarContextMenu(event, { dateKey = "", eventId = null, calendarEvent = null } = {}) {
+    event.preventDefault();
+    event.stopPropagation();
+    const estimatedWidth = 264;
+    const estimatedHeight = 480;
+    const x = Math.max(8, Math.min(event.clientX, window.innerWidth - estimatedWidth - 8));
+    const y = Math.max(8, Math.min(event.clientY, window.innerHeight - estimatedHeight - 8));
+    const resolvedEventId = calendarEvent?.id || eventId || null;
+    const resolvedOccurrenceKey = calendarEvent?.occurrence_key || "";
+    if (resolvedEventId) {
+      setSelectedCalendarEventId(getCalendarSeriesEventId(calendarEvent || { id: resolvedEventId }) || resolvedEventId);
+    }
+    if (resolvedOccurrenceKey) {
+      setSelectedCalendarOccurrenceKey(resolvedOccurrenceKey);
+    }
+    setCalendarContextMenu({ visible: true, x, y, dateKey, eventId: resolvedEventId, occurrenceKey: resolvedOccurrenceKey, submenu: null });
+  }
+
+  async function persistCalendarEventUpdate(calendarEvent, payload, successText = "Appointment updated.") {
+    if (!calendarEvent?.id) {
+      return;
+    }
+    const isOccurrenceUpdate = isCalendarOccurrenceEditable(calendarEvent);
+    const targetId = isOccurrenceUpdate
+      ? getCalendarSeriesEventId(calendarEvent)
+      : Number(calendarEvent.id);
+    const requestPayload = { ...payload };
+    if (isOccurrenceUpdate) {
+      requestPayload.scope = "occurrence";
+      requestPayload.occurrence_start = calendarEvent.occurrence_original_start || calendarEvent.starts_at;
+    }
+    await apiFetch(`/api/calendar/${targetId}`, { method: "PUT", body: requestPayload });
+    await loadBootstrap();
+    const selectedSeriesId = getCalendarSeriesEventId(calendarEvent);
+    const selectedOccurrenceStart = isOccurrenceUpdate
+      ? (calendarEvent.occurrence_original_start || calendarEvent.starts_at)
+      : (requestPayload.starts_at || calendarEvent.starts_at);
+    setSelectedCalendarEventId(selectedSeriesId || targetId);
+    setSelectedCalendarOccurrenceKey(
+      selectedOccurrenceStart
+        ? `${selectedSeriesId || targetId}:${dayjs(selectedOccurrenceStart).toISOString()}`
+        : ""
+    );
+    setSuccessMessage(successText);
+    setError("");
+  }
+
+  async function handleMoveCalendarEvent(dropTargetValue, calendarEvent) {
+    if (!dropTargetValue || !calendarEvent?.id) {
+      return;
+    }
+    const targetDate = dayjs(dropTargetValue);
+    if (!targetDate.isValid()) {
+      return;
+    }
+    const sourceStart = dayjs(calendarEvent.starts_at);
+    const sourceEnd = dayjs(calendarEvent.ends_at);
+    const durationMinutes = Math.max(30, sourceEnd.diff(sourceStart, "minute"));
+    const hasExplicitTime = /T\d{2}:\d{2}/.test(String(dropTargetValue || ""));
+    const nextStart = hasExplicitTime
+      ? targetDate.second(sourceStart.second()).millisecond(0)
+      : targetDate.hour(sourceStart.hour()).minute(sourceStart.minute()).second(sourceStart.second()).millisecond(0);
+    const nextEnd = nextStart.add(durationMinutes, "minute");
+    try {
+      await persistCalendarEventUpdate(
+        calendarEvent,
+        {
+          starts_at: nextStart.toISOString(),
+          ends_at: nextEnd.toISOString()
+        },
+        "Appointment moved."
+      );
+      setCalDate(nextStart);
+    } catch (e) {
+      setError(e.message);
+      setSuccessMessage("");
+    }
+  }
+
+  async function handleCalendarContextAction(action) {
+    const contextEvent = timelineCalendarEvents.find((item) => item.occurrence_key === calendarContextMenu.occurrenceKey)
+      || data.calendar.find((item) => Number(item.id) === Number(calendarContextMenu.eventId))
+      || null;
+    const targetDate = calendarContextMenu.dateKey ? dayjs(calendarContextMenu.dateKey) : (contextEvent?.starts_at ? dayjs(contextEvent.starts_at) : calDate);
+    
+    if (action === "new_appointment") {
+      openCalendarEditor(targetDate);
+      return;
+    }
+    if (action === "new_all_day_event") {
+      setCalendarEditor({
+        open: true,
+        mode: "create",
+        eventId: null,
+        seriesEventId: null,
+        scope: "series",
+        occurrenceStart: "",
+        canEditOccurrence: false,
+        form: {
+          ...createDefaultCalendarForm(targetDate),
+          is_all_day: true
+        }
+      });
+      closeCalendarContextMenu();
+      return;
+    }
+    if (action === "new_meeting" || action === "new_meeting_request") {
+      setCalendarEditor({
+        open: true,
+        mode: "create",
+        eventId: null,
+        seriesEventId: null,
+        scope: "series",
+        occurrenceStart: "",
+        canEditOccurrence: false,
+        form: {
+          ...createDefaultCalendarForm(targetDate),
+          category: "Meeting",
+          status: "Busy"
+        }
+      });
+      closeCalendarContextMenu();
+      return;
+    }
+    if (action === "new_teamviewer_meeting") {
+      setCalendarEditor({
+        open: true,
+        mode: "create",
+        eventId: null,
+        seriesEventId: null,
+        scope: "series",
+        occurrenceStart: "",
+        canEditOccurrence: false,
+        form: {
+          ...createDefaultCalendarForm(targetDate),
+          category: "Meeting",
+          location: "TeamViewer Meeting",
+          description: "Please join the TeamViewer meeting: https://meeting.teamviewer.com/v/12345678"
+        }
+      });
+      closeCalendarContextMenu();
+      return;
+    }
+    if (action === "new_recurring_appointment") {
+      setCalendarEditor({
+        open: true,
+        mode: "create",
+        eventId: null,
+        seriesEventId: null,
+        scope: "series",
+        occurrenceStart: "",
+        canEditOccurrence: false,
+        form: {
+          ...createDefaultCalendarForm(targetDate),
+          recurrence_pattern: "daily",
+          recurrence_interval: 1
+        }
+      });
+      closeCalendarContextMenu();
+      return;
+    }
+    if (action === "new_recurring_event") {
+      setCalendarEditor({
+        open: true,
+        mode: "create",
+        eventId: null,
+        seriesEventId: null,
+        scope: "series",
+        occurrenceStart: "",
+        canEditOccurrence: false,
+        form: {
+          ...createDefaultCalendarForm(targetDate),
+          is_all_day: true,
+          recurrence_pattern: "daily",
+          recurrence_interval: 1
+        }
+      });
+      closeCalendarContextMenu();
+      return;
+    }
+    if (action === "new_recurring_meeting") {
+      setCalendarEditor({
+        open: true,
+        mode: "create",
+        eventId: null,
+        seriesEventId: null,
+        scope: "series",
+        occurrenceStart: "",
+        canEditOccurrence: false,
+        form: {
+          ...createDefaultCalendarForm(targetDate),
+          category: "Meeting",
+          status: "Busy",
+          recurrence_pattern: "daily",
+          recurrence_interval: 1
+        }
+      });
+      closeCalendarContextMenu();
+      return;
+    }
+    if (action.startsWith("color_")) {
+      if (contextEvent) {
+        const colorMap = {
+          color_blue: "#2563eb",
+          color_green: "#16a34a",
+          color_orange: "#ea580c",
+          color_purple: "#9333ea",
+          color_red: "#dc2626"
+        };
+        const colorValue = colorMap[action];
+        if (colorValue) {
+          await persistCalendarEventUpdate(contextEvent, { color: colorValue });
+          setSuccessMessage("Appointment category color updated.");
+        }
+      } else {
+        setError("Please right-click an appointment to set its color.");
+      }
+      closeCalendarContextMenu();
+      return;
+    }
+    if (action === "calendar_options") {
+      setDialog({
+        title: "Calendar Options",
+        message: "You can configure calendar settings, categories, and notifications under Settings > Server Settings."
+      });
+      closeCalendarContextMenu();
+      return;
+    }
+    if (action === "view_settings") {
+      setDialog({
+        title: "View Settings",
+        message: "Calendar views are styled in dark mode with a Saturday-to-Friday week format."
+      });
+      closeCalendarContextMenu();
+      return;
+    }
+    if (action === "edit" && contextEvent) {
+      openCalendarEditor(dayjs(contextEvent.starts_at), contextEvent);
+      return;
+    }
+    if (action === "edit_series" && contextEvent) {
+      openCalendarSeriesEditor(contextEvent);
+      return;
+    }
+    if (action === "today") {
+      setCalDate(dayjs(getJordanNowDateTimeInput()));
+      setCalView("day");
+      closeCalendarContextMenu();
+      return;
+    }
+    if (action === "go_to_date") {
+      setCalDate(targetDate);
+      setCalView("day");
+      closeCalendarContextMenu();
+      return;
+    }
+    if (action === "delete" && contextEvent) {
+      await handleDeleteCalendarEvent(contextEvent, {
+        scope: isCalendarOccurrenceEditable(contextEvent) ? "occurrence" : "series",
+        confirmText: isCalendarOccurrenceEditable(contextEvent)
+          ? "Delete only this occurrence and keep the rest of the series?"
+          : "Delete this appointment?"
+      });
+      return;
+    }
+    if (action === "delete_series" && contextEvent) {
+      await handleDeleteCalendarEvent(contextEvent, { scope: "series", successText: "Series deleted." });
+      return;
+    }
+    if (action === "skip_occurrence" && contextEvent) {
+      await handleDeleteCalendarEvent(contextEvent, {
+        scope: "occurrence",
+        confirmText: "Skip this occurrence from the series?",
+        successText: "Occurrence skipped."
+      });
+      return;
+    }
+  }
+
   async function handleExportAction(format) { if (!filteredEmails.length) { setError("No results to export."); return; } await exportSearchResults(format); }
 
   function getPriorityColor(p) {
@@ -4412,65 +6654,946 @@ function App() {
 
   // ===== CALENDAR VIEW =====
   function renderCalendar() {
-    const currentCells = calView === "week" ? weeklyCalendar : monthlyCalendar;
-    const navTitle = calView === "week" ? calDate.format("MMM D, YYYY") : calDate.format("MMMM YYYY");
+    const currentCells = monthlyCalendar;
+    const navTitle = calView === "day"
+      ? calDate.format("dddd, D MMMM YYYY")
+      : calView === "week"
+        ? `${calDate.startOf("week").format("D MMM")} - ${calDate.endOf("week").format("D MMM YYYY")}`
+        : calDate.format("MM YYYY");
+    const contextMenuEvent = timelineCalendarEvents.find((item) => item.occurrence_key === calendarContextMenu.occurrenceKey)
+      || data.calendar.find((item) => Number(item.id) === Number(calendarContextMenu.eventId))
+      || null;
+    const canManageSelectedOccurrence = isCalendarOccurrenceEditable(selectedCalendarEvent);
+    const upcomingEvents = [...(timelineCalendarEvents || [])]
+      .filter((event) => new Date(event.ends_at || event.starts_at).getTime() >= Date.now() - 24 * 60 * 60 * 1000)
+      .sort((a, b) => new Date(a.starts_at).getTime() - new Date(b.starts_at).getTime())
+      .slice(0, 8);
 
     return (
-      <div className="o365-calendar">
-        <div className="o365-cal-sidebar">
-          <div className="o365-settings-section">
-            <h3 style={{ border: "none", padding: "8px 0" }}>Calendar</h3>
-            <div className="o365-settings-body" style={{ padding: 8 }}>
-              <button className="o365-ribbon-btn o365-ribbon-primary" onClick={openCalendarView} style={{ marginBottom: 8, width: "100%", padding: "6px" }}>
-                <Plus size={16} /> New Event
+      <div
+        className={`o365-calendar outlook-calendar-shell ${calendarDragState ? "is-dragging-calendar" : ""}`}
+        onClick={() => {
+          closeCalendarContextMenu();
+          setWeekAllDayPopover({ visible: false, dayIndex: null, x: 0, y: 0 });
+        }}
+      >
+        <div className="outlook-calendar-sidebar">
+          <button
+            className="outlook-calendar-primary"
+            type="button"
+            onClick={() => openCalendarEditor(calDate)}
+          >
+            <Plus size={16} />
+            <span>New Appointment</span>
+          </button>
+
+          {calendarSidebarMonths.map((monthDate) => {
+            const miniCells = buildMiniCalendarCells(monthDate);
+            return (
+              <div key={monthDate.format("YYYY-MM")} className="outlook-mini-calendar">
+                <div className="outlook-mini-calendar-header">{monthDate.format("MM YYYY")}</div>
+                <div className="outlook-mini-calendar-weekdays">
+                  {weekdayLabels.map((label) => <span key={`${monthDate.format("MM")}-${label}`}>{label.slice(0, 2)}</span>)}
+                </div>
+                <div className="outlook-mini-calendar-grid">
+                  {miniCells.map((cellDate) => {
+                    const dateKey = cellDate.format("YYYY-MM-DD");
+                    const isToday = dateKey === getJordanNowDateKey();
+                    const isActive = dateKey === calDate.format("YYYY-MM-DD");
+                    return (
+                      <button
+                        key={dateKey}
+                        type="button"
+                        className={`outlook-mini-calendar-cell ${cellDate.month() !== monthDate.month() ? "other" : ""} ${isToday ? "today" : ""} ${isActive ? "active" : ""}`}
+                        onClick={() => setCalDate(cellDate)}
+                      >
+                        {cellDate.date()}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+
+          <div className="outlook-calendar-sidebar-card">
+            <div className="outlook-calendar-sidebar-title">Upcoming</div>
+            {upcomingEvents.length ? upcomingEvents.map((event) => (
+              <button
+                key={event.occurrence_key || event.id}
+                type="button"
+                className={`outlook-upcoming-item ${selectedCalendarOccurrenceKey === event.occurrence_key ? "active" : ""}`}
+                onClick={() => {
+                  setSelectedCalendarEventId(getCalendarSeriesEventId(event) || event.id);
+                  setSelectedCalendarOccurrenceKey(event.occurrence_key || "");
+                  setCalDate(dayjs(event.starts_at));
+                }}
+              >
+                <span className="outlook-upcoming-dot" style={{ background: event.color || "#0f6cbd" }} />
+                <span className="outlook-upcoming-main">
+                  <strong>{event.title}</strong>
+                  <small>{formatJordanDateValue(event.starts_at, { month: "2-digit", day: "2-digit", year: "numeric" })} {formatJordanTimeValue(event.starts_at, { month: undefined, day: undefined, year: undefined })}</small>
+                </span>
               </button>
-              <h4 style={{ fontSize: 12, margin: "8px 0", color: "#666" }}>Upcoming</h4>
-              {data.reminders.length ? data.reminders.slice(0, 5).map(r => (
-                <div key={r.id} style={{ fontSize: 11, padding: "4px 0", borderBottom: "1px solid #eee" }}>
-                  <strong>{r.title}</strong><br />
-                  <span style={{ color: "#666" }}>{formatJordanTimeValue(r.remind_at, { month: "short", day: "2-digit", year: undefined })}</span>
+            )) : <div className="outlook-empty-hint">No upcoming appointments</div>}
+          </div>
+        </div>
+
+        <div className="outlook-calendar-main">
+          <div className="outlook-calendar-toolbar">
+            <div className="outlook-calendar-toolbar-left">
+              <button type="button" className="outlook-toolbar-btn" onClick={() => setCalDate(dayjs(getJordanNowDateTimeInput()))}>Today</button>
+              <button type="button" className="outlook-toolbar-icon" onClick={() => setCalDate((d) => d.subtract(1, calView === "day" ? "day" : calView === "week" ? "week" : "month"))}><ChevronLeft size={16} /></button>
+              <button type="button" className="outlook-toolbar-icon" onClick={() => setCalDate((d) => d.add(1, calView === "day" ? "day" : calView === "week" ? "week" : "month"))}><ChevronRight size={16} /></button>
+              <div className="outlook-calendar-title">{navTitle}</div>
+            </div>
+            <div className="outlook-calendar-toolbar-right">
+              <div className="o365-cal-view-options outlook-view-switch">
+                <button className={calView === "month" ? "active" : ""} onClick={() => setCalView("month")}>Month</button>
+                <button className={calView === "week" ? "active" : ""} onClick={() => setCalView("week")}>Week</button>
+                <button className={calView === "day" ? "active" : ""} onClick={() => setCalView("day")}>Day</button>
+              </div>
+              <button type="button" className="outlook-toolbar-btn" onClick={() => setCurrentView("mail")}>Back to Mail</button>
+            </div>
+          </div>
+
+          <div className="outlook-calendar-surface">
+            {calView === "day" ? (
+              <div className="outlook-day-board" onContextMenu={(event) => openCalendarContextMenu(event, { dateKey: calDate.format("YYYY-MM-DD") })}>
+                <div className="outlook-day-board-header">{calDate.format("dddd, D MMMM YYYY")}</div>
+                <div className="outlook-day-grid">
+                  <div className="outlook-day-allday-row">
+                    <div className="outlook-day-allday-label">All day</div>
+                    <div
+                      className="outlook-day-allday-events"
+                      onDragOver={(event) => event.preventDefault()}
+                      onDrop={async (mouseEvent) => {
+                        mouseEvent.preventDefault();
+                        const raw = mouseEvent.dataTransfer.getData("application/x-calendar-event");
+                        if (!raw) return;
+                        try {
+                          const payload = JSON.parse(raw);
+                          const draggedEvent = timelineCalendarEvents.find((item) => item.occurrence_key === payload.occurrenceKey)
+                            || timelineCalendarEvents.find((item) => Number(item.id) === Number(payload.eventId));
+                          if (draggedEvent) {
+                            await handleMoveCalendarEvent(calDate.format("YYYY-MM-DD"), draggedEvent);
+                          }
+                        } catch {}
+                        setCalendarDragState(null);
+                      }}
+                    >
+                      {currentDayAllDayEvents.length ? currentDayAllDayEvents.map((event) => (
+                        <button
+                          key={`day-allday-${event.occurrence_key || event.id}`}
+                          type="button"
+                          className={`outlook-day-allday-event ${selectedCalendarOccurrenceKey === event.occurrence_key ? "active" : ""}`}
+                          style={{ borderLeftColor: event.color || "#0f6cbd" }}
+                          onClick={() => {
+                            setSelectedCalendarEventId(getCalendarSeriesEventId(event) || event.id);
+                            setSelectedCalendarOccurrenceKey(event.occurrence_key || "");
+                          }}
+                          onDoubleClick={() => openCalendarEditor(dayjs(event.starts_at), event)}
+                          onContextMenu={(mouseEvent) => openCalendarContextMenu(mouseEvent, { calendarEvent: event, dateKey: calDate.format("YYYY-MM-DD") })}
+                        >
+                          <strong>{event.title}</strong>
+                          <span>{event.continuesBefore ? "Starts earlier" : ""}{event.continuesBefore && event.continuesAfter ? " | " : ""}{event.continuesAfter ? "Ends later" : ""}</span>
+                        </button>
+                      )) : <div className="outlook-empty-hint">No all-day appointments.</div>}
+                    </div>
+                  </div>
+                  <div className="outlook-day-timeline">
+                    <div className="outlook-day-time-column">
+                      {weekTimeSlots.map((slot) => (
+                        <div key={`day-label-${slot.index}`} className="outlook-day-time-cell">{slot.label}</div>
+                      ))}
+                    </div>
+                    <div
+                      className="outlook-day-slots"
+                      style={{ minHeight: `${weekGridHeight}px` }}
+                      onDragOver={(event) => event.preventDefault()}
+                      onDrop={async (mouseEvent) => {
+                        mouseEvent.preventDefault();
+                        const raw = mouseEvent.dataTransfer.getData("application/x-calendar-event");
+                        if (!raw) return;
+                        try {
+                          const payload = JSON.parse(raw);
+                          const draggedEvent = timelineCalendarEvents.find((item) => item.occurrence_key === payload.occurrenceKey)
+                            || timelineCalendarEvents.find((item) => Number(item.id) === Number(payload.eventId));
+                          if (draggedEvent) {
+                            const dropDateTime = getWeekDropDateTime(currentDayStart.hour(CALENDAR_WEEK_START_HOUR).minute(0).second(0).millisecond(0), mouseEvent.clientY, mouseEvent.currentTarget);
+                            await handleMoveCalendarEvent(dropDateTime.toISOString(), draggedEvent);
+                          }
+                        } catch {}
+                        setCalendarDragState(null);
+                      }}
+                    >
+                      {weekTimeSlots.map((slot) => (
+                        <div key={`day-slot-${slot.index}`} className="outlook-day-slot" />
+                      ))}
+                      {currentDayTimedEvents.map((event) => {
+                        const dayStart = currentDayStart.hour(CALENDAR_WEEK_START_HOUR).minute(0).second(0).millisecond(0);
+                        const dayEnd = dayStart.add((CALENDAR_WEEK_END_HOUR - CALENDAR_WEEK_START_HOUR) * 60, "minute");
+                        const eventStart = dayjs(event.starts_at);
+                        const eventEnd = dayjs(event.ends_at);
+                        const visibleStart = eventStart.isBefore(dayStart) ? dayStart : eventStart;
+                        const visibleEnd = eventEnd.isAfter(dayEnd) ? dayEnd : eventEnd;
+                        if (!visibleEnd.isAfter(dayStart) || !visibleStart.isBefore(dayEnd)) {
+                          return null;
+                        }
+                        const minutesFromStart = Math.max(0, visibleStart.diff(dayStart, "minute"));
+                        const durationMinutes = Math.max(CALENDAR_WEEK_SLOT_MINUTES, visibleEnd.diff(visibleStart, "minute"));
+                        const top = (minutesFromStart / CALENDAR_WEEK_SLOT_MINUTES) * CALENDAR_WEEK_SLOT_HEIGHT;
+                        const height = Math.max(CALENDAR_WEEK_SLOT_HEIGHT, (durationMinutes / CALENDAR_WEEK_SLOT_MINUTES) * CALENDAR_WEEK_SLOT_HEIGHT);
+                        const columnWidth = 100 / Math.max(1, event.totalColumns || 1);
+                        const spanWidth = columnWidth * Math.max(1, event.spanColumns || 1);
+                        return (
+                          <div
+                            key={`day-timed-${event.occurrence_key || event.id}`}
+                            className={`outlook-day-timed-event ${selectedCalendarOccurrenceKey === event.occurrence_key ? "active" : ""}`}
+                            style={{
+                              top,
+                              height,
+                              borderLeftColor: event.color || "#0f6cbd",
+                              left: `calc(${columnWidth * event.columnIndex}% + 6px)`,
+                              width: `calc(${spanWidth}% - 10px)`
+                            }}
+                            onClick={() => {
+                              setSelectedCalendarEventId(getCalendarSeriesEventId(event) || event.id);
+                              setSelectedCalendarOccurrenceKey(event.occurrence_key || "");
+                            }}
+                            onDoubleClick={() => openCalendarEditor(dayjs(event.starts_at), event)}
+                            onContextMenu={(mouseEvent) => openCalendarContextMenu(mouseEvent, { calendarEvent: event, dateKey: calDate.format("YYYY-MM-DD") })}
+                            draggable
+                            onDragStart={(mouseEvent) => {
+                              const payload = JSON.stringify({ eventId: event.id, occurrenceKey: event.occurrence_key, startsAt: event.starts_at, endsAt: event.ends_at });
+                              mouseEvent.dataTransfer.setData("application/x-calendar-event", payload);
+                              mouseEvent.dataTransfer.effectAllowed = "move";
+                              setCalendarDragState({ eventId: event.id, occurrenceKey: event.occurrence_key });
+                            }}
+                            onDragEnd={() => setCalendarDragState(null)}
+                          >
+                            <strong>{formatJordanTimeValue(event.starts_at, { month: undefined, day: undefined, year: undefined })} {event.title}</strong>
+                            <span>{event.location || event.category || "Appointment"}</span>
+                            <div className="outlook-day-event-meta">
+                              {event.reminder_enabled ? <small><Bell size={12} /> Reminder {event.reminder_minutes || 0} min</small> : null}
+                              {(isCalendarOccurrenceEditable(event) || String(event.recurrence_pattern || "none") !== "none") ? <small><RefreshCw size={12} /> Series</small> : null}
+                            </div>
+                            <button
+                              type="button"
+                              className="outlook-day-event-resize"
+                              onMouseDown={(mouseEvent) => {
+                                mouseEvent.stopPropagation();
+                                setCalendarResizeState({ eventId: event.id, occurrenceKey: event.occurrence_key, startY: mouseEvent.clientY, currentY: mouseEvent.clientY });
+                              }}
+                              title="Resize duration"
+                            >
+                              ⋮
+                            </button>
+                          </div>
+                        );
+                      })}
+                      {!currentDayTimedEvents.length && !currentDayAllDayEvents.length ? (
+                        <div className="outlook-empty-hint">No appointments for this day.</div>
+                      ) : null}
+                    </div>
+                  </div>
                 </div>
-              )) : <div style={{ fontSize: 11, color: "#999" }}>No upcoming events</div>}
+              </div>
+            ) : calView === "week" ? (
+              <div className="outlook-week-board">
+                <div className="outlook-week-header">
+                  <div className="outlook-week-time-gutter" />
+                  {weeklyCalendar.map((day) => {
+                    const dateKey = day.date.format("YYYY-MM-DD");
+                    const isToday = dateKey === getJordanNowDateKey();
+                    const isSelected = dateKey === calDate.format("YYYY-MM-DD");
+                    return (
+                      <div
+                        key={`header-${dateKey}`}
+                        className={`outlook-week-header-cell ${isToday ? "today" : ""} ${isSelected ? "selected" : ""}`}
+                        onClick={() => setCalDate(day.date)}
+                      >
+                        <strong>{day.date.format("ddd")}</strong>
+                        <span>{day.date.format("DD/MM")}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div
+                  className="outlook-week-allday-grid"
+                  style={{ gridTemplateRows: `repeat(${weekAllDayVisibleRowCount}, ${CALENDAR_WEEK_ALLDAY_ROW_HEIGHT}px)` }}
+                >
+                  <div className="outlook-week-allday-label" style={{ gridRow: `1 / span ${weekAllDayVisibleRowCount}` }}>All day</div>
+                  {weeklyCalendar.map((day) => {
+                    const dateKey = day.date.format("YYYY-MM-DD");
+                    return (
+                      <div
+                        key={`allday-cell-${dateKey}`}
+                        className="outlook-week-allday-cell"
+                        style={{ gridColumn: `${day.date.diff(weekStartDate, "day") + 2}`, gridRow: `1 / span ${weekAllDayVisibleRowCount}` }}
+                        onDragOver={(event) => event.preventDefault()}
+                        onDrop={async (mouseEvent) => {
+                          mouseEvent.preventDefault();
+                          const raw = mouseEvent.dataTransfer.getData("application/x-calendar-event");
+                          if (!raw) return;
+                          try {
+                            const payload = JSON.parse(raw);
+                            const draggedEvent = timelineCalendarEvents.find((item) => item.occurrence_key === payload.occurrenceKey)
+                              || timelineCalendarEvents.find((item) => Number(item.id) === Number(payload.eventId));
+                            if (draggedEvent) {
+                              await handleMoveCalendarEvent(dateKey, draggedEvent);
+                            }
+                          } catch {}
+                          setCalendarDragState(null);
+                        }}
+                      />
+                    );
+                  })}
+                  {weekAllDayLayout.items.filter((event) => event.rowIndex < CALENDAR_WEEK_ALLDAY_VISIBLE_ROWS).map((event) => (
+                    <button
+                      key={`allday-${event.occurrence_key || event.id}`}
+                      type="button"
+                      className={`outlook-week-allday-event ${selectedCalendarOccurrenceKey === event.occurrence_key ? "active" : ""}`}
+                      style={{
+                        gridColumn: `${event.startIndex + 2} / span ${event.spanDays}`,
+                        gridRow: event.rowIndex + 1,
+                        borderLeftColor: event.color || "#0f6cbd"
+                      }}
+                      onClick={() => {
+                        setSelectedCalendarEventId(getCalendarSeriesEventId(event) || event.id);
+                        setSelectedCalendarOccurrenceKey(event.occurrence_key || "");
+                      }}
+                      onDoubleClick={() => openCalendarEditor(dayjs(event.starts_at), event)}
+                      onContextMenu={(mouseEvent) => openCalendarContextMenu(mouseEvent, { calendarEvent: event, dateKey: getJordanDateKey(event.starts_at) })}
+                      draggable
+                      onDragStart={(mouseEvent) => {
+                        const payload = JSON.stringify({ eventId: event.id, occurrenceKey: event.occurrence_key, startsAt: event.starts_at, endsAt: event.ends_at });
+                        mouseEvent.dataTransfer.setData("application/x-calendar-event", payload);
+                        mouseEvent.dataTransfer.effectAllowed = "move";
+                        setCalendarDragState({ eventId: event.id, occurrenceKey: event.occurrence_key });
+                      }}
+                      onDragEnd={() => setCalendarDragState(null)}
+                    >
+                      <span
+                        className="outlook-week-allday-resize start"
+                        onMouseDown={(mouseEvent) => {
+                          mouseEvent.stopPropagation();
+                          const dayCell = mouseEvent.currentTarget.closest(".outlook-week-allday-grid")?.querySelector(".outlook-week-allday-cell");
+                          const dayWidth = dayCell?.getBoundingClientRect?.().width || 0;
+                          setCalendarResizeState({
+                            mode: "horizontal",
+                            edge: "start",
+                            eventId: event.id,
+                            occurrenceKey: event.occurrence_key,
+                            startX: mouseEvent.clientX,
+                            dayWidth
+                          });
+                        }}
+                      />
+                      <strong>
+                        {event.continuesBefore ? "..." : ""}
+                        {event.title}
+                        {event.continuesAfter ? " ..." : ""}
+                      </strong>
+                      {!event.is_all_day ? (
+                        <span>{formatJordanTimeValue(event.starts_at, { month: undefined, day: undefined, year: undefined })}</span>
+                      ) : null}
+                      <span
+                        className="outlook-week-allday-resize end"
+                        onMouseDown={(mouseEvent) => {
+                          mouseEvent.stopPropagation();
+                          const dayCell = mouseEvent.currentTarget.closest(".outlook-week-allday-grid")?.querySelector(".outlook-week-allday-cell");
+                          const dayWidth = dayCell?.getBoundingClientRect?.().width || 0;
+                          setCalendarResizeState({
+                            mode: "horizontal",
+                            edge: "end",
+                            eventId: event.id,
+                            occurrenceKey: event.occurrence_key,
+                            startX: mouseEvent.clientX,
+                            dayWidth
+                          });
+                        }}
+                      />
+                    </button>
+                  ))}
+                  {weekAllDayOverflow.map((item) => (
+                    <button
+                      key={`allday-more-${item.dayIndex}`}
+                      type="button"
+                      className="outlook-week-allday-more"
+                      style={{
+                        gridColumn: `${item.dayIndex + 2}`,
+                        gridRow: weekAllDayVisibleRowCount
+                      }}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        const rect = event.currentTarget.getBoundingClientRect();
+                        setWeekAllDayPopover({
+                          visible: true,
+                          dayIndex: item.dayIndex,
+                          x: Math.max(12, Math.min(rect.left, window.innerWidth - 320)),
+                          y: Math.min(rect.bottom + 8, window.innerHeight - 220)
+                        });
+                      }}
+                    >
+                      +{item.count} more
+                    </button>
+                  ))}
+                </div>
+                <div className="outlook-week-grid">
+                  <div className="outlook-week-time-column">
+                    {weekTimeSlots.map((slot) => (
+                      <div key={`label-${slot.index}`} className="outlook-week-time-cell">{slot.label}</div>
+                    ))}
+                  </div>
+                  {weeklyCalendar.map((day) => {
+                    const dateKey = day.date.format("YYYY-MM-DD");
+                    const dayStart = day.date.hour(CALENDAR_WEEK_START_HOUR).minute(0).second(0).millisecond(0);
+                    const dayEnd = dayStart.add((CALENDAR_WEEK_END_HOUR - CALENDAR_WEEK_START_HOUR) * 60, "minute");
+                    return (
+                      <div
+                        key={`column-${dateKey}`}
+                        className="outlook-week-day-column"
+                        onContextMenu={(event) => openCalendarContextMenu(event, { dateKey })}
+                      >
+                        <div
+                          className="outlook-week-day-slots"
+                          style={{ minHeight: `${weekGridHeight}px` }}
+                          onDragOver={(event) => event.preventDefault()}
+                          onDrop={async (mouseEvent) => {
+                            mouseEvent.preventDefault();
+                            const raw = mouseEvent.dataTransfer.getData("application/x-calendar-event");
+                            if (!raw) return;
+                            try {
+                              const payload = JSON.parse(raw);
+                              const draggedEvent = timelineCalendarEvents.find((item) => item.occurrence_key === payload.occurrenceKey)
+                                || timelineCalendarEvents.find((item) => Number(item.id) === Number(payload.eventId));
+                              if (draggedEvent) {
+                                const dropDateTime = getWeekDropDateTime(dayStart, mouseEvent.clientY, mouseEvent.currentTarget);
+                                await handleMoveCalendarEvent(dropDateTime.toISOString(), draggedEvent);
+                              }
+                            } catch {}
+                            setCalendarDragState(null);
+                          }}
+                        >
+                          {weekTimeSlots.map((slot) => (
+                            <div
+                              key={`slot-${dateKey}-${slot.index}`}
+                              className="outlook-week-slot"
+                            />
+                          ))}
+                          {day.timedEvents.map((event) => {
+                            const eventStart = dayjs(event.starts_at);
+                            const eventEnd = dayjs(event.ends_at);
+                            const visibleStart = eventStart.isBefore(dayStart) ? dayStart : eventStart;
+                            const visibleEnd = eventEnd.isAfter(dayEnd) ? dayEnd : eventEnd;
+                            if (!visibleEnd.isAfter(dayStart) || !visibleStart.isBefore(dayEnd)) {
+                              return null;
+                            }
+                            const minutesFromStart = Math.max(0, visibleStart.diff(dayStart, "minute"));
+                            const durationMinutes = Math.max(CALENDAR_WEEK_SLOT_MINUTES, visibleEnd.diff(visibleStart, "minute"));
+                            const top = (minutesFromStart / CALENDAR_WEEK_SLOT_MINUTES) * CALENDAR_WEEK_SLOT_HEIGHT;
+                            const height = Math.max(CALENDAR_WEEK_SLOT_HEIGHT, (durationMinutes / CALENDAR_WEEK_SLOT_MINUTES) * CALENDAR_WEEK_SLOT_HEIGHT);
+                            const columnWidth = 100 / Math.max(1, event.totalColumns || 1);
+                            const spanWidth = columnWidth * Math.max(1, event.spanColumns || 1);
+                            return (
+                              <div
+                                key={event.occurrence_key || event.id}
+                                className={`outlook-week-event ${selectedCalendarOccurrenceKey === event.occurrence_key ? "active" : ""}`}
+                                style={{
+                                  top,
+                                  height,
+                                  borderLeftColor: event.color || "#0f6cbd",
+                                  left: `calc(${columnWidth * event.columnIndex}% + 6px)`,
+                                  width: `calc(${spanWidth}% - 10px)`
+                                }}
+                                onClick={() => {
+                                  setSelectedCalendarEventId(getCalendarSeriesEventId(event) || event.id);
+                                  setSelectedCalendarOccurrenceKey(event.occurrence_key || "");
+                                }}
+                                onDoubleClick={() => openCalendarEditor(dayjs(event.starts_at), event)}
+                                onContextMenu={(mouseEvent) => openCalendarContextMenu(mouseEvent, { calendarEvent: event, dateKey })}
+                                draggable
+                                onDragStart={(mouseEvent) => {
+                                  const payload = JSON.stringify({ eventId: event.id, occurrenceKey: event.occurrence_key, startsAt: event.starts_at, endsAt: event.ends_at });
+                                  mouseEvent.dataTransfer.setData("application/x-calendar-event", payload);
+                                  mouseEvent.dataTransfer.effectAllowed = "move";
+                                  setCalendarDragState({ eventId: event.id, occurrenceKey: event.occurrence_key });
+                                }}
+                                onDragEnd={() => setCalendarDragState(null)}
+                              >
+                                <strong>{formatJordanTimeValue(event.starts_at, { month: undefined, day: undefined, year: undefined })} {event.title}</strong>
+                                <span>{event.location || event.category || "Appointment"}</span>
+                                <button
+                                  type="button"
+                                  className="outlook-week-event-resize"
+                                  onMouseDown={(mouseEvent) => {
+                                    mouseEvent.stopPropagation();
+                                    setCalendarResizeState({ eventId: event.id, occurrenceKey: event.occurrence_key, startY: mouseEvent.clientY, currentY: mouseEvent.clientY });
+                                  }}
+                                  title="Resize duration"
+                                >
+                                  ⋮
+                                </button>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                {weekAllDayPopover.visible && Number.isInteger(weekAllDayPopover.dayIndex) ? (
+                  <div
+                    ref={weekAllDayPopoverRef}
+                    className="outlook-week-more-popover"
+                    style={{ left: weekAllDayPopover.x, top: weekAllDayPopover.y }}
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    <div className="outlook-week-more-popover-header">
+                      <strong>{weekStartDate.add(weekAllDayPopover.dayIndex, "day").format("dddd, D MMMM")}</strong>
+                      <button type="button" onClick={() => setWeekAllDayPopover({ visible: false, dayIndex: null, x: 0, y: 0 })}>Close</button>
+                    </div>
+                    <div className="outlook-week-more-popover-list">
+                      {weekAllDayPopoverEvents.map((event) => (
+                        <button
+                          key={`popover-${event.occurrence_key || event.id}`}
+                          type="button"
+                          className={`outlook-week-more-popover-item ${selectedCalendarOccurrenceKey === event.occurrence_key ? "active" : ""}`}
+                          style={{ borderLeftColor: event.color || "#0f6cbd" }}
+                          onClick={() => {
+                            setSelectedCalendarEventId(getCalendarSeriesEventId(event) || event.id);
+                            setSelectedCalendarOccurrenceKey(event.occurrence_key || "");
+                            setWeekAllDayPopover({ visible: false, dayIndex: null, x: 0, y: 0 });
+                          }}
+                          onDoubleClick={() => openCalendarEditor(dayjs(event.starts_at), event)}
+                          onContextMenu={(mouseEvent) => openCalendarContextMenu(mouseEvent, { calendarEvent: event, dateKey: weekStartDate.add(weekAllDayPopover.dayIndex, "day").format("YYYY-MM-DD") })}
+                        >
+                          <strong>{event.title}</strong>
+                          <span>{event.is_all_day ? "All day" : formatJordanTimeValue(event.starts_at, { month: undefined, day: undefined, year: undefined })}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            ) : (
+              <div className="outlook-month-board">
+                <div className="outlook-month-weekdays">
+                  {weekdayLabels.map((label) => (
+                    <div key={label} className="outlook-month-weekday">{label === "Sun" ? "Sunday" : label === "Mon" ? "Monday" : label === "Tue" ? "Tuesday" : label === "Wed" ? "Wednesday" : label === "Thu" ? "Thursday" : label === "Fri" ? "Friday" : "Saturday"}</div>
+                  ))}
+                </div>
+                <div className="outlook-month-grid">
+                  {currentCells.map((cell) => {
+                    const dateKey = cell.date.format("YYYY-MM-DD");
+                    const isToday = dateKey === getJordanNowDateKey();
+                    const isSelected = dateKey === calDate.format("YYYY-MM-DD");
+                    return (
+                      <div
+                        key={dateKey}
+                        className={`outlook-month-cell ${cell.date.month() !== calDate.month() && calView === "month" ? "other-month" : ""} ${isToday ? "today" : ""} ${isSelected ? "selected" : ""}`}
+                        onClick={() => setCalDate(cell.date)}
+                        onDoubleClick={() => openCalendarEditor(cell.date)}
+                        onContextMenu={(event) => openCalendarContextMenu(event, { dateKey })}
+                        onDragOver={(event) => event.preventDefault()}
+                        onDrop={async (mouseEvent) => {
+                          mouseEvent.preventDefault();
+                          const raw = mouseEvent.dataTransfer.getData("application/x-calendar-event");
+                          if (!raw) return;
+                          try {
+                            const payload = JSON.parse(raw);
+                            const draggedEvent = timelineCalendarEvents.find((item) => item.occurrence_key === payload.occurrenceKey) || timelineCalendarEvents.find((item) => Number(item.id) === Number(payload.eventId));
+                            if (draggedEvent) {
+                              await handleMoveCalendarEvent(dateKey, draggedEvent);
+                            }
+                          } catch {}
+                          setCalendarDragState(null);
+                        }}
+                      >
+                        <div className="outlook-month-cell-header">
+                          <span className="outlook-month-date">{cell.date.date()}</span>
+                          {cell.events.length > 0 ? <span className="outlook-month-count">+{cell.events.length}</span> : null}
+                        </div>
+                        <div className="outlook-month-events">
+                          {cell.events.slice(0, 4).map((event) => (
+                            <button
+                              key={event.occurrence_key || event.id}
+                              type="button"
+                              className={`outlook-month-event ${selectedCalendarOccurrenceKey === event.occurrence_key ? "active" : ""}`}
+                              style={{ background: event.color || "#0f6cbd" }}
+                              onClick={(mouseEvent) => {
+                                mouseEvent.stopPropagation();
+                                setSelectedCalendarEventId(getCalendarSeriesEventId(event) || event.id);
+                                setSelectedCalendarOccurrenceKey(event.occurrence_key || "");
+                              }}
+                              onDoubleClick={(mouseEvent) => {
+                                mouseEvent.stopPropagation();
+                                openCalendarEditor(dayjs(event.starts_at), event);
+                              }}
+                              onContextMenu={(mouseEvent) => openCalendarContextMenu(mouseEvent, { calendarEvent: event, dateKey })}
+                              draggable
+                              onDragStart={(mouseEvent) => {
+                                mouseEvent.stopPropagation();
+                                const payload = JSON.stringify({ eventId: event.id, occurrenceKey: event.occurrence_key, startsAt: event.starts_at, endsAt: event.ends_at });
+                                mouseEvent.dataTransfer.setData("application/x-calendar-event", payload);
+                                mouseEvent.dataTransfer.effectAllowed = "move";
+                                setCalendarDragState({ eventId: event.id, occurrenceKey: event.occurrence_key });
+                              }}
+                              onDragEnd={() => setCalendarDragState(null)}
+                            >
+                              <span className="outlook-month-event-time">{event.is_all_day ? "All day" : formatJordanTimeValue(event.starts_at, { month: undefined, day: undefined, year: undefined })}</span>
+                              <span className="outlook-month-event-title">{event.title}</span>
+                            </button>
+                          ))}
+                          {cell.events.length > 4 ? <div className="outlook-more-events">+{cell.events.length - 4} more</div> : null}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            <div className="outlook-calendar-inspector">
+              <div className="outlook-calendar-inspector-header">
+                <CalendarDays size={16} />
+                <span>{selectedCalendarEvent ? "Selected Appointment" : "Day Summary"}</span>
+              </div>
+              {selectedCalendarEvent ? (
+                <div className="outlook-calendar-inspector-body">
+                  <div className="outlook-inspector-color" style={{ background: selectedCalendarEvent.color || "#0f6cbd" }} />
+                  <h3>{selectedCalendarEvent.title}</h3>
+                  <div>{formatJordanDateValue(selectedCalendarEvent.starts_at, { month: "2-digit", day: "2-digit", year: "numeric" })}</div>
+                  <div>{selectedCalendarEvent.is_all_day ? "All day" : `${formatJordanTimeValue(selectedCalendarEvent.starts_at, { month: undefined, day: undefined, year: undefined })} - ${formatJordanTimeValue(selectedCalendarEvent.ends_at, { month: undefined, day: undefined, year: undefined })}`}</div>
+                  <div>{selectedCalendarEvent.location || "No location"}</div>
+                  <div>{selectedCalendarEvent.category || "Appointment"} • {selectedCalendarEvent.status || "Busy"}</div>
+                  {String(selectedCalendarEvent.recurrence_pattern || "none") !== "none" ? (
+                    <div>Recurring • {selectedCalendarEvent.recurrence_pattern} every {selectedCalendarEvent.recurrence_interval || 1} {selectedCalendarEvent.recurrence_pattern === "daily" ? "day(s)" : selectedCalendarEvent.recurrence_pattern === "weekly" ? "week(s)" : "month(s)"}</div>
+                  ) : null}
+                  {selectedCalendarEvent.description ? <p>{selectedCalendarEvent.description}</p> : null}
+                  {selectedCalendarEvent.reminder_enabled ? <div className="outlook-inspector-reminder"><Bell size={14} /> Reminder {selectedCalendarEvent.reminder_minutes || 0} minute(s) before</div> : null}
+                  <div className="outlook-inspector-actions">
+                    <button type="button" onClick={() => openCalendarEditor(dayjs(selectedCalendarEvent.starts_at), selectedCalendarEvent)}><Pen size={14} /> {canManageSelectedOccurrence ? "Edit Occurrence" : "Edit"}</button>
+                    {canManageSelectedOccurrence ? (
+                      <>
+                        <button type="button" onClick={() => openCalendarSeriesEditor(selectedCalendarEvent)}><RefreshCw size={14} /> Edit Series</button>
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteCalendarEvent(
+                            selectedCalendarEvent,
+                            {
+                              scope: "occurrence",
+                              confirmText: "Delete only this occurrence and keep the rest of the series?",
+                              successText: "Occurrence deleted from the series."
+                            }
+                          )}
+                          disabled={isDeletingCalendarEvent}
+                        >
+                          <Trash2 size={14} /> Delete Only This Occurrence
+                        </button>
+                        <button type="button" onClick={() => handleDeleteCalendarEvent(selectedCalendarEvent, { scope: "series", successText: "Series deleted." })} disabled={isDeletingCalendarEvent}><Trash2 size={14} /> Delete Series</button>
+                      </>
+                    ) : (
+                      <button type="button" onClick={() => handleDeleteCalendarEvent(selectedCalendarEvent, { scope: "series" })} disabled={isDeletingCalendarEvent}><Trash2 size={14} /> Delete</button>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div className="outlook-empty-hint">Select a day or appointment to see full details.</div>
+              )}
             </div>
           </div>
         </div>
-        <div className="o365-cal-main">
-          <div className="o365-cal-nav">
-            <button onClick={() => setCalDate(dayjs())}>Today</button>
-            <button onClick={() => setCalDate(d => d.subtract(1, calView === "week" ? "week" : "month"))}><ChevronLeft size={16} /></button>
-            <button onClick={() => setCalDate(d => d.add(1, calView === "week" ? "week" : "month"))}><ChevronRight size={16} /></button>
-            <h2>{navTitle}</h2>
-            <div className="o365-cal-view-options">
-              <button className={calView === "month" ? "active" : ""} onClick={() => setCalView("month")}>Month</button>
-              <button className={calView === "week" ? "active" : ""} onClick={() => setCalView("week")}>Week</button>
-              <button className={calView === "day" ? "active" : ""} onClick={() => setCalView("day")}>Day</button>
+
+        {calendarEditor.open ? (
+          <div className="outlook-calendar-modal-backdrop" onClick={closeCalendarEditor}>
+            <div className="outlook-calendar-modal" onClick={(event) => event.stopPropagation()}>
+              <div className="outlook-calendar-modal-header">
+                <div>
+                  <strong>{calendarEditor.mode === "edit" ? "Edit Appointment" : "New Appointment"}</strong>
+                  <div>
+                    {calendarEditor.mode === "edit"
+                      ? (calendarEditor.scope === "occurrence" ? "Update only this occurrence." : "Update the schedule and reminder.")
+                      : "Create an appointment with reminder."}
+                  </div>
+                </div>
+                <button type="button" className="outlook-toolbar-icon" onClick={closeCalendarEditor}><X size={16} /></button>
+              </div>
+              <div className="outlook-calendar-modal-body">
+                {calendarEditor.mode === "edit" && calendarEditor.canEditOccurrence ? (
+                  <div className="outlook-calendar-scope-banner">
+                    <span>{calendarEditor.scope === "occurrence" ? "Editing this occurrence only." : "Editing the entire series."}</span>
+                    <div className="outlook-calendar-scope-actions">
+                      <button type="button" className={calendarEditor.scope === "occurrence" ? "active" : ""} onClick={() => switchCalendarEditorScope("occurrence")}>This occurrence</button>
+                      <button type="button" className={calendarEditor.scope === "series" ? "active" : ""} onClick={() => switchCalendarEditorScope("series")}>Entire series</button>
+                    </div>
+                  </div>
+                ) : null}
+                <div className="outlook-calendar-form-row">
+                  <label>Subject</label>
+                  <input value={calendarEditor.form.title} onChange={(event) => updateCalendarEditorField("title", event.target.value)} placeholder="Appointment subject" />
+                </div>
+                <div className="outlook-calendar-form-grid">
+                  <div className="outlook-calendar-form-row">
+                    <label>Start</label>
+                    <input type="datetime-local" value={calendarEditor.form.starts_at} onChange={(event) => updateCalendarEditorField("starts_at", event.target.value)} />
+                  </div>
+                  <div className="outlook-calendar-form-row">
+                    <label>End</label>
+                    <input type="datetime-local" value={calendarEditor.form.ends_at} onChange={(event) => updateCalendarEditorField("ends_at", event.target.value)} />
+                  </div>
+                </div>
+                <div className="outlook-calendar-form-grid">
+                  <div className="outlook-calendar-form-row">
+                    <label>Location</label>
+                    <input value={calendarEditor.form.location} onChange={(event) => updateCalendarEditorField("location", event.target.value)} placeholder="Meeting room / link" />
+                  </div>
+                  <div className="outlook-calendar-form-row">
+                    <label>Category</label>
+                    <select value={calendarEditor.form.category} onChange={(event) => updateCalendarEditorField("category", event.target.value)}>
+                      <option value="Appointment">Appointment</option>
+                      <option value="Meeting">Meeting</option>
+                      <option value="Review">Review</option>
+                      <option value="Focus Time">Focus Time</option>
+                    </select>
+                  </div>
+                </div>
+                <div className="outlook-calendar-form-grid">
+                  <div className="outlook-calendar-form-row">
+                    <label>Status</label>
+                    <select value={calendarEditor.form.status} onChange={(event) => updateCalendarEditorField("status", event.target.value)}>
+                      <option value="Busy">Busy</option>
+                      <option value="Free">Free</option>
+                      <option value="Tentative">Tentative</option>
+                      <option value="Out of Office">Out of Office</option>
+                    </select>
+                  </div>
+                  <div className="outlook-calendar-form-row">
+                    <label>Color</label>
+                    <input type="color" value={calendarEditor.form.color} onChange={(event) => updateCalendarEditorField("color", event.target.value)} />
+                  </div>
+                </div>
+                <div className="outlook-calendar-check-row">
+                  <label><input type="checkbox" checked={calendarEditor.form.is_all_day} onChange={(event) => updateCalendarEditorField("is_all_day", event.target.checked)} /> All day</label>
+                  <label><input type="checkbox" checked={calendarEditor.form.reminder_enabled} onChange={(event) => updateCalendarEditorField("reminder_enabled", event.target.checked)} /> Reminder</label>
+                </div>
+                {calendarEditor.scope !== "occurrence" ? (
+                  <>
+                    <div className="outlook-calendar-form-grid">
+                      <div className="outlook-calendar-form-row">
+                        <label>Recurrence</label>
+                        <select value={calendarEditor.form.recurrence_pattern} onChange={(event) => updateCalendarEditorField("recurrence_pattern", event.target.value)}>
+                          <option value="none">Does not repeat</option>
+                          <option value="daily">Daily</option>
+                          <option value="weekly">Weekly</option>
+                          <option value="monthly">Monthly</option>
+                        </select>
+                      </div>
+                      {calendarEditor.form.recurrence_pattern !== "none" ? (
+                        <div className="outlook-calendar-form-row">
+                          <label>Repeat every</label>
+                          <input type="number" min="1" value={calendarEditor.form.recurrence_interval} onChange={(event) => updateCalendarEditorField("recurrence_interval", Number(event.target.value || 1))} />
+                        </div>
+                      ) : <div />}
+                    </div>
+                    {calendarEditor.form.recurrence_pattern === "weekly" ? (
+                      <div className="outlook-calendar-form-row">
+                        <label>Repeat on</label>
+                        <div className="outlook-calendar-day-pills">
+                          {RECURRENCE_DAY_KEYS.map((dayKey) => (
+                            <button
+                              key={dayKey}
+                              type="button"
+                              className={`outlook-calendar-day-pill ${calendarEditor.form.recurrence_days.includes(dayKey) ? "active" : ""}`}
+                              onClick={() => {
+                                const exists = calendarEditor.form.recurrence_days.includes(dayKey);
+                                const nextDays = exists
+                                  ? calendarEditor.form.recurrence_days.filter((item) => item !== dayKey)
+                                  : [...calendarEditor.form.recurrence_days, dayKey];
+                                updateCalendarEditorField("recurrence_days", nextDays.length ? nextDays : [dayKey]);
+                              }}
+                            >
+                              {dayKey}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
+                    {calendarEditor.form.recurrence_pattern !== "none" ? (
+                      <div className="outlook-calendar-form-grid">
+                        <div className="outlook-calendar-form-row">
+                          <label>Repeat until</label>
+                          <input type="date" value={calendarEditor.form.recurrence_until} onChange={(event) => updateCalendarEditorField("recurrence_until", event.target.value)} />
+                        </div>
+                        <div className="outlook-calendar-form-row">
+                          <label>Occurrences</label>
+                          <input type="number" min="1" value={calendarEditor.form.recurrence_count} onChange={(event) => updateCalendarEditorField("recurrence_count", event.target.value)} placeholder="Optional" />
+                        </div>
+                      </div>
+                    ) : null}
+                  </>
+                ) : null}
+                {calendarEditor.form.reminder_enabled ? (
+                  <div className="outlook-calendar-form-row">
+                    <label>Reminder</label>
+                    <select value={calendarEditor.form.reminder_minutes} onChange={(event) => updateCalendarEditorField("reminder_minutes", Number(event.target.value))}>
+                      {CALENDAR_REMINDER_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>{option.label}</option>
+                      ))}
+                    </select>
+                  </div>
+                ) : null}
+                <div className="outlook-calendar-form-row">
+                  <label>Notes</label>
+                  <textarea rows={4} value={calendarEditor.form.description} onChange={(event) => updateCalendarEditorField("description", event.target.value)} placeholder="Add appointment notes..." />
+                </div>
+              </div>
+              <div className="outlook-calendar-modal-actions">
+                {calendarEditor.mode === "edit" && calendarEditor.eventId ? (
+                  <button
+                    type="button"
+                    className="danger"
+                    onClick={() => handleDeleteCalendarEvent(
+                      selectedCalendarEvent || { id: calendarEditor.eventId, occurrence_original_start: calendarEditor.occurrenceStart },
+                      {
+                        scope: calendarEditor.scope === "occurrence" ? "occurrence" : "series",
+                        confirmText: calendarEditor.scope === "occurrence"
+                          ? "Delete only this occurrence and keep the rest of the series?"
+                          : "Delete this appointment?",
+                        successText: calendarEditor.scope === "occurrence" ? "Occurrence deleted from the series." : "Appointment deleted."
+                      }
+                    )}
+                    disabled={isDeletingCalendarEvent}
+                  >
+                    {calendarEditor.scope === "occurrence" ? "Delete Only This Occurrence" : "Delete"}
+                  </button>
+                ) : <span />}
+                <div className="outlook-calendar-modal-actions-right">
+                  <button type="button" onClick={closeCalendarEditor}>Cancel</button>
+                  <button type="button" className="primary" onClick={handleSaveCalendarEvent} disabled={isSavingCalendarEvent}>
+                    {isSavingCalendarEvent ? "Saving..." : calendarEditor.mode === "edit" ? (calendarEditor.scope === "occurrence" ? "Save Occurrence" : "Save Changes") : "Create Appointment"}
+                  </button>
+                </div>
+              </div>
             </div>
-            <button style={{ marginLeft: "auto" }} onClick={() => setCurrentView("mail")}>Back to Mail</button>
           </div>
-          {calView === "day" ? (
-            <div style={{ flex: 1, overflow: "auto", padding: 16 }}>
-              <h3 style={{ fontSize: 16, fontWeight: 300, marginBottom: 12 }}>{calDate.format("dddd, MMMM D, YYYY")}</h3>
-              {data.calendar.filter(ev => getJordanDateKey(ev.starts_at) === calDate.format("YYYY-MM-DD")).length ? data.calendar.filter(ev => getJordanDateKey(ev.starts_at) === calDate.format("YYYY-MM-DD")).map(ev => (
-                <div key={ev.id} style={{ padding: "8px 12px", background: "#deecf9", marginBottom: 4, borderLeft: "3px solid #243A80", fontSize: 12 }}>
-                  <strong>{ev.title}</strong> {formatJordanTimeValue(ev.starts_at, { month: undefined, day: undefined, year: undefined })} - {formatJordanTimeValue(ev.ends_at, { month: undefined, day: undefined, year: undefined })}
-                  {ev.location ? <span style={{ color: "#666", marginLeft: 8 }}>{ev.location}</span> : null}
+        ) : null}
+
+        {calendarContextMenu.visible ? (
+          <div
+            ref={calendarContextMenuRef}
+            className="o365-context-menu"
+            style={{ left: calendarContextMenu.x, top: calendarContextMenu.y }}
+            onClick={(event) => event.stopPropagation()}
+          >
+            {contextMenuEvent ? (
+              <>
+                <button className="o365-context-menu-item tone-reply" type="button" onClick={() => handleCalendarContextAction("edit")}>
+                  <div className="o365-context-menu-item-main"><Pen size={15} /><span>{isCalendarOccurrenceEditable(contextMenuEvent) ? "Edit Occurrence" : "Edit"}</span></div>
+                </button>
+                {isCalendarOccurrenceEditable(contextMenuEvent) ? (
+                  <>
+                    <button className="o365-context-menu-item tone-related" type="button" onClick={() => handleCalendarContextAction("edit_series")}>
+                      <div className="o365-context-menu-item-main"><RefreshCw size={15} /><span>Edit Series</span></div>
+                    </button>
+                    <button className="o365-context-menu-item tone-delete" type="button" onClick={() => handleCalendarContextAction("delete")}>
+                      <div className="o365-context-menu-item-main"><Trash2 size={15} /><span>Delete Only This Occurrence</span></div>
+                    </button>
+                    <button className="o365-context-menu-item tone-delete" type="button" onClick={() => handleCalendarContextAction("skip_occurrence")}>
+                      <div className="o365-context-menu-item-main"><Trash2 size={15} /><span>Skip Occurrence</span></div>
+                    </button>
+                    <button className="o365-context-menu-item tone-delete" type="button" onClick={() => handleCalendarContextAction("delete_series")}>
+                      <div className="o365-context-menu-item-main"><Trash2 size={15} /><span>Delete Series</span></div>
+                    </button>
+                  </>
+                ) : (
+                  <button className="o365-context-menu-item tone-delete" type="button" onClick={() => handleCalendarContextAction("delete")}>
+                    <div className="o365-context-menu-item-main"><Trash2 size={15} /><span>Delete</span></div>
+                  </button>
+                )}
+                <div className="o365-context-menu-separator" />
+              </>
+            ) : null}
+
+            <button className="o365-context-menu-item" type="button" onClick={() => handleCalendarContextAction("new_appointment")}>
+              <div className="o365-context-menu-item-main"><Calendar size={15} /><span>New Appointment</span></div>
+            </button>
+            <button className="o365-context-menu-item" type="button" onClick={() => handleCalendarContextAction("new_all_day_event")}>
+              <div className="o365-context-menu-item-main"><Calendar size={15} /><span>New All Day Event</span></div>
+            </button>
+            <button className="o365-context-menu-item" type="button" onClick={() => handleCalendarContextAction("new_meeting_request")}>
+              <div className="o365-context-menu-item-main"><Users size={15} /><span>New Meeting Request</span></div>
+            </button>
+            <button className="o365-context-menu-item" type="button" onClick={() => handleCalendarContextAction("new_teamviewer_meeting")}>
+              <div className="o365-context-menu-item-main"><Video size={15} /><span>New TeamViewer Meeting</span></div>
+            </button>
+
+            <div className="o365-context-menu-separator" />
+
+            <button className="o365-context-menu-item" type="button" onClick={() => handleCalendarContextAction("new_recurring_appointment")}>
+              <div className="o365-context-menu-item-main"><RefreshCw size={15} /><span>New Recurring Appointment</span></div>
+            </button>
+            <button className="o365-context-menu-item" type="button" onClick={() => handleCalendarContextAction("new_recurring_event")}>
+              <div className="o365-context-menu-item-main"><RefreshCw size={15} /><span>New Recurring Event</span></div>
+            </button>
+            <button className="o365-context-menu-item" type="button" onClick={() => handleCalendarContextAction("new_recurring_meeting")}>
+              <div className="o365-context-menu-item-main"><Users size={15} /><span>New Recurring Meeting</span></div>
+            </button>
+
+            <div className="o365-context-menu-separator" />
+
+            <button className="o365-context-menu-item" type="button" onClick={() => handleCalendarContextAction("today")}>
+              <div className="o365-context-menu-item-main"><CalendarDays size={15} /><span>Today</span></div>
+            </button>
+            <button className="o365-context-menu-item" type="button" onClick={() => handleCalendarContextAction("go_to_date")}>
+              <div className="o365-context-menu-item-main"><ClockIcon size={15} /><span>Go to Date...</span></div>
+            </button>
+
+            <div className="o365-context-menu-separator" />
+
+            <div
+              className="o365-context-menu-item has-submenu tone-categorize"
+              onMouseEnter={() => setCalendarContextMenu((prev) => ({ ...prev, submenu: "color" }))}
+              onMouseLeave={() => setCalendarContextMenu((prev) => (prev.submenu ? { ...prev, submenu: null } : prev))}
+            >
+              <div className="o365-context-menu-item-main">
+                <Bookmark size={15} /> <span>Color</span>
+              </div>
+              <ChevronRight size={14} />
+              {calendarContextMenu.submenu === "color" ? (
+                <div className="o365-context-submenu" style={{ top: "-30px" }}>
+                  {OUTLOOK_CONTEXT_CATEGORIES.map((category) => (
+                    <button
+                      key={category.value}
+                      className="o365-context-menu-item submenu-item"
+                      type="button"
+                      onClick={() => handleCalendarContextAction(
+                        category.value === "Blue Category" ? "color_blue" :
+                        category.value === "Green Category" ? "color_green" :
+                        category.value === "Orange Category" ? "color_orange" :
+                        category.value === "Purple Category" ? "color_purple" : "color_red"
+                      )}
+                    >
+                      <span
+                        className="o365-context-badge-dot"
+                        style={{ backgroundColor: category.color, display: "inline-block", width: "10px", height: "10px", borderRadius: "50%", marginRight: "8px" }}
+                      />
+                      <span>{category.label}</span>
+                    </button>
+                  ))}
                 </div>
-              )) : <div style={{ fontSize: 12, color: "#999" }}>No events for this day.</div>}
+              ) : null}
             </div>
-          ) : (
-            <div className="o365-cal-grid">
-              {weekdayLabels.map(d => <div key={d} style={{ padding: 6, textAlign: "center", fontSize: 11, fontWeight: 700, color: "#555", background: "#f5f5f5" }}>{d}</div>)}
-              {currentCells.map(cell => (
-                <div key={cell.date.toString()} className={`o365-cal-cell ${cell.date.month() !== calDate.month() ? "other-month" : ""} ${cell.date.format("YYYY-MM-DD") === getJordanDateKey(new Date()) ? "today" : ""}`}
-                  onClick={() => { setCalDate(cell.date); setCalView("day"); }}>
-                  <div className="o365-cal-day-num">{cell.date.date()}</div>
-                  {cell.events.slice(0, 3).map(ev => <div key={ev.id} className="o365-cal-event">{ev.title}</div>)}
-                  {cell.events.length > 3 ? <div style={{ fontSize: 10, color: "#666" }}>+{cell.events.length - 3} more</div> : null}
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
+
+            <button className="o365-context-menu-item" type="button" onClick={() => handleCalendarContextAction("calendar_options")}>
+              <div className="o365-context-menu-item-main"><Settings size={15} /><span>Calendar Options...</span></div>
+            </button>
+            <button className="o365-context-menu-item" type="button" onClick={() => handleCalendarContextAction("view_settings")}>
+              <div className="o365-context-menu-item-main"><Grid3X3 size={15} /><span>View Settings...</span></div>
+            </button>
+          </div>
+        ) : null}
       </div>
     );
   }
@@ -4596,6 +7719,8 @@ function App() {
                 <div className="o365-settings-body">
                   <div className="o365-setting-row"><label>Company Name</label><input value={settingsForm.company_name} onChange={e => setSettingsForm({ ...settingsForm, company_name: e.target.value })} /></div>
                   <div className="o365-setting-row"><label>Logo URL</label><input value={settingsForm.logo_url || ""} onChange={e => setSettingsForm({ ...settingsForm, logo_url: e.target.value })} placeholder="/logo.gif or https://..." /></div>
+                  <div className="o365-setting-row"><label>Signature Image URL</label><input value={settingsForm.signature_image_url || ""} onChange={e => setSettingsForm({ ...settingsForm, signature_image_url: e.target.value })} placeholder="/signature.png or https://..." /></div>
+                  <div className="o365-setting-row"><label>Stamp Image URL</label><input value={settingsForm.stamp_image_url || ""} onChange={e => setSettingsForm({ ...settingsForm, stamp_image_url: e.target.value })} placeholder="/stamp.png or https://..." /></div>
                   <div className="o365-setting-row"><label>Company Address</label><input value={settingsForm.company_address || ""} onChange={e => setSettingsForm({ ...settingsForm, company_address: e.target.value })} placeholder="Amman, Jordan" /></div>
                   <div className="o365-setting-row"><label>Company Phone</label><input value={settingsForm.company_phone || ""} onChange={e => setSettingsForm({ ...settingsForm, company_phone: e.target.value })} placeholder="+962 ..." /></div>
                   <div className="o365-setting-row"><label>Company Website</label><input value={settingsForm.company_website || ""} onChange={e => setSettingsForm({ ...settingsForm, company_website: e.target.value })} placeholder="https://example.com" /></div>
@@ -4807,8 +7932,147 @@ function App() {
                 <div style={{ marginTop: 16, borderTop: "1px solid #eee", paddingTop: 16 }}>
                   <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>Outgoing Letter Catalogs</div>
                   <p style={{ fontSize: 12, color: "#666", marginBottom: 10 }}>
-                    عرف القوائم المرجعية التي ستظهر في شاشة إنشاء الكتاب الرسمي. استخدم الصيغة `الاسم|الكود` للقوائم المرجعية، و`اسم العميل|الوصف` لقائمة العملاء.
+                    عرف القوائم المرجعية التي ستظهر في شاشة إنشاء الكتاب الرسمي. الصيغة العامة القديمة ما زالت مدعومة، لكن للربط حسب الشركة استخدم:
+                    `اسم الشركة|اسم العميل|الوصف|الكود` للعملاء، و`اسم الشركة|اسم المرجع|الكود|وصف اختياري` لباقي المرجعيات.
                   </p>
+                  {canAccessAdmin ? (
+                    <div style={{ marginBottom: 12, padding: 12, border: "1px solid #e5e7eb", borderRadius: 8, background: "#f8fafc" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 8 }}>
+                        <div>
+                          <div style={{ fontSize: 12, fontWeight: 600, color: "#334155" }}>Catalog Company Backfill</div>
+                          <div style={{ fontSize: 11, color: "#64748b" }}>
+                            يربط المرجعيات القديمة بالشركات فقط عندما تكون النتيجة واضحة، ويترك الحالات غير المؤكدة للمراجعة اليدوية داخل نفس الحقول.
+                          </div>
+                        </div>
+                        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                          <button
+                            type="button"
+                            onClick={handleApplyAllCatalogSuggestions}
+                            disabled={isApplyingAllCatalogSuggestions || !catalogCompanyBackfillSummary}
+                            style={{ padding: "8px 14px", background: "#107c10", color: "#fff", border: "none", borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: isApplyingAllCatalogSuggestions || !catalogCompanyBackfillSummary ? "not-allowed" : "pointer", opacity: isApplyingAllCatalogSuggestions || !catalogCompanyBackfillSummary ? 0.65 : 1 }}
+                          >
+                            {isApplyingAllCatalogSuggestions ? "Applying Suggestions..." : "Apply All Suggested"}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={handleRunCatalogCompanyBackfill}
+                            disabled={isRunningCatalogCompanyBackfill || !outboundCompanyOptions.length}
+                            style={{ padding: "8px 14px", background: "#1a237e", color: "#fff", border: "none", borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: isRunningCatalogCompanyBackfill || !outboundCompanyOptions.length ? "not-allowed" : "pointer", opacity: isRunningCatalogCompanyBackfill || !outboundCompanyOptions.length ? 0.65 : 1 }}
+                          >
+                            {isRunningCatalogCompanyBackfill ? "Running Catalog Backfill..." : "Run Catalog Backfill"}
+                          </button>
+                        </div>
+                      </div>
+                      {!outboundCompanyOptions.length ? (
+                        <div style={{ fontSize: 11, color: "#8a5a00", background: "#fff4ce", padding: "8px 10px", borderRadius: 6 }}>
+                          عرّف الشركات أولًا داخل حقل `Companies` حتى يتمكن النظام من ربط المرجعيات القديمة بها.
+                        </div>
+                      ) : null}
+                      {catalogCompanyBackfillSummary ? (
+                        <div style={{ display: "grid", gap: 10, marginTop: 10 }}>
+                          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 8 }}>
+                            {Object.entries(OUTGOING_CATALOG_REVIEW_CONFIG).map(([sectionKey, config]) => {
+                              const section = catalogCompanyBackfillSummary?.[sectionKey];
+                              return (
+                                <div key={sectionKey} style={{ border: "1px solid #e2e8f0", borderRadius: 6, background: "#fff", padding: 10 }}>
+                                  <div style={{ fontSize: 11, fontWeight: 700, color: "#1f2937", marginBottom: 6 }}>{config.label}</div>
+                                  <div style={{ fontSize: 11, color: "#475569", lineHeight: 1.6 }}>
+                                    Total: {section?.total_count || 0}<br />
+                                    Updated: {section?.updated_count || 0}<br />
+                                    Scoped: {section?.already_scoped_count || 0}<br />
+                                    Ambiguous: {section?.ambiguous_count || 0}<br />
+                                    Unmatched: {section?.unmatched_count || 0}
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                          {Object.entries(OUTGOING_CATALOG_REVIEW_CONFIG).map(([sectionKey, config]) => {
+                            const section = catalogCompanyBackfillSummary?.[sectionKey];
+                            const reviewRows = [
+                              ...(Array.isArray(section?.ambiguous_entries) ? section.ambiguous_entries.map((item) => ({ ...item, reviewBucket: "ambiguous_entries" })) : []),
+                              ...(Array.isArray(section?.unmatched_entries) ? section.unmatched_entries.map((item) => ({ ...item, reviewBucket: "unmatched_entries" })) : [])
+                            ];
+                            if (!reviewRows.length) {
+                              return null;
+                            }
+                            return (
+                              <div key={`${sectionKey}-review`} style={{ border: "1px solid #dbeafe", borderRadius: 8, background: "#fff", padding: 12 }}>
+                                <div style={{ fontSize: 12, fontWeight: 700, color: "#1e3a8a", marginBottom: 4 }}>
+                                  {config.label} Review Queue
+                                </div>
+                                <div style={{ fontSize: 11, color: "#64748b", marginBottom: 10 }}>
+                                  Apply a company directly to the remaining ambiguous or unmatched lines without editing the textarea manually.
+                                </div>
+                                <div style={{ display: "grid", gap: 10 }}>
+                                  {reviewRows.map((item) => {
+                                    const reviewValue = String(item?.value || "").trim();
+                                    const reviewKey = `${sectionKey}::${reviewValue}`;
+                                    const selectedCompanyValue = catalogReviewSelections[reviewKey] || "";
+                                    return (
+                                      <div key={reviewKey} style={{ border: "1px solid #e5e7eb", borderRadius: 6, padding: 10, background: "#f8fafc" }}>
+                                        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", marginBottom: 6 }}>
+                                          <div style={{ fontSize: 11, fontWeight: 700, color: item.reviewBucket === "ambiguous_entries" ? "#9a6700" : "#a4262c" }}>
+                                            {item.reviewBucket === "ambiguous_entries" ? "Ambiguous" : "Unmatched"}
+                                          </div>
+                                          <div style={{ fontSize: 11, color: "#64748b" }}>
+                                            {item.label || reviewValue}
+                                          </div>
+                                        </div>
+                                        <div style={{ fontSize: 11, color: "#334155", background: "#fff", border: "1px solid #e2e8f0", borderRadius: 4, padding: "8px 10px", marginBottom: 8, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                                          {reviewValue}
+                                        </div>
+                                        {Array.isArray(item?.candidates) && item.candidates.length ? (
+                                          <div style={{ fontSize: 11, color: "#8a5a00", marginBottom: 8 }}>
+                                            Suggested: {item.candidates[0].company_name} [{item.candidates[0].company_code}]
+                                          </div>
+                                        ) : (
+                                          <div style={{ fontSize: 11, color: "#64748b", marginBottom: 8 }}>
+                                            Suggested: no confident match, choose a company manually.
+                                          </div>
+                                        )}
+                                        {Array.isArray(item?.candidates) && item.candidates.length ? (
+                                          <div style={{ fontSize: 11, color: "#64748b", marginBottom: 8 }}>
+                                            {item.candidates.map((candidate) => `${candidate.company_name} [${candidate.company_code}]`).join(" | ")}
+                                          </div>
+                                        ) : null}
+                                        <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto auto", gap: 8, alignItems: "center" }}>
+                                          <select
+                                            value={selectedCompanyValue}
+                                            onChange={(e) => setCatalogReviewSelections((prev) => ({ ...prev, [reviewKey]: e.target.value }))}
+                                            style={{ width: "100%", padding: "7px 9px", border: "1px solid #cbd5e1", borderRadius: 4, fontSize: 12 }}
+                                          >
+                                            <option value="">Select company</option>
+                                            {outboundCompanyOptions.map((option) => (
+                                              <option key={option.value} value={option.value}>{option.label} [{option.code}]</option>
+                                            ))}
+                                          </select>
+                                          <button
+                                            type="button"
+                                            onClick={() => handleApplyCatalogReview(sectionKey, item, item.reviewBucket)}
+                                            style={{ padding: "7px 12px", background: "#107c10", color: "#fff", border: "none", borderRadius: 4, fontSize: 11, fontWeight: 600, cursor: "pointer" }}
+                                          >
+                                            Apply
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={() => removeCatalogReviewItem(sectionKey, reviewValue, item.reviewBucket)}
+                                            style={{ padding: "7px 12px", background: "#fff", color: "#475569", border: "1px solid #cbd5e1", borderRadius: 4, fontSize: 11, fontWeight: 600, cursor: "pointer" }}
+                                          >
+                                            Dismiss
+                                          </button>
+                                        </div>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
                     <div>
                       <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#555", marginBottom: 6 }}>Companies</label>
@@ -4832,7 +8096,7 @@ function App() {
                           ...settingsForm,
                           outbound_subject_clients: e.target.value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)
                         })}
-                        placeholder={"حاتم علي محمد النواصره|الرقم الوظيفي:11830 – مساعد فني\nClient B|Department XYZ"}
+                        placeholder={"TIG Jordan|حاتم علي محمد النواصره|الرقم الوظيفي:11830 – مساعد فني|HATEM\nJoNi|Client B|Department XYZ|CL-B"}
                         style={{ width: "100%", padding: "8px 10px", border: "1px solid #ddd", borderRadius: 4, fontSize: 12, resize: "vertical" }}
                       />
                     </div>
@@ -4847,7 +8111,7 @@ function App() {
                           ...settingsForm,
                           outbound_subject_quotations: e.target.value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)
                         })}
-                        placeholder={"General Quotation|GEN\nPricing Review|PRC"}
+                        placeholder={"TIG Jordan|General Quotation|GEN|\nJoNi|Pricing Review|PRC|Commercial"}
                         style={{ width: "100%", padding: "8px 10px", border: "1px solid #ddd", borderRadius: 4, fontSize: 12, resize: "vertical" }}
                       />
                     </div>
@@ -4860,7 +8124,7 @@ function App() {
                           ...settingsForm,
                           outbound_subject_studies: e.target.value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)
                         })}
-                        placeholder={"Feasibility Study|FES\nTechnical Study|TEC"}
+                        placeholder={"TIG Jordan|Feasibility Study|FES|\nJoNi|Technical Study|TEC|Electrical"}
                         style={{ width: "100%", padding: "8px 10px", border: "1px solid #ddd", borderRadius: 4, fontSize: 12, resize: "vertical" }}
                       />
                     </div>
@@ -4873,7 +8137,7 @@ function App() {
                           ...settingsForm,
                           outbound_subject_admin_subjects: e.target.value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)
                         })}
-                        placeholder={"Contract Extension|CTR\nHR Formal Notice|HRN"}
+                        placeholder={"TIG Jordan|Contract Extension|CTR|\nJoNi|HR Formal Notice|HRN|Internal"}
                         style={{ width: "100%", padding: "8px 10px", border: "1px solid #ddd", borderRadius: 4, fontSize: 12, resize: "vertical" }}
                       />
                     </div>
@@ -4885,7 +8149,19 @@ function App() {
                     عند اختيار المجموعة `Projects` في شاشة الإرسال، سيتم استخدام هذه القائمة كمرجع `Subject Number`.
                   </p>
                   {canAccessAdmin ? (
-                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr auto", gap: 8, alignItems: "end", marginBottom: 12 }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr auto", gap: 8, alignItems: "end", marginBottom: 12 }}>
+                      <div>
+                        <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#555", marginBottom: 6 }}>Company</label>
+                        <select
+                          value={composeProjectForm.company_value}
+                          onChange={(e) => setComposeProjectForm({ ...composeProjectForm, company_value: e.target.value })}
+                        >
+                          <option value="">Select company</option>
+                          {outboundCompanyOptions.map((item) => (
+                            <option key={item.value} value={item.value}>{item.label}</option>
+                          ))}
+                        </select>
+                      </div>
                       <div>
                         <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#555", marginBottom: 6 }}>Project Code</label>
                         <input
@@ -4911,6 +8187,7 @@ function App() {
                     {projects.length ? projects.map((project) => (
                       <div key={project.id} style={{ fontSize: 12, color: "#444" }}>
                         <strong>[{project.project_code}]</strong> {project.project_name}
+                        {project.company_name ? <span style={{ color: "#777" }}>{` - ${project.company_name}`}</span> : null}
                       </div>
                     )) : (
                       <div style={{ fontSize: 12, color: "#777" }}>لا توجد مشاريع معرفة بعد.</div>
@@ -5236,13 +8513,364 @@ function App() {
           activeAccountId={activeAccountId}
           setActiveAccountId={setActiveAccountId}
           emailKeys={emailKeys}
-          outboundCompanyOptions={buildOutgoingCatalogOptions(outboundSubjectCompanies, "generic")}
-          outboundClientOptions={buildOutgoingCatalogOptions(outboundSubjectClients, "client")}
+          outboundCompanyOptions={outboundCompanyOptions}
+          outboundClientOptions={outboundClientOptions}
           outgoingReferenceOptions={outgoingReferenceOptions}
           professionalOutgoingState={professionalOutgoingState}
           enforceOutboundSubjectSchema={settingsForm.enforce_outbound_subject_schema !== false}
         />
       </Suspense>
+    );
+  }
+
+  function renderEmailContextMenu() {
+    if (!emailContextMenu.visible || !contextMenuEmail) {
+      return null;
+    }
+    const isOutbox = contextMenuEmail.folder_name === "Outbox";
+    const isSent = contextMenuEmail.folder_name === "Sent";
+    const canRecall = isSent && !contextMenuEmail.recalled;
+    const canRetry = isOutbox && Boolean(contextMenuEmail.queue_last_error);
+    const followUpLabel = contextMenuEmail.follow_up_status
+      ? `${contextMenuEmail.follow_up_status}${contextMenuEmail.follow_up_due_at ? ` · ${formatJordanTimeValue(contextMenuEmail.follow_up_due_at, { month: "2-digit", day: "2-digit", year: "numeric" })}` : ""}`
+      : "";
+
+    return (
+      <div
+        ref={emailContextMenuRef}
+        className="o365-context-menu"
+        style={{ left: emailContextMenu.x, top: emailContextMenu.y }}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="o365-context-menu-header">
+          <div className="title">{contextMenuEmail.sender_name || contextMenuEmail.sender_email || "Message"}</div>
+          <div className="subtitle">{contextMenuEmail.subject || "(No subject)"}</div>
+          {contextMenuEmail.user_category || followUpLabel ? (
+            <div className="o365-context-menu-meta">
+              {contextMenuEmail.user_category ? (
+                <span className="o365-context-badge">
+                  <span className="o365-context-badge-dot" style={{ background: getContextMenuCategoryColor(contextMenuEmail.user_category) }}></span>
+                  {contextMenuEmail.user_category}
+                </span>
+              ) : null}
+              {followUpLabel ? <span className="o365-context-badge muted">{followUpLabel}</span> : null}
+            </div>
+          ) : null}
+        </div>
+
+        <div className="o365-context-menu-caption">Actions</div>
+
+        <button className="o365-context-menu-item tone-copy" onClick={async () => { closeEmailContextMenu(); await copyTextToClipboard(contextMenuEmail.subject || "", "Subject copied."); }}>
+          <div className="o365-context-menu-item-main">
+            <Copy size={15} /> <span>Copy Subject</span>
+          </div>
+          <span className="o365-context-menu-shortcut">Ctrl+C</span>
+        </button>
+        <button className="o365-context-menu-item tone-print" onClick={() => handleQuickPrint(contextMenuEmail)}>
+          <div className="o365-context-menu-item-main">
+            <Printer size={15} /> <span>Quick Print</span>
+          </div>
+          <span className="o365-context-menu-shortcut">Ctrl+P</span>
+        </button>
+        <button className="o365-context-menu-item tone-reply" onClick={() => { closeEmailContextMenu(); prepareReplyDraft("reply"); }}>
+          <div className="o365-context-menu-item-main">
+            <Reply size={15} /> <span>Reply</span>
+          </div>
+          <span className="o365-context-menu-shortcut">Ctrl+R</span>
+        </button>
+        <button className="o365-context-menu-item tone-reply-all" onClick={() => { closeEmailContextMenu(); prepareReplyDraft("replyAll"); }}>
+          <div className="o365-context-menu-item-main">
+            <ReplyAll size={15} /> <span>Reply All</span>
+          </div>
+          <span className="o365-context-menu-shortcut">Ctrl+Shift+R</span>
+        </button>
+        <button className="o365-context-menu-item tone-forward" onClick={() => { closeEmailContextMenu(); prepareReplyDraft("forward"); }}>
+          <div className="o365-context-menu-item-main">
+            <Forward size={15} /> <span>Forward</span>
+          </div>
+          <span className="o365-context-menu-shortcut">Ctrl+F</span>
+        </button>
+
+        <div className="o365-context-menu-separator"></div>
+
+        <button className="o365-context-menu-item tone-readstate" onClick={() => handleContextReadState(contextMenuEmail, !contextMenuEmail.is_read)}>
+          <div className="o365-context-menu-item-main">
+            {contextMenuEmail.is_read ? <Mail size={15} /> : <MailOpen size={15} />}
+            <span>{contextMenuEmail.is_read ? "Mark as Unread" : "Mark as Read"}</span>
+          </div>
+          <span className="o365-context-menu-shortcut">{contextMenuEmail.is_read ? "U" : "Q"}</span>
+        </button>
+
+        <div className="o365-context-menu-caption">Organize</div>
+
+        <div
+          className="o365-context-menu-item has-submenu tone-quicksteps"
+          onMouseEnter={() => setEmailContextMenu((prev) => ({ ...prev, submenu: "quicksteps" }))}
+          onMouseLeave={() => setEmailContextMenu((prev) => (prev.submenu ? { ...prev, submenu: null } : prev))}
+        >
+          <div className="o365-context-menu-item-main">
+            <Sparkles size={15} /> <span>Quick Steps</span>
+          </div>
+          <ChevronRight size={14} />
+          {emailContextMenu.submenu === "quicksteps" ? (
+            <div className="o365-context-submenu">
+              <button className="o365-context-menu-item submenu-item" onClick={() => handleQuickStep(contextMenuEmail, "reply_archive")}>
+                <Reply size={14} />
+                <span>Reply and Archive</span>
+              </button>
+              <button className="o365-context-menu-item submenu-item" onClick={() => handleQuickStep(contextMenuEmail, "archive_read")}>
+                <Archive size={14} />
+                <span>Archive and Mark Read</span>
+              </button>
+              <button className="o365-context-menu-item submenu-item" onClick={() => handleQuickStep(contextMenuEmail, "flag_tomorrow")}>
+                <Flag size={14} />
+                <span>Flag for Tomorrow</span>
+              </button>
+              <button className="o365-context-menu-item submenu-item" onClick={() => handleQuickStep(contextMenuEmail, "copy_sender_subject")}>
+                <Copy size={14} />
+                <span>Copy Sender + Subject</span>
+              </button>
+            </div>
+          ) : null}
+        </div>
+
+        <div
+          className="o365-context-menu-item has-submenu tone-categorize"
+          onMouseEnter={() => setEmailContextMenu((prev) => ({ ...prev, submenu: "categorize" }))}
+          onMouseLeave={() => setEmailContextMenu((prev) => (prev.submenu ? { ...prev, submenu: null } : prev))}
+        >
+          <div className="o365-context-menu-item-main">
+            <Bookmark size={15} /> <span>Categorize</span>
+          </div>
+          <ChevronRight size={14} />
+          {emailContextMenu.submenu === "categorize" ? (
+            <div className="o365-context-submenu">
+              {OUTLOOK_CONTEXT_CATEGORIES.map((category) => (
+                <button
+                  key={category.value}
+                  className="o365-context-menu-item submenu-item"
+                  onClick={async () => {
+                    closeEmailContextMenu();
+                    await updateEmailContextMeta(
+                      contextMenuEmail.id,
+                      { user_category: category.value, follow_up_status: contextMenuEmail.follow_up_status || "", follow_up_due_at: contextMenuEmail.follow_up_due_at || null, follow_up_note: contextMenuEmail.follow_up_note || "" },
+                      `Category set to ${category.label}.`
+                    );
+                  }}
+                >
+                  <span className="o365-context-badge-dot" style={{ background: category.color }}></span>
+                  <span>{category.label}</span>
+                </button>
+              ))}
+              <div className="o365-context-menu-separator"></div>
+              <button
+                className="o365-context-menu-item submenu-item"
+                onClick={async () => {
+                  closeEmailContextMenu();
+                  await updateEmailContextMeta(
+                    contextMenuEmail.id,
+                    { user_category: "", follow_up_status: contextMenuEmail.follow_up_status || "", follow_up_due_at: contextMenuEmail.follow_up_due_at || null, follow_up_note: contextMenuEmail.follow_up_note || "" },
+                    "Category cleared."
+                  );
+                }}
+              >
+                <X size={14} />
+                <span>Clear Category</span>
+              </button>
+            </div>
+          ) : null}
+        </div>
+
+        <div
+          className="o365-context-menu-item has-submenu tone-followup"
+          onMouseEnter={() => setEmailContextMenu((prev) => ({ ...prev, submenu: "followup" }))}
+          onMouseLeave={() => setEmailContextMenu((prev) => (prev.submenu ? { ...prev, submenu: null } : prev))}
+        >
+          <div className="o365-context-menu-item-main">
+            <Flag size={15} /> <span>Follow Up</span>
+          </div>
+          <ChevronRight size={14} />
+          {emailContextMenu.submenu === "followup" ? (
+            <div className="o365-context-submenu">
+              {OUTLOOK_FOLLOW_UP_PRESETS.map((preset) => (
+                <button
+                  key={preset.value}
+                  className="o365-context-menu-item submenu-item"
+                  onClick={async () => {
+                    closeEmailContextMenu();
+                    await updateEmailContextMeta(
+                      contextMenuEmail.id,
+                      {
+                        user_category: contextMenuEmail.user_category || "",
+                        follow_up_status: preset.label,
+                        follow_up_due_at: preset.getDate(),
+                        follow_up_note: contextMenuEmail.follow_up_note || ""
+                      },
+                      `Follow Up set to ${preset.label}.`
+                    );
+                  }}
+                >
+                  <Flag size={14} />
+                  <span>{preset.label}</span>
+                </button>
+              ))}
+              <div className="o365-context-menu-separator"></div>
+              <button
+                className="o365-context-menu-item submenu-item"
+                onClick={async () => {
+                  closeEmailContextMenu();
+                  await updateEmailContextMeta(
+                    contextMenuEmail.id,
+                    { user_category: contextMenuEmail.user_category || "", follow_up_status: "", follow_up_due_at: null, follow_up_note: "" },
+                    "Follow Up cleared."
+                  );
+                }}
+              >
+                <X size={14} />
+                <span>Clear Flag</span>
+              </button>
+            </div>
+          ) : null}
+        </div>
+
+        <div
+          className="o365-context-menu-item has-submenu tone-move"
+          onMouseEnter={() => setEmailContextMenu((prev) => ({ ...prev, submenu: "move" }))}
+          onMouseLeave={() => setEmailContextMenu((prev) => (prev.submenu ? { ...prev, submenu: null } : prev))}
+        >
+          <div className="o365-context-menu-item-main">
+            <Archive size={15} /> <span>Move</span>
+          </div>
+          <ChevronRight size={14} />
+          {emailContextMenu.submenu === "move" ? (
+            <div className="o365-context-submenu">
+              {contextMoveTargets.length ? contextMoveTargets.map((folderName) => (
+                <button
+                  key={folderName}
+                  className="o365-context-menu-item submenu-item"
+                  onClick={() => moveSingleEmailToFolder(contextMenuEmail, folderName)}
+                >
+                  {(folderIcons[folderName] ? (() => {
+                    const FolderIcon = folderIcons[folderName];
+                    return <FolderIcon size={14} />;
+                  })() : <Archive size={14} />)}
+                  <span>{getFolderDisplayName(folderName)}</span>
+                </button>
+              )) : (
+                <div className="o365-context-menu-empty">No target folders</div>
+              )}
+            </div>
+          ) : null}
+        </div>
+
+        <button className="o365-context-menu-item tone-archive" onClick={() => moveSingleEmailToFolder(contextMenuEmail, "Archive", "Email moved to Archive.")}>
+          <div className="o365-context-menu-item-main">
+            <Archive size={15} /> <span>Archive</span>
+          </div>
+        </button>
+        <button className="o365-context-menu-item tone-junk" onClick={() => moveSingleEmailToFolder(contextMenuEmail, "Junk", "Email moved to Junk.")}>
+          <div className="o365-context-menu-item-main">
+            <ShieldAlert size={15} /> <span>Junk</span>
+          </div>
+        </button>
+        <button className="o365-context-menu-item tone-onenote" onClick={() => openSendToOneNoteDialog(contextMenuEmail)}>
+          <div className="o365-context-menu-item-main">
+            <FileText size={15} /> <span>Send to OneNote</span>
+          </div>
+        </button>
+
+        <div className="o365-context-menu-caption">Tools</div>
+
+        <div
+          className="o365-context-menu-item has-submenu tone-related"
+          onMouseEnter={() => setEmailContextMenu((prev) => ({ ...prev, submenu: "related" }))}
+          onMouseLeave={() => setEmailContextMenu((prev) => (prev.submenu ? { ...prev, submenu: null } : prev))}
+        >
+          <div className="o365-context-menu-item-main">
+            <ExternalLink size={15} /> <span>Find Related</span>
+          </div>
+          <ChevronRight size={14} />
+          {emailContextMenu.submenu === "related" ? (
+            <div className="o365-context-submenu">
+              <button className="o365-context-menu-item submenu-item" onClick={() => handleFindRelated(contextMenuEmail, "serial_thread")}>
+                <MessageSquare size={14} />
+                <span>Open Related Thread</span>
+              </button>
+              <button className="o365-context-menu-item submenu-item" onClick={() => handleFindRelated(contextMenuEmail, "serial_search")}>
+                <Search size={14} />
+                <span>Search by Serial</span>
+              </button>
+              <button className="o365-context-menu-item submenu-item" onClick={() => handleFindRelated(contextMenuEmail, "sender_search")}>
+                <Users size={14} />
+                <span>Find from Sender</span>
+              </button>
+              <button className="o365-context-menu-item submenu-item" onClick={() => handleFindRelated(contextMenuEmail, "project_search")}>
+                <Building2 size={14} />
+                <span>Find by Project Ref</span>
+              </button>
+            </div>
+          ) : null}
+        </div>
+
+        <div
+          className="o365-context-menu-item has-submenu tone-rules"
+          onMouseEnter={() => setEmailContextMenu((prev) => ({ ...prev, submenu: "rules" }))}
+          onMouseLeave={() => setEmailContextMenu((prev) => (prev.submenu ? { ...prev, submenu: null } : prev))}
+        >
+          <div className="o365-context-menu-item-main">
+            <Filter size={15} /> <span>Rules</span>
+          </div>
+          <ChevronRight size={14} />
+          {emailContextMenu.submenu === "rules" ? (
+            <div className="o365-context-submenu">
+              <button className="o365-context-menu-item submenu-item" onClick={() => applyRuleAction(contextMenuEmail, "search_sender")}>
+                <Search size={14} />
+                <span>Find All from Sender</span>
+              </button>
+              <button className="o365-context-menu-item submenu-item" onClick={() => applyRuleAction(contextMenuEmail, "mark_sender_read")}>
+                <Mail size={14} />
+                <span>Mark Sender Mail as Read</span>
+              </button>
+              <button className="o365-context-menu-item submenu-item" onClick={() => applyRuleAction(contextMenuEmail, "move_sender_archive")}>
+                <Archive size={14} />
+                <span>Archive Sender Mail</span>
+              </button>
+              <button className="o365-context-menu-item submenu-item" onClick={() => applyRuleAction(contextMenuEmail, "move_sender_junk")}>
+                <ShieldAlert size={14} />
+                <span>Junk Sender Mail</span>
+              </button>
+              <button className="o365-context-menu-item submenu-item" onClick={() => applyRuleAction(contextMenuEmail, "move_sender_deleted")}>
+                <Trash2 size={14} />
+                <span>Delete Sender Mail</span>
+              </button>
+            </div>
+          ) : null}
+        </div>
+
+        {canRetry ? (
+          <button className="o365-context-menu-item tone-retry" onClick={() => { closeEmailContextMenu(); handleRetryEmail(); }}>
+            <div className="o365-context-menu-item-main">
+              <RefreshCw size={15} /> <span>Retry Send</span>
+            </div>
+          </button>
+        ) : null}
+        {canRecall ? (
+          <button className="o365-context-menu-item tone-recall" onClick={() => { closeEmailContextMenu(); handleRecallEmail(); }}>
+            <div className="o365-context-menu-item-main">
+              <ClockIcon size={15} /> <span>Recall</span>
+            </div>
+          </button>
+        ) : null}
+
+        <div className="o365-context-menu-separator"></div>
+
+        <button className="o365-context-menu-item danger tone-delete" onClick={() => { closeEmailContextMenu(); handleDeleteAction([contextMenuEmail.id]); }}>
+          <div className="o365-context-menu-item-main">
+            <Trash2 size={15} /> <span>Delete</span>
+          </div>
+          <span className="o365-context-menu-shortcut">Del</span>
+        </button>
+      </div>
     );
   }
 
@@ -5611,7 +9239,7 @@ function App() {
                     <span className="o365-msg-toolbar-label">{smartFolder ? smartFolder.charAt(0).toUpperCase() + smartFolder.slice(1).replace("-", " ") : getFolderDisplayName(selectedFolder)} ({resultSummary.totalMatches})</span>
                   </div>
                 </div>
-                <div className="o365-msg-list">
+                <div className="o365-msg-list" onScroll={closeEmailContextMenu}>
                   {filteredEmails.length ? (() => {
                     const today = dayjs().startOf('day');
                     const yesterday = dayjs().subtract(1, 'day').startOf('day');
@@ -5629,7 +9257,11 @@ function App() {
                       return (
                         <Fragment key={email.id}>
                           {showDateHeader && <div className="o365-msg-date-header">{dateGroup}</div>}
-                          <div className={`o365-msg-row ${selectedEmail?.id === email.id ? "active" : ""} ${email.approval_status === "pending" ? "pending" : email.approval_status === "rejected" ? "rejected" : !email.is_read ? "unread" : "read"}`} onClick={() => onEmailClick(email)}>
+                          <div
+                            className={`o365-msg-row ${selectedEmail?.id === email.id ? "active" : ""} ${email.approval_status === "pending" ? "pending" : email.approval_status === "rejected" ? "rejected" : !email.is_read ? "unread" : "read"}`}
+                            onClick={() => onEmailClick(email)}
+                            onContextMenu={(event) => openEmailContextMenu(event, email)}
+                          >
                             {!isStandardInboxUser ? <input type="checkbox" className="msg-check" checked={selectedEmailIds.includes(email.id)} onChange={() => toggleEmailSelection(email.id)} onClick={e => e.stopPropagation()} /> : <div style={{ width: 16 }} />}
                             <span className="msg-sender" style={{ color: getPriorityColor(email.priority) }}>
                               {getPriorityLabel(email.priority) ? <span style={{ marginRight: 2 }}>{getPriorityLabel(email.priority)}</span> : null}
@@ -5640,6 +9272,8 @@ function App() {
                               {email.approval_status === "rejected" ? <span style={{ color: "#d13438", fontWeight: 700, marginRight: 4, fontSize: 10, background: "#fde7e9", padding: "1px 5px", borderRadius: 3 }}>&#9660; REJECTED</span> : null}
                               {email.approval_status === "approved" ? <span style={{ color: "#107c10", fontWeight: 700, marginRight: 4, fontSize: 10, background: "#e6f4e6", padding: "1px 5px", borderRadius: 3 }}>&#10003; APPROVED</span> : null}
                               {email.serial ? <span style={{ color: "var(--c-primary)", fontWeight: 600, marginRight: 4, fontSize: 10, background: "var(--c-primary-tp)", padding: "1px 5px", borderRadius: 3 }}>{email.serial}</span> : null}
+                              {email.user_category ? <span style={{ color: "#fff", fontWeight: 600, marginRight: 4, fontSize: 10, background: getContextMenuCategoryColor(email.user_category), padding: "1px 6px", borderRadius: 999 }}>{email.user_category}</span> : null}
+                              {email.follow_up_status ? <span style={{ color: "#8a4b00", fontWeight: 700, marginRight: 4, fontSize: 10, background: "#fff1d6", padding: "1px 6px", borderRadius: 999 }}><Flag size={10} style={{ marginRight: 3, verticalAlign: "middle" }} />{email.follow_up_status}</span> : null}
                               {email.parent_id ? <span style={{ color: "#666", marginRight: 2, fontSize: 10 }}>&#9500;</span> : null}
                               {email.recalled ? <span style={{ color: "#d13438", fontWeight: 700, marginRight: 4, fontSize: 10 }}>[RECALLED]</span> : null}
                               {email.has_attachments ? <Paperclip size={11} style={{ flexShrink: 0, opacity: 0.6 }} /> : null}
@@ -5816,6 +9450,7 @@ function App() {
             dashboardStats={dashboardStats}
             analytics={analytics}
             approvalAnalytics={approvalAnalytics}
+            calendarAnalytics={calendarAnalytics}
             employeeForm={employeeForm}
             setEmployeeForm={setEmployeeForm}
             editingEmployeeId={editingEmployeeId}
@@ -5893,6 +9528,7 @@ function App() {
             onMarkSelectedArchiveTrackingTasksDone={markSelectedArchiveTrackingTasksDone}
             onAssignSelectedArchiveTrackingTasks={assignSelectedArchiveTrackingTasks}
             onExportSelectedArchiveTrackingTasks={exportSelectedArchiveTrackingTasks}
+            outboundCompanyOptions={outboundCompanyOptions}
             apiFetch={apiFetch}
           />
         </Suspense>
@@ -6021,7 +9657,7 @@ function App() {
       {showReminderPopup && token && (
         <Suspense fallback={null}>
           <ReminderPopup
-            calendarEvents={data.calendar || []}
+            calendarEvents={activeCalendarReminderEvents}
             tasks={data.tasks || []}
             onDismiss={(id) => {
               setDismissedReminders(prev => ({ ...prev, [id]: Date.now() }));
@@ -6032,6 +9668,12 @@ function App() {
             onOpenEvent={(evt) => {
               setShowReminderPopup(false);
               setCurrentView("calendar");
+              setSelectedCalendarEventId(evt?.id || null);
+              setSelectedCalendarOccurrenceKey(evt?.occurrence_key || "");
+              if (evt?.starts_at) {
+                setCalDate(dayjs(evt.starts_at));
+                setCalView("day");
+              }
             }}
             onOpenTask={(task) => {
               setShowReminderPopup(false);
@@ -6040,6 +9682,7 @@ function App() {
           />
         </Suspense>
       )}
+      {renderEmailContextMenu()}
     </div>
   );
 }

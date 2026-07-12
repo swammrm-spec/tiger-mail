@@ -13,6 +13,7 @@ import {
   analyzeIncomingEmail,
   getUserByEmail,
   getUserById,
+  getUsersWithActiveEmailAccounts,
   getAppSettings,
   getMailSettingsForUser,
   getEmailById,
@@ -60,6 +61,7 @@ const imapWatcherReconnectTimers = new Map();
 let schedulerHandle = null;
 const cycleInFlightByUser = new Map();
 let globalCycleInFlight = null;
+let globalAccountSyncInFlight = null;
 const backgroundFetchIntervalMinutes = Math.max(0.5, Number(process.env.BACKGROUND_MAIL_FETCH_MINUTES || 1));
 
 function reportSendReceiveAuthDebug(location, msg, data = {}, runId = "pre-fix", hypothesisId = "") {
@@ -1417,91 +1419,86 @@ async function runCycle(userId = null) {
 
 async function syncEmailAccounts(userId = null) {
   try {
-    const { getUserById } = await import("./database.js");
-    const users = userId ? [await getUserById(userId)] : (await import("./database.js")).then(m => m.getAllAdminUsers ? m.getAllAdminUsers() : []).catch(() => []);
+    const users = userId
+      ? [await getUserById(userId)]
+      : await getUsersWithActiveEmailAccounts();
+    const accountConfigs = [];
 
     for (const user of (Array.isArray(users) ? users : [])) {
       if (!user || !user.id) continue;
       const accounts = await getUserActiveAccounts(user.id);
       for (const account of accounts) {
-        const configKey = `account_${account.id}`;
-        if (!activeConfigs.has(account.id)) {
-          const config = {
-            user_id: user.id,
-            account_id: account.id,
-            email_address: account.email_address,
-            display_name: account.display_name,
-            account_type: account.imap_host ? "IMAP" : "POP3",
-            username: account.imap_username || account.pop3_username || account.email_address,
-            password: account.imap_password || account.pop3_password || "",
-            incoming_server: account.imap_host || account.pop3_host || "",
-            incoming_port: account.imap_port || account.pop3_port || 993,
-            incoming_ssl: account.imap_ssl || account.pop3_ssl || true,
-            outgoing_server: account.smtp_host || "",
-            outgoing_port: account.smtp_port || 587,
-            outgoing_ssl: account.smtp_ssl || true,
-            outgoing_username: account.smtp_username || account.email_address,
-            outgoing_password: account.smtp_password || "",
-            company_name: user.company_name || "TECHNO Group"
-          };
-          activeConfigs.set(account.id, config);
-        }
+        accountConfigs.push({
+          user_id: user.id,
+          account_id: account.id,
+          email_address: account.email_address,
+          display_name: account.display_name,
+          account_type: account.imap_host ? "IMAP" : "POP3",
+          username: account.imap_username || account.pop3_username || account.email_address,
+          password: account.imap_password || account.pop3_password || "",
+          incoming_server: account.imap_host || account.pop3_host || "",
+          incoming_port: account.imap_port || account.pop3_port || 993,
+          incoming_ssl: account.imap_ssl || account.pop3_ssl || true,
+          outgoing_server: account.smtp_host || "",
+          outgoing_port: account.smtp_port || 587,
+          outgoing_ssl: account.smtp_ssl || true,
+          outgoing_username: account.smtp_username || account.email_address,
+          outgoing_password: account.smtp_password || "",
+          company_name: user.company_name || "TECHNO Group"
+        });
       }
     }
+    return accountConfigs;
   } catch (e) {
     console.error("Failed to sync email accounts:", e.message);
+    return [];
   }
 }
 
 async function runFullMailSyncAllAccounts() {
-  await syncEmailAccounts();
-  if (!activeConfigs.size) {
+  const accountConfigs = await syncEmailAccounts();
+  if (!accountConfigs.length) {
     return {
       totals: { sent: 0, received: 0, queued: 0, skipped: 0, deleted: 0, accounts: 0 },
       accounts: []
     };
   }
 
-  if (globalCycleInFlight) {
-    const totals = await globalCycleInFlight;
+  if (globalAccountSyncInFlight) {
+    const result = await globalAccountSyncInFlight;
     return {
-      totals: {
-        sent: totals.sent || 0,
-        received: totals.received || 0,
-        queued: totals.queued || 0,
-        skipped: totals.skipped || 0,
-        deleted: totals.deleted || 0,
-        accounts: activeConfigs.size
-      },
-      accounts: []
+      totals: result.totals,
+      accounts: result.accounts
     };
   }
 
-  globalCycleInFlight = (async () => {
+  globalAccountSyncInFlight = (async () => {
     try {
       const totals = { sent: 0, received: 0, queued: 0, skipped: 0, deleted: 0, accounts: 0 };
       const accounts = [];
 
-      for (const [configuredUserId, config] of activeConfigs.entries()) {
+      for (const config of accountConfigs) {
         try {
-          const result = await runSingleCycle(configuredUserId, config);
-          totals.sent += result.sent || 0;
+          const result = await receiveEmailsOnce(config, Number(config.user_id || 0));
           totals.received += result.received || 0;
-          totals.queued += result.queued || 0;
           totals.skipped += result.skipped || 0;
           totals.deleted += result.deleted || 0;
           totals.accounts += 1;
           accounts.push({
-            user_id: configuredUserId,
+            user_id: Number(config.user_id || 0),
+            account_id: Number(config.account_id || 0),
             email_address: config.email_address || "",
             account_type: config.account_type || "POP3",
             ok: true,
+            sent: 0,
+            queued: 0,
             ...result
           });
         } catch (error) {
           totals.accounts += 1;
           accounts.push({
-            user_id: configuredUserId,
+            user_id: Number(config.user_id || 0),
+            account_id: Number(config.account_id || 0),
             email_address: config.email_address || "",
             account_type: config.account_type || "POP3",
             ok: false,
@@ -1512,11 +1509,11 @@ async function runFullMailSyncAllAccounts() {
 
       return { totals, accounts };
     } finally {
-      globalCycleInFlight = null;
+      globalAccountSyncInFlight = null;
     }
   })();
 
-  return globalCycleInFlight;
+  return globalAccountSyncInFlight;
 }
 
 function startScheduler() {
@@ -3565,7 +3562,8 @@ async function receivePop3EmailsOnce(config, ownerUserId = null) {
       }));
 
     for (const entry of messageEntries) {
-      const externalId = `pop3:${entry.uid}`;
+      const ownerScope = Number(ownerUserId || config?.user_id || 0);
+      const externalId = `pop3:${ownerScope}:${entry.uid}`;
       const existingEmail = await getEmailByExternalMessageId(externalId);
       if (existingEmail) {
         // #region debug-point send-receive-sync:duplicate-skip
@@ -3863,7 +3861,8 @@ function extractPop3Uid(externalMessageId = "") {
   if (!value.startsWith("pop3:")) {
     return "";
   }
-  return value.slice(5);
+  const parts = value.split(":").filter(Boolean);
+  return parts[parts.length - 1] || "";
 }
 
 function cleanupSavedAttachmentFiles(files = []) {
@@ -4112,6 +4111,8 @@ async function processOutboxQueue(config, userId = null) {
 
   for (const email of queuedEmails) {
     const attachments = await getEmailAttachments(email.id);
+    const inlineAssets = await buildInlineAssetBundle(config);
+    const htmlBody = applyInlineAssetReplacements(String(email.body_html || "").trim() || "", inlineAssets.replacements);
     try {
       // #region debug-point send-receive-auth:outbox-attempt
       reportSendReceiveAuthDebug(
@@ -4134,8 +4135,8 @@ async function processOutboxQueue(config, userId = null) {
         bcc: email.bcc_list || undefined,
         subject: email.subject,
         text: email.body,
-        html: String(email.body_html || "").trim() || undefined,
-        attachments: await buildAttachmentPayload(attachments)
+        html: htmlBody || undefined,
+        attachments: [...await buildAttachmentPayload(attachments), ...inlineAssets.attachments]
       });
       await markOutboxSent(email.id, info.messageId);
       // #region debug-point send-receive-auth:outbox-success
@@ -4189,6 +4190,8 @@ async function retryQueuedEmailNow(emailId, userId = null) {
 
   const transporter = getSmtpTransporter(config);
   const attachments = await getEmailAttachments(email.id);
+  const inlineAssets = await buildInlineAssetBundle(config);
+  const htmlBody = applyInlineAssetReplacements(String(email.body_html || "").trim() || "", inlineAssets.replacements);
 
   try {
     const info = await transporter.sendMail({
@@ -4198,8 +4201,8 @@ async function retryQueuedEmailNow(emailId, userId = null) {
       bcc: email.bcc_list || undefined,
       subject: email.subject,
       text: email.body,
-      html: String(email.body_html || "").trim() || undefined,
-      attachments: await buildAttachmentPayload(attachments)
+      html: htmlBody || undefined,
+      attachments: [...await buildAttachmentPayload(attachments), ...inlineAssets.attachments]
     });
 
     await markOutboxSent(email.id, info.messageId);
@@ -4265,6 +4268,112 @@ function buildArchiveFooterHtml(value = "") {
   return `<div style="margin-top:18px;padding-top:12px;border-top:1px solid #dbe1ea;font-family:Arial,'Segoe UI',sans-serif;font-size:12px;color:#64748b;white-space:pre-wrap;">${escapeMailHtml(normalized)}</div>`;
 }
 
+const OUTGOING_INLINE_ASSET_PLACEHOLDERS = {
+  logo: "__OUTGOING_INLINE_LOGO__",
+  signature: "__OUTGOING_INLINE_SIGNATURE__",
+  stamp: "__OUTGOING_INLINE_STAMP__"
+};
+
+function guessInlineAssetContentType(source = "") {
+  const normalized = String(source || "").toLowerCase();
+  if (normalized.endsWith(".png")) return "image/png";
+  if (normalized.endsWith(".jpg") || normalized.endsWith(".jpeg")) return "image/jpeg";
+  if (normalized.endsWith(".gif")) return "image/gif";
+  if (normalized.endsWith(".webp")) return "image/webp";
+  if (normalized.endsWith(".svg")) return "image/svg+xml";
+  return "application/octet-stream";
+}
+
+function resolveInlineAssetDiskPath(source = "") {
+  const normalized = String(source || "").trim();
+  if (!normalized || /^https?:\/\//i.test(normalized)) {
+    return "";
+  }
+  if (path.isAbsolute(normalized)) {
+    return normalized;
+  }
+  if (normalized.startsWith("/")) {
+    return path.join(process.cwd(), "public", normalized.replace(/^\/+/, ""));
+  }
+  return path.resolve(process.cwd(), normalized);
+}
+
+async function loadInlineAsset(source = "") {
+  const normalized = String(source || "").trim();
+  if (!normalized) {
+    return null;
+  }
+  if (/^https?:\/\//i.test(normalized)) {
+    try {
+      const response = await fetch(normalized);
+      if (!response.ok) {
+        return null;
+      }
+      const arrayBuffer = await response.arrayBuffer();
+      return {
+        content: Buffer.from(arrayBuffer),
+        contentType: response.headers.get("content-type") || guessInlineAssetContentType(normalized),
+        filename: path.basename(new URL(normalized).pathname) || "inline-asset"
+      };
+    } catch {
+      return null;
+    }
+  }
+  const diskPath = resolveInlineAssetDiskPath(normalized);
+  if (!diskPath || !fs.existsSync(diskPath)) {
+    return null;
+  }
+  return {
+    path: diskPath,
+    contentType: guessInlineAssetContentType(diskPath),
+    filename: path.basename(diskPath) || "inline-asset"
+  };
+}
+
+async function buildInlineAssetBundle(config = {}) {
+  const assetDefinitions = [
+    { key: "logo", source: config.logo_url, placeholder: OUTGOING_INLINE_ASSET_PLACEHOLDERS.logo },
+    { key: "signature", source: config.signature_image_url, placeholder: OUTGOING_INLINE_ASSET_PLACEHOLDERS.signature },
+    { key: "stamp", source: config.stamp_image_url, placeholder: OUTGOING_INLINE_ASSET_PLACEHOLDERS.stamp }
+  ];
+
+  const replacements = {};
+  const attachments = [];
+
+  for (const asset of assetDefinitions) {
+    const originalSource = String(asset.source || "").trim();
+    if (!originalSource) {
+      replacements[asset.placeholder] = "";
+      continue;
+    }
+    const loaded = await loadInlineAsset(originalSource);
+    if (!loaded) {
+      replacements[asset.placeholder] = /^https?:\/\//i.test(originalSource) ? originalSource : "";
+      continue;
+    }
+    const cid = `${asset.key}.${crypto.randomUUID()}@emailarray.local`;
+    attachments.push({
+      filename: loaded.filename,
+      path: loaded.path,
+      content: loaded.content,
+      contentType: loaded.contentType,
+      cid,
+      disposition: "inline"
+    });
+    replacements[asset.placeholder] = `cid:${cid}`;
+  }
+
+  return { attachments, replacements };
+}
+
+function applyInlineAssetReplacements(html = "", replacements = {}) {
+  let output = String(html || "");
+  for (const [placeholder, replacement] of Object.entries(replacements || {})) {
+    output = output.split(placeholder).join(replacement || "");
+  }
+  return output;
+}
+
 async function sendMailMessage({ recipient_name, recipient_email, cc_list, bcc_list, subject, body, body_html, priority = "Normal", sensitivity = "Normal", read_receipt, delivery_receipt, from, account_id }, files = [], employeeId = null) {
   const ownerUserId = Number(employeeId || 0);
   let config = activeConfigs.get(ownerUserId) || await ensureActiveConfig(ownerUserId);
@@ -4315,8 +4424,9 @@ async function sendMailMessage({ recipient_name, recipient_email, cc_list, bcc_l
 
   const hiddenFooter = await generateHiddenFooter(subjectMeta.project_code || "UNSPECIFIED", serialInfo.serial);
   const textBodyWithFooter = (body || "") + bodyFooter;
+  const inlineAssets = await buildInlineAssetBundle(config);
   const htmlContent = String(body_html || "").trim()
-    ? String(body_html || "")
+    ? applyInlineAssetReplacements(String(body_html || ""), inlineAssets.replacements)
     : `<div style="font-family:Arial,'Segoe UI',sans-serif;font-size:14px;color:#0f172a;">${convertPlainTextToHtml(body || "")}</div>`;
   const bodyWithFooter = `${htmlContent}${buildArchiveFooterHtml(bodyFooter)}${hiddenFooter}`;
 
@@ -4330,7 +4440,7 @@ async function sendMailMessage({ recipient_name, recipient_email, cc_list, bcc_l
       subject: subjectWithSerial,
       text: textBodyWithFooter,
       html: bodyWithFooter,
-      attachments: await buildAttachmentPayload(files),
+      attachments: [...await buildAttachmentPayload(files), ...inlineAssets.attachments],
       headers: {
         "X-Company-Serial": serialInfo.serial,
         "X-Company-Department": config.department || "General"
@@ -4475,6 +4585,8 @@ async function deliverApprovalEmail(emailRecord, files = [], employeeId = null) 
   await ensureFolder("Sent", "Send", 0);
   await ensureFolder("Outbox", "Send", 0);
   const transporter = getSmtpTransporter(config);
+  const inlineAssets = await buildInlineAssetBundle(config);
+  const htmlBody = applyInlineAssetReplacements(String(emailRecord.body_html || "").trim() || "", inlineAssets.replacements);
   const fromAddress = emailRecord.sender_email
     ? `"${emailRecord.sender_name || config.display_name || config.company_name}" <${emailRecord.sender_email}>`
     : `"${config.display_name || config.company_name}" <${config.email_address}>`;
@@ -4487,8 +4599,8 @@ async function deliverApprovalEmail(emailRecord, files = [], employeeId = null) 
       bcc: emailRecord.bcc_list || undefined,
       subject: emailRecord.subject,
       text: emailRecord.body,
-      html: String(emailRecord.body_html || "").trim() || undefined,
-      attachments: await buildAttachmentPayload(files)
+      html: htmlBody || undefined,
+      attachments: [...await buildAttachmentPayload(files), ...inlineAssets.attachments]
     });
 
     await markOutboxSent(emailRecord.id, info.messageId);

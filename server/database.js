@@ -790,7 +790,9 @@ async function addMissingEmailColumns() {
     "ai_summary TEXT", "transaction_type TEXT", "urgency_level TEXT",
     "needs_reply BOOLEAN DEFAULT FALSE", "reply_deadline TIMESTAMPTZ",
     "replied_at TIMESTAMPTZ", "archived BOOLEAN DEFAULT FALSE",
-    "archived_at TIMESTAMPTZ"
+    "archived_at TIMESTAMPTZ",
+    "user_category TEXT DEFAULT ''", "follow_up_status TEXT DEFAULT ''",
+    "follow_up_due_at TIMESTAMPTZ", "follow_up_note TEXT DEFAULT ''"
   ];
   for (const col of cols) {
     try { await query(`ALTER TABLE emails ADD COLUMN IF NOT EXISTS ${col}`); } catch (e) { /* already exists */ }
@@ -1099,7 +1101,25 @@ async function runSchema() {
         starts_at TIMESTAMPTZ NOT NULL,
         ends_at TIMESTAMPTZ NOT NULL,
         location TEXT,
-        category TEXT DEFAULT 'Meeting'
+        category TEXT DEFAULT 'Meeting',
+        description TEXT DEFAULT '',
+        status TEXT DEFAULT 'Busy',
+        is_all_day BOOLEAN DEFAULT FALSE,
+        reminder_enabled BOOLEAN DEFAULT TRUE,
+        reminder_minutes INTEGER DEFAULT 15,
+        reminder_at TIMESTAMPTZ,
+        color TEXT DEFAULT '#0f6cbd',
+        recurrence_pattern TEXT DEFAULT 'none',
+        recurrence_interval INTEGER DEFAULT 1,
+        recurrence_days TEXT DEFAULT '',
+        recurrence_until TIMESTAMPTZ,
+        recurrence_count INTEGER,
+        series_master_id INTEGER REFERENCES calendar_events(id) ON DELETE CASCADE,
+        occurrence_original_start TIMESTAMPTZ,
+        exception_mode TEXT DEFAULT 'none',
+        employee_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
       )
     `,
     `
@@ -1107,6 +1127,8 @@ async function runSchema() {
         id INTEGER PRIMARY KEY,
         company_name TEXT NOT NULL,
         logo_url TEXT,
+        signature_image_url TEXT DEFAULT '',
+        stamp_image_url TEXT DEFAULT '',
         company_address TEXT DEFAULT '',
         company_phone TEXT DEFAULT '',
         company_website TEXT DEFAULT '',
@@ -1154,6 +1176,8 @@ async function runSchema() {
         user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
         company_name TEXT NOT NULL,
         logo_url TEXT,
+        signature_image_url TEXT DEFAULT '',
+        stamp_image_url TEXT DEFAULT '',
         company_address TEXT DEFAULT '',
         company_phone TEXT DEFAULT '',
         company_website TEXT DEFAULT '',
@@ -1258,6 +1282,28 @@ async function runSchema() {
   await query("ALTER TABLE emails ADD COLUMN IF NOT EXISTS last_reminder_slot TEXT DEFAULT ''");
   await query("ALTER TABLE emails ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMPTZ");
   await query("ALTER TABLE emails ADD COLUMN IF NOT EXISTS snoozed_until TIMESTAMPTZ");
+  await query("ALTER TABLE emails ADD COLUMN IF NOT EXISTS user_category TEXT DEFAULT ''");
+  await query("ALTER TABLE emails ADD COLUMN IF NOT EXISTS follow_up_status TEXT DEFAULT ''");
+  await query("ALTER TABLE emails ADD COLUMN IF NOT EXISTS follow_up_due_at TIMESTAMPTZ");
+  await query("ALTER TABLE emails ADD COLUMN IF NOT EXISTS follow_up_note TEXT DEFAULT ''");
+  await query("ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS description TEXT DEFAULT ''");
+  await query("ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'Busy'");
+  await query("ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS is_all_day BOOLEAN DEFAULT FALSE");
+  await query("ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS reminder_enabled BOOLEAN DEFAULT TRUE");
+  await query("ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS reminder_minutes INTEGER DEFAULT 15");
+  await query("ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS reminder_at TIMESTAMPTZ");
+  await query("ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS color TEXT DEFAULT '#0f6cbd'");
+  await query("ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS recurrence_pattern TEXT DEFAULT 'none'");
+  await query("ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS recurrence_interval INTEGER DEFAULT 1");
+  await query("ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS recurrence_days TEXT DEFAULT ''");
+  await query("ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS recurrence_until TIMESTAMPTZ");
+  await query("ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS recurrence_count INTEGER");
+  await query("ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS series_master_id INTEGER REFERENCES calendar_events(id) ON DELETE CASCADE");
+  await query("ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS occurrence_original_start TIMESTAMPTZ");
+  await query("ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS exception_mode TEXT DEFAULT 'none'");
+  await query("ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS employee_id INTEGER REFERENCES users(id) ON DELETE CASCADE");
+  await query("ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()");
+  await query("ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()");
   await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS manager_id INTEGER REFERENCES users(id)");
   await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE");
   await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS created_by INTEGER REFERENCES users(id)");
@@ -1492,6 +1538,8 @@ async function runSchema() {
         id SERIAL PRIMARY KEY,
         project_code TEXT NOT NULL UNIQUE,
         project_name TEXT NOT NULL,
+        company_name TEXT DEFAULT '',
+        company_code TEXT DEFAULT '',
         client_name TEXT DEFAULT '',
         location TEXT DEFAULT '',
         status TEXT DEFAULT 'Active',
@@ -1510,6 +1558,8 @@ async function runSchema() {
   } catch (e) { /* columns may already exist */ }
 
   try {
+    await query(`ALTER TABLE projects ADD COLUMN IF NOT EXISTS company_name TEXT DEFAULT ''`);
+    await query(`ALTER TABLE projects ADD COLUMN IF NOT EXISTS company_code TEXT DEFAULT ''`);
     await query(`ALTER TABLE projects ADD COLUMN IF NOT EXISTS project_manager_id INTEGER REFERENCES users(id) ON DELETE SET NULL`);
     await query(`ALTER TABLE projects ADD COLUMN IF NOT EXISTS budget NUMERIC DEFAULT 0`);
     await query(`ALTER TABLE projects ADD COLUMN IF NOT EXISTS completion_pct INTEGER DEFAULT 0`);
@@ -1778,6 +1828,8 @@ async function runSchema() {
   await query("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS graph_client_id TEXT DEFAULT ''");
   await query("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS graph_client_secret TEXT DEFAULT ''");
   await query("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS graph_mailbox_user TEXT DEFAULT ''");
+  await query("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS signature_image_url TEXT DEFAULT ''");
+  await query("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS stamp_image_url TEXT DEFAULT ''");
   await query("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS company_address TEXT DEFAULT ''");
   await query("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS company_phone TEXT DEFAULT ''");
   await query("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS company_website TEXT DEFAULT ''");
@@ -1798,6 +1850,8 @@ async function runSchema() {
   await query("ALTER TABLE user_mail_settings ADD COLUMN IF NOT EXISTS graph_client_id TEXT DEFAULT ''");
   await query("ALTER TABLE user_mail_settings ADD COLUMN IF NOT EXISTS graph_client_secret TEXT DEFAULT ''");
   await query("ALTER TABLE user_mail_settings ADD COLUMN IF NOT EXISTS graph_mailbox_user TEXT DEFAULT ''");
+  await query("ALTER TABLE user_mail_settings ADD COLUMN IF NOT EXISTS signature_image_url TEXT DEFAULT ''");
+  await query("ALTER TABLE user_mail_settings ADD COLUMN IF NOT EXISTS stamp_image_url TEXT DEFAULT ''");
   await query("ALTER TABLE user_mail_settings ADD COLUMN IF NOT EXISTS company_address TEXT DEFAULT ''");
   await query("ALTER TABLE user_mail_settings ADD COLUMN IF NOT EXISTS company_phone TEXT DEFAULT ''");
   await query("ALTER TABLE user_mail_settings ADD COLUMN IF NOT EXISTS company_website TEXT DEFAULT ''");
@@ -2106,7 +2160,7 @@ async function seedDefaults() {
   await query(
     `
       INSERT INTO app_settings (
-        id, company_name, logo_url, display_name, email_address, account_type,
+        id, company_name, logo_url, signature_image_url, stamp_image_url, display_name, email_address, account_type,
         incoming_server, incoming_port, incoming_ssl, outgoing_server, outgoing_port,
         outgoing_encryption, smtp_auth_required, smtp_same_as_incoming, username, password,
         remember_password, require_spa, leave_copy_on_server, remove_after_days,
@@ -2114,17 +2168,19 @@ async function seedDefaults() {
         sync_sent_items, graph_tenant_id, graph_client_id, graph_client_secret, graph_mailbox_user
       )
       VALUES (
-        1, $1, $2, $3, $4, $5,
-        $6, $7, $8, $9, $10,
-        $11, $12, $13, $14, $15,
-        $16, $17, $18, $19,
-        $20, $21, $22, $23,
-        $24, $25, $26, $27, $28
+        1, $1, $2, $3, $4, $5, $6, $7,
+        $8, $9, $10, $11, $12,
+        $13, $14, $15, $16, $17,
+        $18, $19, $20, $21,
+        $22, $23, $24, $25,
+        $26, $27, $28, $29, $30
       )
     `,
     [
       "TECHNO GROUP",
       "/logo.gif",
+      "",
+      "",
       "M. Safadi",
       defaultAdminEmail,
       "POP3",
@@ -2236,7 +2292,7 @@ async function ensureSystemDefaults() {
     await query(
       `
         INSERT INTO app_settings (
-          id, company_name, logo_url, display_name, email_address, account_type,
+          id, company_name, logo_url, signature_image_url, stamp_image_url, display_name, email_address, account_type,
           incoming_server, incoming_port, incoming_ssl, outgoing_server, outgoing_port,
           outgoing_encryption, smtp_auth_required, smtp_same_as_incoming, username, password,
           remember_password, require_spa, leave_copy_on_server, remove_after_days,
@@ -2244,17 +2300,19 @@ async function ensureSystemDefaults() {
           sync_sent_items, graph_tenant_id, graph_client_id, graph_client_secret, graph_mailbox_user
         )
         VALUES (
-          1, $1, $2, $3, $4, $5,
-          $6, $7, $8, $9, $10,
-          $11, $12, $13, $14, $15,
-          $16, $17, $18, $19,
-          $20, $21, $22, $23,
-          $24, $25, $26, $27, $28
+          1, $1, $2, $3, $4, $5, $6, $7,
+          $8, $9, $10, $11, $12,
+          $13, $14, $15, $16, $17,
+          $18, $19, $20, $21,
+          $22, $23, $24, $25,
+          $26, $27, $28, $29, $30
         )
       `,
       [
         "TECHNO GROUP",
         "/logo.gif",
+        "",
+        "",
         "M. Safadi",
         defaultAdminEmail,
         "POP3",
@@ -2466,6 +2524,20 @@ async function getAllAdminUsers() {
   return rows;
 }
 
+async function getUsersWithActiveEmailAccounts() {
+  const { rows } = await query(
+    `
+      SELECT DISTINCT users.*
+      FROM users
+      JOIN email_accounts ON email_accounts.user_id = users.id
+      WHERE users.is_active = TRUE
+        AND email_accounts.is_active = TRUE
+      ORDER BY users.id ASC
+    `
+  );
+  return rows;
+}
+
 async function revokeApprovalActionTokens({
   emailId,
   managerId = null,
@@ -2646,13 +2718,18 @@ function buildUserMailSettings(user, settings = {}) {
   const userEmail = user?.email || "";
   const effectiveEmailAddress = settings.user_id ? settings.email_address : userEmail;
   const effectiveUsername = settings.user_id ? settings.username : userEmail;
+  const defaultAddress = "Business Park, Amman, Jordan";
+  const defaultPhone = "+962 6 000 0000";
+  const defaultWebsite = "https://www.example.com";
 
   return {
     company_name: settings.company_name || "TECHNO GROUP",
-    logo_url: settings.logo_url || "",
-    company_address: settings.company_address || "",
-    company_phone: settings.company_phone || "",
-    company_website: settings.company_website || "",
+    logo_url: settings.logo_url || "/logo.gif",
+    signature_image_url: settings.signature_image_url || "",
+    stamp_image_url: settings.stamp_image_url || "",
+    company_address: settings.company_address || defaultAddress,
+    company_phone: settings.company_phone || defaultPhone,
+    company_website: settings.company_website || defaultWebsite,
     display_name: settings.display_name || userName,
     email_address: effectiveEmailAddress || userEmail,
     account_type: settings.account_type || "POP3",
@@ -2851,7 +2928,12 @@ async function listBootstrapData(currentUserId) {
       scopedEmailParams
     ),
     query("SELECT * FROM reports ORDER BY id"),
-    query("SELECT * FROM calendar_events ORDER BY starts_at ASC"),
+    query(
+      isAdminOverride
+        ? "SELECT * FROM calendar_events ORDER BY starts_at ASC"
+        : "SELECT * FROM calendar_events WHERE employee_id = $1 OR employee_id IS NULL ORDER BY starts_at ASC",
+      scopedEmailParams
+    ),
     getMailSettingsForUser(currentUserId)
   ]);
 
@@ -2907,6 +2989,10 @@ async function createEmail(email, files = [], source = "manual", employeeId = nu
   await query("ALTER TABLE emails ADD COLUMN IF NOT EXISTS reminder_count INTEGER DEFAULT 0");
   await query("ALTER TABLE emails ADD COLUMN IF NOT EXISTS last_reminder_at TIMESTAMPTZ");
   await query("ALTER TABLE emails ADD COLUMN IF NOT EXISTS last_reminder_slot TEXT DEFAULT ''");
+  await query("ALTER TABLE emails ADD COLUMN IF NOT EXISTS user_category TEXT DEFAULT ''");
+  await query("ALTER TABLE emails ADD COLUMN IF NOT EXISTS follow_up_status TEXT DEFAULT ''");
+  await query("ALTER TABLE emails ADD COLUMN IF NOT EXISTS follow_up_due_at TIMESTAMPTZ");
+  await query("ALTER TABLE emails ADD COLUMN IF NOT EXISTS follow_up_note TEXT DEFAULT ''");
   await query("ALTER TABLE emails ADD COLUMN IF NOT EXISTS project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL");
   await query("ALTER TABLE emails ADD COLUMN IF NOT EXISTS email_key_id INTEGER REFERENCES email_keys(id) ON DELETE SET NULL");
   await query("ALTER TABLE attachments ADD COLUMN IF NOT EXISTS content_id TEXT");
@@ -3065,52 +3151,56 @@ async function updateAppSettings(settings) {
       SET
         company_name = $1,
         logo_url = $2,
-        company_address = $3,
-        company_phone = $4,
-        company_website = $5,
-        display_name = $6,
-        email_address = $7,
-        account_type = $8,
-        incoming_server = $9,
-        incoming_port = $10,
-        incoming_ssl = $11,
-        outgoing_server = $12,
-        outgoing_port = $13,
-        outgoing_encryption = $14,
-        smtp_auth_required = $15,
-        smtp_same_as_incoming = $16,
-        username = $17,
-        password = $18,
-        remember_password = $19,
-        require_spa = $20,
-        leave_copy_on_server = $21,
-        remove_after_days = $22,
-        remove_when_deleted = $23,
-        auto_send_receive_minutes = $24,
-        signature = $25,
-        default_priority = $26,
-        default_sensitivity = $27,
-        default_read_receipt = $28,
-        default_delivery_receipt = $29,
-        inbox_folder_name = $30,
-        sent_folder_name = $31,
-        sync_sent_items = $32,
-        graph_tenant_id = $33,
-        graph_client_id = $34,
-        graph_client_secret = $35,
-        graph_mailbox_user = $36,
-        outbound_subject_companies_json = $37,
-        outbound_subject_quotations_json = $38,
-        outbound_subject_clients_json = $39,
-        outbound_subject_studies_json = $40,
-        outbound_subject_admin_subjects_json = $41,
-        enforce_outbound_subject_schema = $42
+        signature_image_url = $3,
+        stamp_image_url = $4,
+        company_address = $5,
+        company_phone = $6,
+        company_website = $7,
+        display_name = $8,
+        email_address = $9,
+        account_type = $10,
+        incoming_server = $11,
+        incoming_port = $12,
+        incoming_ssl = $13,
+        outgoing_server = $14,
+        outgoing_port = $15,
+        outgoing_encryption = $16,
+        smtp_auth_required = $17,
+        smtp_same_as_incoming = $18,
+        username = $19,
+        password = $20,
+        remember_password = $21,
+        require_spa = $22,
+        leave_copy_on_server = $23,
+        remove_after_days = $24,
+        remove_when_deleted = $25,
+        auto_send_receive_minutes = $26,
+        signature = $27,
+        default_priority = $28,
+        default_sensitivity = $29,
+        default_read_receipt = $30,
+        default_delivery_receipt = $31,
+        inbox_folder_name = $32,
+        sent_folder_name = $33,
+        sync_sent_items = $34,
+        graph_tenant_id = $35,
+        graph_client_id = $36,
+        graph_client_secret = $37,
+        graph_mailbox_user = $38,
+        outbound_subject_companies_json = $39,
+        outbound_subject_quotations_json = $40,
+        outbound_subject_clients_json = $41,
+        outbound_subject_studies_json = $42,
+        outbound_subject_admin_subjects_json = $43,
+        enforce_outbound_subject_schema = $44
       WHERE id = 1
       RETURNING *
     `,
     [
       settings.company_name,
       settings.logo_url || "",
+      settings.signature_image_url || "",
+      settings.stamp_image_url || "",
       settings.company_address || "",
       settings.company_phone || "",
       settings.company_website || "",
@@ -3200,7 +3290,7 @@ async function updateMailSettingsForUser(userId, settings) {
   const result = await query(
     `
       INSERT INTO user_mail_settings (
-        id, user_id, company_name, logo_url, company_address, company_phone, company_website, display_name, email_address, account_type,
+        id, user_id, company_name, logo_url, signature_image_url, stamp_image_url, company_address, company_phone, company_website, display_name, email_address, account_type,
         incoming_server, incoming_port, incoming_ssl, outgoing_server, outgoing_port,
         outgoing_encryption, smtp_auth_required, smtp_same_as_incoming, username, password,
         remember_password, require_spa, leave_copy_on_server, remove_after_days,
@@ -3211,19 +3301,21 @@ async function updateMailSettingsForUser(userId, settings) {
         outbound_subject_studies_json, outbound_subject_admin_subjects_json, enforce_outbound_subject_schema, updated_at
       )
       VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-        $11, $12, $13, $14, $15,
-        $16, $17, $18, $19, $20,
-        $21, $22, $23, $24,
-        $25, $26, $27, $28,
-        $29, $30, $31, $32, $33,
-        $34, $35, $36, $37, $38,
-        $39, $40, $41, $42, $43, $44, NOW()
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+        $13, $14, $15, $16, $17,
+        $18, $19, $20, $21, $22,
+        $23, $24, $25, $26,
+        $27, $28, $29, $30,
+        $31, $32, $33, $34, $35,
+        $36, $37, $38, $39, $40,
+        $41, $42, $43, $44, $45, $46, NOW()
       )
       ON CONFLICT (user_id)
       DO UPDATE SET
         company_name = EXCLUDED.company_name,
         logo_url = EXCLUDED.logo_url,
+        signature_image_url = EXCLUDED.signature_image_url,
+        stamp_image_url = EXCLUDED.stamp_image_url,
         company_address = EXCLUDED.company_address,
         company_phone = EXCLUDED.company_phone,
         company_website = EXCLUDED.company_website,
@@ -3272,6 +3364,8 @@ async function updateMailSettingsForUser(userId, settings) {
       userId,
       normalized.company_name,
       normalized.logo_url || "",
+      normalized.signature_image_url || "",
+      normalized.stamp_image_url || "",
       normalized.company_address || "",
       normalized.company_phone || "",
       normalized.company_website || "",
@@ -3399,11 +3493,16 @@ async function importSyncedEmails(items = []) {
         recommendation: serial ? `Archived with serial ${serial}. Thread depth: ${threadDepth}.` : "Imported from existing mail sync pipeline.",
         report_status: item.report_status || "Pending Review",
         external_message_id: item.external_message_id,
+        body_html: item.body_html || null,
+        sent_at: item.sent_at || null,
+        employee_id: item.employee_id || null,
+        account_id: item.account_id || null,
         reminder_title: item.reminder_title,
         remind_at: item.remind_at
       },
       [],
-      "sync"
+      "sync",
+      item.employee_id || null
     );
 
     if (item.message_id && archivedEmail) {
@@ -4107,6 +4206,49 @@ async function getEmployeeAnalytics() {
      FROM users`
   );
   return { employees: rows, summary: summary[0] };
+}
+
+async function getCalendarAdminAnalytics() {
+  const { rows } = await query(
+    `
+      SELECT
+        u.id,
+        u.name,
+        u.email,
+        u.department,
+        COUNT(CASE WHEN COALESCE(c.exception_mode, 'none') <> 'skip' THEN c.id END)::int AS total_events,
+        SUM(CASE WHEN COALESCE(c.recurrence_pattern, 'none') <> 'none' THEN 1 ELSE 0 END)::int AS recurring_events,
+        SUM(CASE WHEN COALESCE(c.exception_mode, 'none') <> 'skip' AND COALESCE(c.reminder_enabled, FALSE) = TRUE THEN 1 ELSE 0 END)::int AS reminder_enabled_events,
+        SUM(CASE WHEN COALESCE(c.exception_mode, 'none') <> 'skip' AND c.starts_at >= NOW() THEN 1 ELSE 0 END)::int AS upcoming_events,
+        SUM(CASE WHEN COALESCE(c.exception_mode, 'none') <> 'skip' AND c.reminder_at IS NOT NULL AND c.reminder_at <= NOW() AND c.starts_at >= NOW() THEN 1 ELSE 0 END)::int AS due_reminders,
+        MAX(c.starts_at) AS latest_event_at
+      FROM users u
+      LEFT JOIN calendar_events c ON c.employee_id = u.id
+      GROUP BY u.id, u.name, u.email, u.department
+      ORDER BY upcoming_events DESC, total_events DESC, u.name ASC
+    `
+  );
+  const { rows: summaryRows } = await query(
+    `
+      SELECT
+        COUNT(CASE WHEN COALESCE(exception_mode, 'none') <> 'skip' THEN 1 END)::int AS total_events,
+        SUM(CASE WHEN COALESCE(recurrence_pattern, 'none') <> 'none' THEN 1 ELSE 0 END)::int AS recurring_events,
+        SUM(CASE WHEN COALESCE(exception_mode, 'none') <> 'skip' AND COALESCE(reminder_enabled, FALSE) = TRUE THEN 1 ELSE 0 END)::int AS reminder_enabled_events,
+        SUM(CASE WHEN COALESCE(exception_mode, 'none') <> 'skip' AND starts_at >= NOW() THEN 1 ELSE 0 END)::int AS upcoming_events,
+        SUM(CASE WHEN COALESCE(exception_mode, 'none') <> 'skip' AND reminder_at IS NOT NULL AND reminder_at <= NOW() AND starts_at >= NOW() THEN 1 ELSE 0 END)::int AS due_reminders
+      FROM calendar_events
+    `
+  );
+  return {
+    employees: rows || [],
+    summary: summaryRows[0] || {
+      total_events: 0,
+      recurring_events: 0,
+      reminder_enabled_events: 0,
+      upcoming_events: 0,
+      due_reminders: 0
+    }
+  };
 }
 
 async function createArchive(adminId, { employee_id, email_ids, notes = "" }) {
@@ -5082,6 +5224,352 @@ async function createTask(taskData) {
   return result.rows[0];
 }
 
+function buildCalendarReminderAt({
+  startsAt,
+  reminderEnabled = true,
+  reminderMinutes = 15,
+  isAllDay = false
+} = {}) {
+  if (!startsAt || !reminderEnabled) {
+    return null;
+  }
+  const safeMinutes = Math.max(0, Number(reminderMinutes || 0));
+  const startDate = new Date(startsAt);
+  if (Number.isNaN(startDate.getTime())) {
+    return null;
+  }
+  if (isAllDay) {
+    startDate.setHours(9, 0, 0, 0);
+  }
+  return new Date(startDate.getTime() - safeMinutes * 60000).toISOString();
+}
+
+function normalizeCalendarExceptionMode(value = "") {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "detached" || normalized === "skip") {
+    return normalized;
+  }
+  return "none";
+}
+
+function buildCalendarEndFromDuration(startsAt, durationMinutes = 60) {
+  const startDate = new Date(startsAt);
+  if (Number.isNaN(startDate.getTime())) {
+    return startsAt;
+  }
+  const safeMinutes = Math.max(30, Number(durationMinutes || 0) || 60);
+  return new Date(startDate.getTime() + safeMinutes * 60000).toISOString();
+}
+
+function getCalendarEventDurationMinutes(event = {}) {
+  const startDate = new Date(event.starts_at || event.start || 0);
+  const endDate = new Date(event.ends_at || event.end || event.starts_at || event.start || 0);
+  if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) {
+    return 60;
+  }
+  return Math.max(30, Math.round((endDate.getTime() - startDate.getTime()) / 60000) || 60);
+}
+
+async function createCalendarEvent(eventData) {
+  const maxResult = await query(`SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM calendar_events`);
+  const nextId = maxResult.rows[0].next_id;
+  const startsAt = eventData.starts_at || eventData.start || null;
+  const endsAt = eventData.ends_at || eventData.end || startsAt;
+  const isAllDay = Boolean(eventData.is_all_day);
+  const reminderEnabled = eventData.reminder_enabled !== false;
+  const reminderMinutes = Math.max(0, Number(eventData.reminder_minutes ?? 15));
+  const recurrencePattern = String(eventData.recurrence_pattern || "none").trim().toLowerCase() || "none";
+  const recurrenceInterval = Math.max(1, Number(eventData.recurrence_interval || 1));
+  const recurrenceDays = Array.isArray(eventData.recurrence_days)
+    ? eventData.recurrence_days.join(",")
+    : String(eventData.recurrence_days || "").trim();
+  const recurrenceUntil = eventData.recurrence_until || null;
+  const recurrenceCount = eventData.recurrence_count ? Math.max(1, Number(eventData.recurrence_count)) : null;
+  const seriesMasterId = eventData.series_master_id ? Number(eventData.series_master_id) : null;
+  const occurrenceOriginalStart = seriesMasterId
+    ? (eventData.occurrence_original_start || startsAt || null)
+    : null;
+  const exceptionMode = normalizeCalendarExceptionMode(eventData.exception_mode);
+  const reminderAt = eventData.reminder_at || buildCalendarReminderAt({
+    startsAt,
+    reminderEnabled,
+    reminderMinutes,
+    isAllDay
+  });
+  const result = await query(
+    `INSERT INTO calendar_events
+      (id, title, starts_at, ends_at, location, category, description, status, is_all_day, reminder_enabled, reminder_minutes, reminder_at, color, recurrence_pattern, recurrence_interval, recurrence_days, recurrence_until, recurrence_count, series_master_id, occurrence_original_start, exception_mode, employee_id, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, NOW(), NOW())
+     RETURNING *`,
+    [
+      nextId,
+      String(eventData.title || "").trim(),
+      startsAt,
+      endsAt,
+      eventData.location || "",
+      eventData.category || "Appointment",
+      eventData.description || "",
+      eventData.status || "Busy",
+      isAllDay,
+      reminderEnabled,
+      reminderMinutes,
+      reminderAt,
+      eventData.color || "#0f6cbd",
+      recurrencePattern,
+      recurrenceInterval,
+      recurrencePattern === "weekly" ? recurrenceDays : "",
+      recurrencePattern === "none" ? null : recurrenceUntil,
+      recurrencePattern === "none" ? null : recurrenceCount,
+      seriesMasterId,
+      occurrenceOriginalStart,
+      exceptionMode,
+      eventData.employee_id || null
+    ]
+  );
+  return result.rows[0] || null;
+}
+
+async function getCalendarEventById(id) {
+  const result = await query(`SELECT * FROM calendar_events WHERE id = $1`, [id]);
+  return result.rows[0] || null;
+}
+
+async function getCalendarEvents(filters = {}) {
+  const params = [];
+  const where = [];
+  let idx = 1;
+  if (filters.employee_id) {
+    where.push(`employee_id = $${idx}`);
+    params.push(Number(filters.employee_id));
+    idx++;
+  }
+  if (filters.from) {
+    where.push(`ends_at >= $${idx}`);
+    params.push(filters.from);
+    idx++;
+  }
+  if (filters.to) {
+    where.push(`starts_at <= $${idx}`);
+    params.push(filters.to);
+    idx++;
+  }
+  const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  const result = await query(
+    `SELECT * FROM calendar_events ${whereSql} ORDER BY starts_at ASC, id ASC`,
+    params
+  );
+  return result.rows || [];
+}
+
+async function updateCalendarEvent(id, eventData) {
+  const current = await getCalendarEventById(id);
+  if (!current) {
+    return null;
+  }
+  const merged = {
+    ...current,
+    ...eventData
+  };
+  const startsAt = merged.starts_at || merged.start || null;
+  const isAllDay = Boolean(merged.is_all_day);
+  const reminderEnabled = merged.reminder_enabled !== false;
+  const reminderMinutes = Math.max(0, Number(merged.reminder_minutes ?? 15));
+  const recurrencePattern = String(merged.recurrence_pattern || "none").trim().toLowerCase() || "none";
+  const recurrenceInterval = Math.max(1, Number(merged.recurrence_interval || 1));
+  const recurrenceDays = Array.isArray(merged.recurrence_days)
+    ? merged.recurrence_days.join(",")
+    : String(merged.recurrence_days || "").trim();
+  const recurrenceUntil = recurrencePattern === "none" ? null : (merged.recurrence_until || null);
+  const recurrenceCount = recurrencePattern === "none" ? null : (merged.recurrence_count ? Math.max(1, Number(merged.recurrence_count)) : null);
+  const seriesMasterId = merged.series_master_id ? Number(merged.series_master_id) : null;
+  const occurrenceOriginalStart = seriesMasterId
+    ? (merged.occurrence_original_start || startsAt || null)
+    : null;
+  const exceptionMode = normalizeCalendarExceptionMode(merged.exception_mode);
+  const reminderAt = Object.prototype.hasOwnProperty.call(eventData, "reminder_at")
+    ? eventData.reminder_at
+    : buildCalendarReminderAt({
+      startsAt,
+      reminderEnabled,
+      reminderMinutes,
+      isAllDay
+    });
+  const result = await query(
+    `UPDATE calendar_events
+     SET title = $2,
+         starts_at = $3,
+         ends_at = $4,
+         location = $5,
+         category = $6,
+         description = $7,
+         status = $8,
+         is_all_day = $9,
+         reminder_enabled = $10,
+         reminder_minutes = $11,
+         reminder_at = $12,
+         color = $13,
+         recurrence_pattern = $14,
+         recurrence_interval = $15,
+         recurrence_days = $16,
+         recurrence_until = $17,
+         recurrence_count = $18,
+         series_master_id = $19,
+         occurrence_original_start = $20,
+         exception_mode = $21,
+         employee_id = $22,
+         updated_at = NOW()
+     WHERE id = $1
+     RETURNING *`,
+    [
+      Number(id),
+      String(merged.title || "").trim(),
+      startsAt,
+      merged.ends_at || merged.end || startsAt,
+      merged.location || "",
+      merged.category || "Appointment",
+      merged.description || "",
+      merged.status || "Busy",
+      isAllDay,
+      reminderEnabled,
+      reminderMinutes,
+      reminderEnabled ? reminderAt : null,
+      merged.color || "#0f6cbd",
+      recurrencePattern,
+      recurrenceInterval,
+      recurrencePattern === "weekly" ? recurrenceDays : "",
+      recurrenceUntil,
+      recurrenceCount,
+      seriesMasterId,
+      occurrenceOriginalStart,
+      exceptionMode,
+      merged.employee_id || null
+    ]
+  );
+  return result.rows[0] || null;
+}
+
+async function getCalendarOccurrenceException(seriesMasterId, occurrenceOriginalStart) {
+  const normalizedStart = occurrenceOriginalStart ? new Date(occurrenceOriginalStart) : null;
+  if (!seriesMasterId || !normalizedStart || Number.isNaN(normalizedStart.getTime())) {
+    return null;
+  }
+  const result = await query(
+    `
+      SELECT *
+      FROM calendar_events
+      WHERE series_master_id = $1
+        AND occurrence_original_start = $2
+      ORDER BY updated_at DESC, id DESC
+      LIMIT 1
+    `,
+    [Number(seriesMasterId), normalizedStart.toISOString()]
+  );
+  return result.rows[0] || null;
+}
+
+async function saveCalendarOccurrenceException(seriesMasterId, occurrenceOriginalStart, eventData = {}, mode = "detached") {
+  const masterEvent = await getCalendarEventById(seriesMasterId);
+  if (!masterEvent) {
+    throw new Error("Series appointment not found.");
+  }
+  const normalizedMode = normalizeCalendarExceptionMode(mode);
+  if (normalizedMode === "none") {
+    throw new Error("Invalid occurrence action.");
+  }
+  const originalStartDate = new Date(occurrenceOriginalStart || eventData.occurrence_original_start || eventData.starts_at || 0);
+  if (Number.isNaN(originalStartDate.getTime())) {
+    throw new Error("Occurrence start is required.");
+  }
+  const originalStartIso = originalStartDate.toISOString();
+  const existingException = await getCalendarOccurrenceException(masterEvent.id, originalStartIso);
+  const hasField = (key) => Object.prototype.hasOwnProperty.call(eventData, key);
+  const sourceForDuration = existingException && normalizeCalendarExceptionMode(existingException.exception_mode) === "detached"
+    ? existingException
+    : masterEvent;
+  const durationMinutes = getCalendarEventDurationMinutes(sourceForDuration);
+
+  if (normalizedMode === "skip") {
+    const skipPayload = {
+      title: masterEvent.title || existingException?.title || "Appointment",
+      starts_at: originalStartIso,
+      ends_at: buildCalendarEndFromDuration(originalStartIso, durationMinutes),
+      location: masterEvent.location || existingException?.location || "",
+      category: masterEvent.category || existingException?.category || "Appointment",
+      description: masterEvent.description || existingException?.description || "",
+      status: masterEvent.status || existingException?.status || "Busy",
+      is_all_day: Boolean(masterEvent.is_all_day),
+      reminder_enabled: false,
+      reminder_minutes: Number(masterEvent.reminder_minutes ?? 15),
+      reminder_at: null,
+      color: masterEvent.color || existingException?.color || "#0f6cbd",
+      recurrence_pattern: "none",
+      recurrence_interval: 1,
+      recurrence_days: [],
+      recurrence_until: null,
+      recurrence_count: null,
+      series_master_id: masterEvent.id,
+      occurrence_original_start: originalStartIso,
+      exception_mode: "skip",
+      employee_id: masterEvent.employee_id || null
+    };
+    return existingException
+      ? updateCalendarEvent(existingException.id, skipPayload)
+      : createCalendarEvent(skipPayload);
+  }
+
+  const detachedStartsAt = eventData.starts_at || existingException?.starts_at || originalStartIso;
+  const detachedEndsAt = eventData.ends_at || existingException?.ends_at || buildCalendarEndFromDuration(detachedStartsAt, durationMinutes);
+  const reminderEnabled = hasField("reminder_enabled")
+    ? Boolean(eventData.reminder_enabled)
+    : existingException
+      ? existingException.reminder_enabled !== false
+      : masterEvent.reminder_enabled !== false;
+  const reminderMinutes = hasField("reminder_minutes")
+    ? Math.max(0, Number(eventData.reminder_minutes ?? 15))
+    : Number(existingException?.reminder_minutes ?? masterEvent.reminder_minutes ?? 15);
+  const isAllDay = hasField("is_all_day")
+    ? Boolean(eventData.is_all_day)
+    : Boolean(existingException?.is_all_day ?? masterEvent.is_all_day);
+  const reminderAt = hasField("reminder_at")
+    ? eventData.reminder_at
+    : buildCalendarReminderAt({
+      startsAt: detachedStartsAt,
+      reminderEnabled,
+      reminderMinutes,
+      isAllDay
+    });
+  const detachedPayload = {
+    title: hasField("title") ? String(eventData.title || "").trim() : (existingException?.title || masterEvent.title || "Appointment"),
+    starts_at: detachedStartsAt,
+    ends_at: detachedEndsAt,
+    location: hasField("location") ? (eventData.location || "") : (existingException?.location || masterEvent.location || ""),
+    category: hasField("category") ? (eventData.category || "Appointment") : (existingException?.category || masterEvent.category || "Appointment"),
+    description: hasField("description") ? (eventData.description || "") : (existingException?.description || masterEvent.description || ""),
+    status: hasField("status") ? (eventData.status || "Busy") : (existingException?.status || masterEvent.status || "Busy"),
+    is_all_day: isAllDay,
+    reminder_enabled: reminderEnabled,
+    reminder_minutes: reminderMinutes,
+    reminder_at: reminderEnabled ? reminderAt : null,
+    color: hasField("color") ? (eventData.color || "#0f6cbd") : (existingException?.color || masterEvent.color || "#0f6cbd"),
+    recurrence_pattern: "none",
+    recurrence_interval: 1,
+    recurrence_days: [],
+    recurrence_until: null,
+    recurrence_count: null,
+    series_master_id: masterEvent.id,
+    occurrence_original_start: originalStartIso,
+    exception_mode: "detached",
+    employee_id: masterEvent.employee_id || null
+  };
+  return existingException
+    ? updateCalendarEvent(existingException.id, detachedPayload)
+    : createCalendarEvent(detachedPayload);
+}
+
+async function deleteCalendarEvent(id) {
+  await query(`DELETE FROM calendar_events WHERE id = $1`, [id]);
+}
+
 async function getTasks(filters = {}) {
   let where = "WHERE 1=1";
   const params = [];
@@ -5799,10 +6287,13 @@ async function deleteEmailKey(id) {
 }
 
 async function createProject(projectData) {
+  const companyName = String(projectData.company_name || "").trim();
+  const companyCode = String(projectData.company_code || "").trim().toUpperCase()
+    || (companyName ? companyName.replace(/[^\w.\-/\s]+/g, "").trim().replace(/\s+/g, "-").toUpperCase() : "");
   const result = await query(
-    `INSERT INTO projects (project_code, project_name, client_name, location, status, start_date, end_date, description)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-    [projectData.project_code.toUpperCase(), projectData.project_name, projectData.client_name || "",
+    `INSERT INTO projects (project_code, project_name, company_name, company_code, client_name, location, status, start_date, end_date, description)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+    [projectData.project_code.toUpperCase(), projectData.project_name, companyName, companyCode, projectData.client_name || "",
      projectData.location || "", projectData.status || "Active", projectData.start_date || null,
      projectData.end_date || null, projectData.description || ""]
   );
@@ -5884,9 +6375,15 @@ async function updateProject(id, projectData) {
   const values = [];
   let idx = 1;
   for (const [key, val] of Object.entries(projectData)) {
-    if (["project_code", "project_name", "client_name", "location", "status", "start_date", "end_date", "description"].includes(key)) {
+    if (["project_code", "project_name", "company_name", "company_code", "client_name", "location", "status", "start_date", "end_date", "description"].includes(key)) {
       fields.push(`${key} = $${idx}`);
-      values.push(val);
+      if (key === "company_code") {
+        values.push(String(val || "").trim().toUpperCase());
+      } else if (key === "company_name") {
+        values.push(String(val || "").trim());
+      } else {
+        values.push(val);
+      }
       idx++;
     }
   }
@@ -7483,6 +7980,7 @@ export {
   getUserByEmail,
   getUserById,
   getAllAdminUsers,
+  getUsersWithActiveEmailAccounts,
   sanitizeUser,
   listBootstrapData,
   getAppSettings,
@@ -7521,6 +8019,7 @@ export {
   deleteEmployee,
   getEmailTrail,
   getEmployeeAnalytics,
+  getCalendarAdminAnalytics,
   createArchive,
   listArchives,
   logEmailTrail,
@@ -7592,6 +8091,12 @@ export {
   getProjectByCode,
   updateProject,
   deleteProject,
+  createCalendarEvent,
+  getCalendarEvents,
+  getCalendarEventById,
+  updateCalendarEvent,
+  saveCalendarOccurrenceException,
+  deleteCalendarEvent,
   getEmailsByProject,
   getProjectEmailHistoryForDrafting,
   getContractMemoryForProject,

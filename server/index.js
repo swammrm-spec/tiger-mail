@@ -5,6 +5,7 @@ import multer from "multer";
 import path from "path";
 import fs from "fs";
 import {
+  query,
   uploadsDir,
   initializeDatabase,
   getDatabaseMode,
@@ -28,6 +29,7 @@ import {
   deleteEmployee,
   getEmailTrail,
   getEmployeeAnalytics,
+  getCalendarAdminAnalytics,
   createArchive,
   listArchives,
   logEmailTrail,
@@ -108,6 +110,12 @@ import {
   extractEmailMetadata,
   createTask,
   getTasks,
+  createCalendarEvent,
+  getCalendarEvents,
+  getCalendarEventById,
+  updateCalendarEvent,
+  saveCalendarOccurrenceException,
+  deleteCalendarEvent,
   getActiveTrackingTasks,
   getTrackingTaskSummary,
   getTrackingTaskById,
@@ -706,21 +714,321 @@ function parseOutgoingCatalogEntry(value = "", mode = "generic") {
   if (!raw) {
     return null;
   }
-  const [labelPart = "", secondPart = "", thirdPart = ""] = raw.split("|").map((item) => String(item || "").trim());
+  const parts = raw.split("|").map((item) => String(item || "").trim());
+  if (mode === "client" && parts.length >= 4) {
+    const [companyScope = "", labelPart = "", detailPart = "", codePart = ""] = parts;
+    const label = labelPart || raw;
+    return {
+      value: raw,
+      label,
+      detail: detailPart,
+      code: codePart || deriveOutgoingCode(label),
+      companyScope,
+      isScoped: Boolean(companyScope)
+    };
+  }
+  if (mode !== "client" && parts.length >= 4) {
+    const [companyScope = "", labelPart = "", codePart = "", detailPart = ""] = parts;
+    const label = labelPart || raw;
+    return {
+      value: raw,
+      label,
+      code: codePart || deriveOutgoingCode(label),
+      detail: detailPart,
+      companyScope,
+      isScoped: Boolean(companyScope)
+    };
+  }
+  const [labelPart = "", secondPart = "", thirdPart = ""] = parts;
   const label = labelPart || raw;
   if (mode === "client") {
     return {
       value: raw,
       label,
       detail: secondPart,
-      code: thirdPart || deriveOutgoingCode(label)
+      code: thirdPart || deriveOutgoingCode(label),
+      companyScope: "",
+      isScoped: false
     };
   }
   return {
     value: raw,
     label,
     code: secondPart || deriveOutgoingCode(label),
-    detail: thirdPart
+    detail: thirdPart,
+    companyScope: "",
+    isScoped: false
+  };
+}
+
+function normalizeOutgoingScopeToken(value = "") {
+  return String(value || "").trim().replace(/\s+/g, " ").toUpperCase();
+}
+
+function buildOutgoingCompanyScopeCandidates(company = null) {
+  if (!company) {
+    return new Set();
+  }
+  return new Set(
+    [company.value, company.label, company.code]
+      .map((item) => normalizeOutgoingScopeToken(item))
+      .filter(Boolean)
+  );
+}
+
+function matchesOutgoingCompanyScope(scopeValue = "", company = null, allowUnscoped = true) {
+  const normalizedScope = normalizeOutgoingScopeToken(scopeValue);
+  if (!normalizedScope) {
+    return allowUnscoped;
+  }
+  if (!company) {
+    return false;
+  }
+  return buildOutgoingCompanyScopeCandidates(company).has(normalizedScope);
+}
+
+function buildOutgoingCatalogOptions(values = [], mode = "generic", company = null) {
+  return normalizeSubjectCatalog(values)
+    .map((item) => parseOutgoingCatalogEntry(item, mode))
+    .filter((item) => matchesOutgoingCompanyScope(item?.companyScope, company, true))
+    .filter(Boolean);
+}
+
+function resolveOutgoingCompanyOptionByScope(scopeValue = "", companyOptions = []) {
+  return (Array.isArray(companyOptions) ? companyOptions : []).find((company) => (
+    matchesOutgoingCompanyScope(scopeValue, company, false)
+  )) || null;
+}
+
+function normalizeProjectTextToken(value = "") {
+  return String(value || "").trim().toUpperCase().replace(/[^A-Z0-9]+/g, "");
+}
+
+function collectProjectCompanyBackfillCandidates(project = {}, companyOptions = [], scopedClientEntries = []) {
+  const candidates = new Map();
+  const addCandidate = (company, reason) => {
+    if (!company?.value) {
+      return;
+    }
+    const existing = candidates.get(company.value);
+    if (existing) {
+      existing.reasons.push(reason);
+      return;
+    }
+    candidates.set(company.value, {
+      company,
+      reasons: [reason]
+    });
+  };
+
+  const existingCompany = resolveOutgoingCompanyOptionByScope(project.company_code || project.company_name || "", companyOptions);
+  if (existingCompany) {
+    addCandidate(existingCompany, "matched existing project company fields");
+  }
+
+  const normalizedClientName = normalizeOutgoingScopeToken(project.client_name || "");
+  if (normalizedClientName) {
+    for (const clientEntry of scopedClientEntries) {
+      const clientLabel = normalizeOutgoingScopeToken(clientEntry?.label || "");
+      const clientDetail = normalizeOutgoingScopeToken(clientEntry?.detail || "");
+      if (normalizedClientName === clientLabel || (clientDetail && normalizedClientName === clientDetail)) {
+        addCandidate(clientEntry.company, `matched client "${clientEntry.label}"`);
+      }
+    }
+  }
+
+  const haystacks = [
+    project.project_code,
+    project.project_name,
+    project.client_name,
+    project.company_name,
+    project.company_code
+  ]
+    .map((item) => normalizeProjectTextToken(item))
+    .filter(Boolean);
+
+  for (const company of companyOptions) {
+    const codeToken = normalizeProjectTextToken(company.code || "");
+    const labelToken = normalizeProjectTextToken(company.label || "");
+    if (codeToken && codeToken.length >= 3 && haystacks.some((item) => item.includes(codeToken))) {
+      addCandidate(company, `matched company code "${company.code}" in project text`);
+      continue;
+    }
+    if (labelToken && labelToken.length >= 5 && haystacks.some((item) => item.includes(labelToken))) {
+      addCandidate(company, `matched company name "${company.label}" in project text`);
+    }
+  }
+
+  return Array.from(candidates.values());
+}
+
+function formatScopedOutgoingCatalogEntry(entry = {}, company = null, mode = "generic") {
+  if (!entry) {
+    return "";
+  }
+  if (!company) {
+    return String(entry.value || "").trim();
+  }
+  if (mode === "client") {
+    return [
+      company.label || "",
+      entry.label || "",
+      entry.detail || "",
+      entry.code || deriveOutgoingCode(entry.label || "")
+    ].map((item) => String(item || "").trim()).join("|");
+  }
+  return [
+    company.label || "",
+    entry.label || "",
+    entry.code || deriveOutgoingCode(entry.label || ""),
+    entry.detail || ""
+  ].map((item) => String(item || "").trim()).join("|");
+}
+
+function collectCatalogCompanyBackfillCandidates(entry = {}, companyOptions = [], options = {}) {
+  const { mode = "generic", mappedProjects = [] } = options;
+  const candidates = new Map();
+  const addCandidate = (company, reason) => {
+    if (!company?.value) {
+      return;
+    }
+    const existing = candidates.get(company.value);
+    if (existing) {
+      existing.reasons.push(reason);
+      return;
+    }
+    candidates.set(company.value, {
+      company,
+      reasons: [reason]
+    });
+  };
+
+  const existingCompany = resolveOutgoingCompanyOptionByScope(entry.companyScope || "", companyOptions);
+  if (existingCompany) {
+    addCandidate(existingCompany, "matched existing catalog scope");
+  }
+
+  const haystacks = [
+    entry.label,
+    entry.code,
+    entry.detail
+  ]
+    .map((item) => normalizeProjectTextToken(item))
+    .filter(Boolean);
+
+  for (const company of companyOptions) {
+    const codeToken = normalizeProjectTextToken(company.code || "");
+    const labelToken = normalizeProjectTextToken(company.label || "");
+    if (codeToken && codeToken.length >= 3 && haystacks.some((item) => item.includes(codeToken))) {
+      addCandidate(company, `matched company code "${company.code}" in catalog text`);
+      continue;
+    }
+    if (labelToken && labelToken.length >= 5 && haystacks.some((item) => item.includes(labelToken))) {
+      addCandidate(company, `matched company name "${company.label}" in catalog text`);
+    }
+  }
+
+  if (mode === "client") {
+    const clientTokens = new Set(
+      [entry.label, entry.detail]
+        .map((item) => normalizeOutgoingScopeToken(item))
+        .filter(Boolean)
+    );
+    for (const project of mappedProjects) {
+      const projectClient = normalizeOutgoingScopeToken(project?.client_name || "");
+      if (projectClient && clientTokens.has(projectClient) && project.company) {
+        addCandidate(project.company, `matched mapped project client "${project.client_name}"`);
+      }
+    }
+  }
+
+  if (!candidates.size && companyOptions.length === 1) {
+    addCandidate(companyOptions[0], "single configured company");
+  }
+
+  return Array.from(candidates.values());
+}
+
+function backfillCatalogEntriesByCompany(values = [], companyOptions = [], options = {}) {
+  const { mode = "generic", mappedProjects = [] } = options;
+  const source = normalizeSubjectCatalog(values);
+  const summary = {
+    total_count: source.length,
+    updated_count: 0,
+    already_scoped_count: 0,
+    ambiguous_count: 0,
+    unmatched_count: 0,
+    updated_entries: [],
+    ambiguous_entries: [],
+    unmatched_entries: []
+  };
+  const nextValues = [];
+
+  for (const rawValue of source) {
+    const entry = parseOutgoingCatalogEntry(rawValue, mode);
+    if (!entry) {
+      continue;
+    }
+    const currentCompany = resolveOutgoingCompanyOptionByScope(entry.companyScope || "", companyOptions);
+    if (currentCompany) {
+      const formattedValue = formatScopedOutgoingCatalogEntry(entry, currentCompany, mode);
+      nextValues.push(formattedValue);
+      if (formattedValue === String(rawValue || "").trim()) {
+        summary.already_scoped_count += 1;
+      } else {
+        summary.updated_count += 1;
+        summary.updated_entries.push({
+          previous_value: rawValue,
+          next_value: formattedValue,
+          company_name: currentCompany.label,
+          company_code: currentCompany.code,
+          reason: "normalized existing catalog scope"
+        });
+      }
+      continue;
+    }
+
+    const candidates = collectCatalogCompanyBackfillCandidates(entry, companyOptions, { mode, mappedProjects });
+    if (candidates.length === 1) {
+      const selectedCandidate = candidates[0];
+      const formattedValue = formatScopedOutgoingCatalogEntry(entry, selectedCandidate.company, mode);
+      nextValues.push(formattedValue);
+      summary.updated_count += 1;
+      summary.updated_entries.push({
+        previous_value: rawValue,
+        next_value: formattedValue,
+        company_name: selectedCandidate.company.label,
+        company_code: selectedCandidate.company.code,
+        reason: selectedCandidate.reasons.join(" | ")
+      });
+    } else {
+      nextValues.push(String(rawValue || "").trim());
+      if (candidates.length > 1) {
+        summary.ambiguous_count += 1;
+        summary.ambiguous_entries.push({
+          value: rawValue,
+          label: entry.label,
+          detail: entry.detail || "",
+          candidates: candidates.map((item) => ({
+            company_name: item.company.label,
+            company_code: item.company.code,
+            reasons: item.reasons
+          }))
+        });
+      } else {
+        summary.unmatched_count += 1;
+        summary.unmatched_entries.push({
+          value: rawValue,
+          label: entry.label,
+          detail: entry.detail || ""
+        });
+      }
+    }
+  }
+
+  return {
+    values: nextValues,
+    summary
   };
 }
 
@@ -729,6 +1037,12 @@ const OUTGOING_GROUP_DEFINITIONS = {
   quotations: { label: "Quotations", code: "QTN" },
   studies: { label: "Studies", code: "STD" },
   admin_subjects: { label: "Admin Subjects", code: "ADM" }
+};
+
+const OUTGOING_INLINE_ASSET_PLACEHOLDERS = {
+  logo: "__OUTGOING_INLINE_LOGO__",
+  signature: "__OUTGOING_INLINE_SIGNATURE__",
+  stamp: "__OUTGOING_INLINE_STAMP__"
 };
 
 function escapeOutgoingHtml(value = "") {
@@ -751,6 +1065,23 @@ function renderOutgoingBodyHtml(value = "") {
     .join("");
 }
 
+function estimateOutgoingPageCount({ body = "", clientLabel = "", clientDetail = "", letterTitle = "" } = {}) {
+  const normalized = [
+    String(clientLabel || "").trim(),
+    String(clientDetail || "").trim(),
+    String(letterTitle || "").trim(),
+    String(body || "").trim()
+  ].filter(Boolean).join("\n");
+  const charBasedPages = Math.ceil((normalized.length || 1) / 1600);
+  const lineBasedPages = Math.ceil(((normalized.split(/\n/).length || 1) + 18) / 28);
+  return Math.max(1, charBasedPages, lineBasedPages);
+}
+
+function normalizeOutgoingTemplateLanguage(value = "") {
+  const normalized = String(value || "").trim().toLowerCase();
+  return normalized === "english" ? "english" : "arabic";
+}
+
 function resolveOutgoingAssetUrl(value = "", baseUrl = "") {
   const raw = String(value || "").trim();
   if (!raw) {
@@ -769,13 +1100,15 @@ function buildOutgoingBrandingLines({
   companyAddress = "",
   companyPhone = "",
   companyWebsite = "",
-  companyEmail = ""
+  companyEmail = "",
+  templateLanguage = "arabic"
 } = {}) {
+  const isEnglish = normalizeOutgoingTemplateLanguage(templateLanguage) === "english";
   return [
-    companyAddress ? `العنوان\t${companyAddress}` : "",
-    companyPhone ? `الهاتف\t${companyPhone}` : "",
-    companyWebsite ? `الموقع\t${companyWebsite}` : "",
-    companyEmail ? `البريد الإلكتروني\t${companyEmail}` : ""
+    companyAddress ? `${isEnglish ? "Address" : "العنوان"}\t${companyAddress}` : "",
+    companyPhone ? `${isEnglish ? "Phone" : "الهاتف"}\t${companyPhone}` : "",
+    companyWebsite ? `${isEnglish ? "Website" : "الموقع"}\t${companyWebsite}` : "",
+    companyEmail ? `${isEnglish ? "Email" : "البريد الإلكتروني"}\t${companyEmail}` : ""
   ].filter(Boolean);
 }
 
@@ -796,32 +1129,45 @@ function buildOutgoingLetterBody({
   companyAddress,
   companyPhone,
   companyWebsite,
-  companyEmail
+  companyEmail,
+  templateLanguage = "arabic"
 } = {}) {
+  const normalizedLanguage = normalizeOutgoingTemplateLanguage(templateLanguage);
+  const isEnglish = normalizedLanguage === "english";
+  const pageCount = estimateOutgoingPageCount({ body, clientLabel, clientDetail, letterTitle });
   return [
-    `إلى السيد / ${clientLabel || "........................................................"} المحترم.`,
+    "============================================================",
+    isEnglish ? "OFFICIAL CORRESPONDENCE" : "مراسلة رسمية",
+    "============================================================",
+    isEnglish
+      ? `To: ${clientLabel || "........................................................"}`
+      : `إلى السيد / ${clientLabel || "........................................................"} المحترم.`,
     clientDetail ? `(${clientDetail})` : "",
     `Subject No.\t${subjectNo}\tDocument No.\t${documentNo}`,
-    `Total pages including this one\t1\tSerial\t${internalSerial}`,
+    `Total pages including this one\t${pageCount}\tSerial\t${internalSerial}`,
     `Date\t${subjectDate}\tAttachments\t${attachmentsCount > 0 ? `Yes (${attachmentsCount})` : "No"}`,
     `Company\t${companyLabel}\tGroup\t${groupLabel}`,
     `Reference\t${referenceLabel}\tType\tLetter`,
-    "Confidential Message; meant for the party listed above only.",
-    "Please refer to Subject No. listed above in your response.",
+    isEnglish ? "Confidential Message; meant for the party listed above only." : "رسالة سرية ومخصصة للطرف المذكور أعلاه فقط.",
+    isEnglish ? "Please refer to Subject No. listed above in your response." : "يرجى الإشارة إلى رقم الموضوع أعلاه في الرد.",
     "",
-    `الموضوع : ${letterTitle}`,
-    "تحية طيبة وبعد،،،،",
+    `${isEnglish ? "Subject" : "الموضوع"} : ${letterTitle}`,
+    isEnglish ? "Dear Sir/Madam," : "تحية طيبة وبعد،،،،",
     "",
     String(body || "").trim(),
     "",
-    "وتفضلوا بقبول فائق الاحترام،،،",
+    isEnglish ? "Yours faithfully," : "وتفضلوا بقبول فائق الاحترام،،،",
     "",
     senderName || "المدير التنفيذي",
     "",
-    "أقر أنا ................................................................................................ بالموافقة على ما هو مبين اعلاه.",
-    "التوقيع:\t\tالتاريخ :",
+    isEnglish
+      ? "I, ................................................................................................, acknowledge approval of the above."
+      : "أقر أنا ................................................................................................ بالموافقة على ما هو مبين اعلاه.",
+    `${isEnglish ? "Signature" : "التوقيع"}:\t\t${isEnglish ? "Date" : "التاريخ"} :`,
+    `${isEnglish ? "Official Stamp" : "الختم الرسمي"}:\t________________________________________`,
     "",
-    ...buildOutgoingBrandingLines({ companyAddress, companyPhone, companyWebsite, companyEmail })
+    ...buildOutgoingBrandingLines({ companyAddress, companyPhone, companyWebsite, companyEmail, templateLanguage: normalizedLanguage }),
+    "============================================================"
   ].filter((line, index) => line || index === 1).join("\n");
 }
 
@@ -844,28 +1190,34 @@ function buildOutgoingLetterHtml({
   companyWebsite,
   companyEmail,
   logoUrl,
-  brandName
+  brandName,
+  signatureImageUrl,
+  stampImageUrl,
+  templateLanguage = "arabic"
 } = {}) {
+  const normalizedLanguage = normalizeOutgoingTemplateLanguage(templateLanguage);
+  const isEnglish = normalizedLanguage === "english";
+  const pageCount = estimateOutgoingPageCount({ body, clientLabel, clientDetail, letterTitle });
   const metadataRows = [
     [
-      { label: "Subject No.", value: subjectNo || "________________" },
-      { label: "Document No.", value: documentNo || "________________" }
+      { label: isEnglish ? "Subject No." : "رقم الموضوع", value: subjectNo || "________________" },
+      { label: isEnglish ? "Document No." : "رقم الكتاب", value: documentNo || "________________" }
     ],
     [
-      { label: "Total pages including this one", value: "1" },
-      { label: "Serial", value: internalSerial || "________________" }
+      { label: isEnglish ? "Total Pages" : "عدد الصفحات", value: String(pageCount) },
+      { label: isEnglish ? "Serial" : "التسلسل", value: internalSerial || "________________" }
     ],
     [
-      { label: "Date", value: subjectDate || "________________" },
-      { label: "Attachments", value: attachmentsCount > 0 ? `Yes (${attachmentsCount})` : "No" }
+      { label: isEnglish ? "Date" : "التاريخ", value: subjectDate || "________________" },
+      { label: isEnglish ? "Attachments" : "المرفقات", value: attachmentsCount > 0 ? `Yes (${attachmentsCount})` : "No" }
     ],
     [
-      { label: "Company", value: companyLabel || "________________" },
-      { label: "Group", value: groupLabel || "________________" }
+      { label: isEnglish ? "Company" : "الشركة", value: companyLabel || "________________" },
+      { label: isEnglish ? "Group" : "المجموعة", value: groupLabel || "________________" }
     ],
     [
-      { label: "Reference", value: referenceLabel || "________________" },
-      { label: "Type", value: "Letter" }
+      { label: isEnglish ? "Reference" : "المرجع", value: referenceLabel || "________________" },
+      { label: isEnglish ? "Type" : "النوع", value: "Letter" }
     ]
   ];
 
@@ -890,6 +1242,12 @@ function buildOutgoingLetterHtml({
   )).join("");
 
   const effectiveBrandName = brandName || companyLabel || "TECHNO Group";
+  const signatureBlock = signatureImageUrl
+    ? `<img src="${escapeOutgoingHtml(signatureImageUrl)}" alt="Signature" style="max-width:180px;max-height:72px;object-fit:contain;display:block;margin-top:14px;" />`
+    : "";
+  const stampBlock = stampImageUrl
+    ? `<img src="${escapeOutgoingHtml(stampImageUrl)}" alt="Official Stamp" style="width:126px;height:126px;object-fit:contain;display:block;margin:12px auto 10px;" />`
+    : `<div style="margin:18px auto 10px;width:126px;height:126px;border:2px dashed #c59b45;border-radius:50%;display:flex;align-items:center;justify-content:center;color:#8a6424;font-size:13px;font-weight:700;line-height:1.6;">Company Seal<br />&amp; Signature</div>`;
   const logoBlock = logoUrl
     ? `<img src="${escapeOutgoingHtml(logoUrl)}" alt="Company Logo" style="width:74px;height:74px;object-fit:contain;border-radius:14px;background:#ffffff;padding:8px;box-shadow:0 8px 22px rgba(15,23,42,0.14);" />`
     : `<div style="width:74px;height:74px;border-radius:18px;background:rgba(255,255,255,0.16);display:flex;align-items:center;justify-content:center;font-size:28px;font-weight:700;color:#ffffff;box-shadow:inset 0 0 0 1px rgba(255,255,255,0.18);">${escapeOutgoingHtml(effectiveBrandName.slice(0, 1).toUpperCase())}</div>`;
@@ -900,37 +1258,52 @@ function buildOutgoingLetterHtml({
         <div style="padding:20px 24px;background:linear-gradient(135deg,#0b2f5b 0%,#124b8a 55%,#1d6fc1 100%);color:#ffffff;">
           <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;">
             <div style="min-width:0;">
-              <div style="font-size:12px;letter-spacing:1.2px;text-transform:uppercase;opacity:0.9;">Official Correspondence</div>
+              <div style="font-size:12px;letter-spacing:1.2px;text-transform:uppercase;opacity:0.9;">${isEnglish ? "Official Correspondence" : "Arabic Official Correspondence"}</div>
               <div style="margin-top:6px;font-size:24px;font-weight:700;">${escapeOutgoingHtml(effectiveBrandName)}</div>
-              <div style="margin-top:4px;font-size:12px;opacity:0.88;">Confidential Message; meant for the party listed above only.</div>
+              <div style="margin-top:4px;font-size:12px;opacity:0.88;">${isEnglish ? "Confidential Message; meant for the party listed above only." : "رسالة سرية ومخصصة للطرف المذكور أعلاه فقط."}</div>
             </div>
             ${logoBlock}
           </div>
         </div>
+        <div style="height:8px;background:linear-gradient(90deg,#c59b45 0%,#f0d58a 48%,#c59b45 100%);"></div>
         <div style="padding:22px 24px 12px;background:#ffffff;">
-          <div style="direction:rtl;text-align:right;font-size:16px;font-weight:700;color:#111827;">إلى السيد / ${escapeOutgoingHtml(clientLabel || "........................................................")} المحترم.</div>
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:14px;padding-bottom:12px;border-bottom:2px solid #d7e2f1;">
+            <div style="font-size:12px;color:#475569;">Ref: <strong style="color:#0f2f57;">${escapeOutgoingHtml(documentNo || "Pending")}</strong></div>
+            <div style="font-size:12px;color:#475569;">Page <strong style="color:#0f2f57;">1</strong> of <strong style="color:#0f2f57;">${pageCount}</strong></div>
+          </div>
+          <div style="direction:${isEnglish ? "ltr" : "rtl"};text-align:${isEnglish ? "left" : "right"};font-size:16px;font-weight:700;color:#111827;">${isEnglish ? `To: ${escapeOutgoingHtml(clientLabel || "........................................................")}` : `إلى السيد / ${escapeOutgoingHtml(clientLabel || "........................................................")} المحترم.`}</div>
           ${clientDetail ? `<div style="direction:rtl;text-align:right;margin-top:6px;font-size:13px;color:#475569;">(${escapeOutgoingHtml(clientDetail)})</div>` : ""}
-          <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;margin-top:18px;">
+          <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:separate;border-spacing:0;margin-top:18px;border:1px solid #d8dee8;border-radius:12px;overflow:hidden;">
             ${metadataHtml}
           </table>
           <div style="margin-top:14px;padding:10px 12px;border:1px solid #dbe5f0;border-radius:10px;background:#f8fafc;font-size:12px;color:#475569;">
-            Please refer to Subject No. listed above in your response.
+            ${isEnglish ? "Please refer to Subject No. listed above in your response." : "يرجى الإشارة إلى رقم الموضوع أعلاه في الرد."}
           </div>
         </div>
         <div style="padding:0 24px 24px;background:linear-gradient(180deg,#ffffff 0%,#f8fbff 100%);">
-          <div style="direction:rtl;text-align:right;padding:18px 20px;border:1px solid #d8dee8;border-radius:12px;background:#fcfcfd;">
-            <div style="font-size:18px;font-weight:700;color:#0f172a;">الموضوع : ${escapeOutgoingHtml(letterTitle || "........................................................")}</div>
-            <div style="margin-top:18px;font-size:15px;font-weight:700;color:#111827;">تحية طيبة وبعد،،،،</div>
+          <div style="height:2px;background:linear-gradient(90deg,transparent 0%,#0f3c78 16%,#c59b45 50%,#0f3c78 84%,transparent 100%);margin-bottom:16px;"></div>
+          <div style="direction:${isEnglish ? "ltr" : "rtl"};text-align:${isEnglish ? "left" : "right"};padding:18px 20px;border:1px solid #d8dee8;border-radius:12px;background:#fcfcfd;">
+            <div style="font-size:18px;font-weight:700;color:#0f172a;">${isEnglish ? "Subject" : "الموضوع"} : ${escapeOutgoingHtml(letterTitle || "........................................................")}</div>
+            <div style="margin-top:18px;font-size:15px;font-weight:700;color:#111827;">${isEnglish ? "Dear Sir/Madam," : "تحية طيبة وبعد،،،،"}</div>
             <div style="margin-top:18px;font-size:14px;color:#1f2937;">
               ${renderOutgoingBodyHtml(body)}
             </div>
-            <div style="margin-top:24px;font-size:15px;font-weight:700;">وتفضلوا بقبول فائق الاحترام،،،</div>
+            <div style="margin-top:24px;font-size:15px;font-weight:700;">${isEnglish ? "Yours faithfully," : "وتفضلوا بقبول فائق الاحترام،،،"}</div>
             <div style="margin-top:18px;font-size:16px;font-weight:700;color:#0f3c78;">${escapeOutgoingHtml(senderName || "المدير التنفيذي")}</div>
+            ${signatureBlock}
           </div>
-          <div style="margin-top:16px;padding:16px 18px;border:1px dashed #c8d3df;border-radius:12px;background:#f8fafc;direction:rtl;text-align:right;">
-            <div style="font-size:14px;color:#0f172a;">أقر أنا ................................................................................................ بالموافقة على ما هو مبين اعلاه.</div>
-            <div style="margin-top:18px;font-size:13px;color:#334155;">التوقيع: <span style="display:inline-block;min-width:160px;border-bottom:1px solid #94a3b8;">&nbsp;</span> التاريخ : <span style="display:inline-block;min-width:120px;border-bottom:1px solid #94a3b8;">&nbsp;</span></div>
+          <div style="margin-top:16px;display:grid;grid-template-columns:minmax(0,1.2fr) minmax(220px,0.8fr);gap:14px;">
+            <div style="padding:16px 18px;border:1px dashed #c8d3df;border-radius:12px;background:#f8fafc;direction:${isEnglish ? "ltr" : "rtl"};text-align:${isEnglish ? "left" : "right"};">
+              <div style="font-size:14px;color:#0f172a;">${isEnglish ? "I, ................................................................................................, acknowledge approval of the above." : "أقر أنا ................................................................................................ بالموافقة على ما هو مبين اعلاه."}</div>
+              <div style="margin-top:18px;font-size:13px;color:#334155;">${isEnglish ? "Signature" : "التوقيع"}: <span style="display:inline-block;min-width:160px;border-bottom:1px solid #94a3b8;">&nbsp;</span> ${isEnglish ? "Date" : "التاريخ"} : <span style="display:inline-block;min-width:120px;border-bottom:1px solid #94a3b8;">&nbsp;</span></div>
+            </div>
+            <div style="padding:16px;border:1px dashed #c8a96a;border-radius:12px;background:linear-gradient(180deg,#fffdf7 0%,#fff8e7 100%);text-align:center;">
+              <div style="font-size:12px;font-weight:700;letter-spacing:1px;color:#8a6424;text-transform:uppercase;">${isEnglish ? "Official Stamp" : "الختم الرسمي"}</div>
+              ${stampBlock}
+              <div style="font-size:12px;color:#7c5a1d;">${isEnglish ? "Authorized validation area" : "منطقة الختم والتوثيق الرسمي"}</div>
+            </div>
           </div>
+          <div style="height:2px;background:linear-gradient(90deg,transparent 0%,#0f3c78 16%,#c59b45 50%,#0f3c78 84%,transparent 100%);margin:18px 0 0;"></div>
           <div style="margin-top:18px;padding:16px 18px;border-radius:12px;background:#0f2f57;color:#e5eefb;text-align:center;">
             <div style="font-size:12px;font-weight:700;letter-spacing:1px;text-transform:uppercase;">Corporate Footer</div>
             <div style="margin-top:10px;font-size:14px;font-weight:700;color:#ffffff;">${escapeOutgoingHtml(effectiveBrandName)}</div>
@@ -981,6 +1354,7 @@ async function enforceOutboundStructuredSubject(req, userId) {
   const internalSerial = normalizeSerialToken(req.body?.outbound_internal_serial);
   const subjectDate = normalizeStructuredDate(req.body?.outbound_subject_date);
   const letterTitle = String(req.body?.outbound_letter_title || "").trim();
+  const templateLanguage = normalizeOutgoingTemplateLanguage(req.body?.outbound_template_language || "arabic");
 
   if (!companyValue) throw new Error("اختيار الشركة إلزامي قبل إرسال الرسالة.");
   if (!clientValue) throw new Error("اختيار العميل إلزامي قبل إرسال الرسالة.");
@@ -991,13 +1365,15 @@ async function enforceOutboundStructuredSubject(req, userId) {
   if (!internalSerial) throw new Error("حقل Serial إلزامي قبل إرسال الرسالة.");
   if (!subjectDate) throw new Error("حقل Date إلزامي ويجب أن يكون بصيغة صحيحة قبل إرسال الرسالة.");
 
-  const company = parseOutgoingCatalogEntry(companyValue, "generic");
-  if (!company || !companies.includes(companyValue)) {
+  const companyOptions = buildOutgoingCatalogOptions(companies, "generic");
+  const company = companyOptions.find((item) => item.value === companyValue) || null;
+  if (!company) {
     throw new Error("الشركة المختارة غير معرفة داخل إعدادات Compose.");
   }
-  const client = parseOutgoingCatalogEntry(clientValue, "client");
-  if (!client || !clients.includes(clientValue)) {
-    throw new Error("العميل المختار غير معرف داخل إعدادات Compose.");
+  const clientOptions = buildOutgoingCatalogOptions(clients, "client", company);
+  const client = clientOptions.find((item) => item.value === clientValue) || null;
+  if (!client) {
+    throw new Error("العميل المختار لا يتبع للشركة المختارة أو غير معرف داخل إعدادات Compose.");
   }
 
   let reference = null;
@@ -1006,22 +1382,27 @@ async function enforceOutboundStructuredSubject(req, userId) {
     if (!project) {
       throw new Error("المشروع المختار غير موجود أو تم حذفه.");
     }
+    if (!matchesOutgoingCompanyScope(project.company_code || project.company_name || "", company, true)) {
+      throw new Error("المشروع المختار لا يتبع للشركة المختارة.");
+    }
     reference = {
       value: String(project.id),
       label: `[${project.project_code}] ${project.project_name}`,
-      code: deriveOutgoingCode(project.project_code || project.project_name || `PRJ-${project.id}`)
+      code: deriveOutgoingCode(project.project_code || project.project_name || `PRJ-${project.id}`),
+      companyScope: project.company_code || project.company_name || ""
     };
     req.body.project_id = project.id;
   } else {
-    const sourceList = groupType === "quotations"
+    const sourceValues = groupType === "quotations"
       ? quotations
       : groupType === "studies"
         ? studies
         : adminSubjects;
-    if (!sourceList.includes(referenceValue)) {
-      throw new Error("المرجع المختار غير معرف داخل إعدادات Compose.");
+    const sourceList = buildOutgoingCatalogOptions(sourceValues, "generic", company);
+    reference = sourceList.find((item) => item.value === referenceValue) || null;
+    if (!reference) {
+      throw new Error("المرجع المختار لا يتبع للشركة المختارة أو غير معرف داخل إعدادات Compose.");
     }
-    reference = parseOutgoingCatalogEntry(referenceValue, "generic");
   }
 
   const groupDefinition = OUTGOING_GROUP_DEFINITIONS[groupType];
@@ -1037,7 +1418,9 @@ async function enforceOutboundStructuredSubject(req, userId) {
   const companyPhone = settings?.company_phone || "";
   const companyWebsite = settings?.company_website || "";
   const companyEmail = settings?.email_address || "";
-  const logoUrl = resolveOutgoingAssetUrl(settings?.logo_url || "", baseUrl);
+  const logoUrl = settings?.logo_url ? OUTGOING_INLINE_ASSET_PLACEHOLDERS.logo : resolveOutgoingAssetUrl(settings?.logo_url || "", baseUrl);
+  const signatureImageUrl = settings?.signature_image_url ? OUTGOING_INLINE_ASSET_PLACEHOLDERS.signature : "";
+  const stampImageUrl = settings?.stamp_image_url ? OUTGOING_INLINE_ASSET_PLACEHOLDERS.stamp : "";
   const compiledBody = buildOutgoingLetterBody({
     companyLabel,
     clientLabel: client.label,
@@ -1055,7 +1438,8 @@ async function enforceOutboundStructuredSubject(req, userId) {
     companyAddress,
     companyPhone,
     companyWebsite,
-    companyEmail
+    companyEmail,
+    templateLanguage
   });
   const compiledHtml = buildOutgoingLetterHtml({
     companyLabel,
@@ -1076,7 +1460,10 @@ async function enforceOutboundStructuredSubject(req, userId) {
     companyWebsite,
     companyEmail,
     logoUrl,
-    brandName
+    brandName,
+    signatureImageUrl,
+    stampImageUrl,
+    templateLanguage
   });
 
   let finalSubject = emailSubjectBase;
@@ -1091,6 +1478,7 @@ async function enforceOutboundStructuredSubject(req, userId) {
   req.body.subject = finalSubject;
   req.body.body = compiledBody;
   req.body.body_html = compiledHtml;
+  req.body.outbound_template_language = templateLanguage;
   return {
     subject: finalSubject,
     subject_no: subjectNo,
@@ -1338,6 +1726,57 @@ app.patch("/api/emails/read-state", authenticateRequest, requireArchivePermissio
     return res.json(result);
   } catch (error) {
     return res.status(400).json({ error: error.message || "Unable to update read state." });
+  }
+});
+
+app.patch("/api/emails/:id/context-meta", authenticateRequest, requireArchivePermission, async (req, res) => {
+  try {
+    const emailId = Number(req.params.id);
+    if (!emailId) {
+      return res.status(400).json({ error: "Invalid email id." });
+    }
+    const email = await getEmailById(emailId);
+    if (!email) {
+      return res.status(404).json({ error: "Email not found." });
+    }
+    const userCategory = typeof req.body?.user_category === "string"
+      ? String(req.body.user_category || "").trim().slice(0, 80)
+      : email.user_category || "";
+    const followUpStatus = typeof req.body?.follow_up_status === "string"
+      ? String(req.body.follow_up_status || "").trim().slice(0, 40)
+      : email.follow_up_status || "";
+    const followUpDueAt = req.body?.follow_up_due_at
+      ? new Date(req.body.follow_up_due_at).toISOString()
+      : null;
+    const followUpNote = typeof req.body?.follow_up_note === "string"
+      ? String(req.body.follow_up_note || "").trim().slice(0, 500)
+      : email.follow_up_note || "";
+
+    const result = await query(
+      `
+        UPDATE emails
+        SET user_category = $2,
+            follow_up_status = $3,
+            follow_up_due_at = $4,
+            follow_up_note = $5,
+            last_action_at = NOW()
+        WHERE id = $1
+        RETURNING *
+      `,
+      [emailId, userCategory, followUpStatus, followUpDueAt, followUpNote]
+    );
+
+    await logEmailTrail(
+      emailId,
+      req.user?.id,
+      "context_menu_update",
+      `Updated category/follow-up via context menu${userCategory ? ` [${userCategory}]` : ""}${followUpStatus ? ` / ${followUpStatus}` : ""}`,
+      req.ip || ""
+    );
+
+    return res.json({ email: result.rows[0] || null });
+  } catch (error) {
+    return res.status(400).json({ error: error.message || "Unable to update email metadata." });
   }
 });
 
@@ -1652,6 +2091,128 @@ app.get("/api/tasks/stats", authenticateRequest, async (req, res) => {
   }
 });
 
+app.get("/api/calendar", authenticateRequest, async (req, res) => {
+  try {
+    const isAdmin = String(req.user?.role || "").toLowerCase() === "admin";
+    const events = await getCalendarEvents({
+      employee_id: isAdmin ? undefined : req.user?.id,
+      from: req.query?.from || undefined,
+      to: req.query?.to || undefined
+    });
+    return res.json({ events });
+  } catch (error) {
+    return res.status(400).json({ error: error.message || "Unable to load calendar events." });
+  }
+});
+
+app.post("/api/calendar", authenticateRequest, async (req, res) => {
+  try {
+    const startsAt = req.body?.starts_at || req.body?.start || null;
+    const endsAt = req.body?.ends_at || req.body?.end || startsAt;
+    if (!String(req.body?.title || "").trim()) {
+      return res.status(400).json({ error: "Appointment title is required." });
+    }
+    if (!startsAt || !endsAt) {
+      return res.status(400).json({ error: "Start and end time are required." });
+    }
+    const event = await createCalendarEvent({
+      ...req.body,
+      starts_at: startsAt,
+      ends_at: endsAt,
+      employee_id: req.user?.id
+    });
+    return res.json({ event });
+  } catch (error) {
+    return res.status(400).json({ error: error.message || "Unable to create appointment." });
+  }
+});
+
+app.put("/api/calendar/:id", authenticateRequest, async (req, res) => {
+  try {
+    const current = await getCalendarEventById(req.params.id);
+    if (!current) {
+      return res.status(404).json({ error: "Appointment not found." });
+    }
+    const scope = String(req.body?.scope || "series").trim().toLowerCase();
+    const occurrenceStart = req.body?.occurrence_start || req.body?.occurrence_original_start || null;
+    const seriesRoot = current.series_master_id && scope === "series"
+      ? await getCalendarEventById(current.series_master_id)
+      : null;
+    const permissionTarget = seriesRoot || current;
+    const isOwner = Number(permissionTarget?.employee_id || 0) === Number(req.user?.id || 0);
+    const isAdmin = String(req.user?.role || "").toLowerCase() === "admin";
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({ error: "You cannot edit this appointment." });
+    }
+    const isRecurringOccurrence = Boolean(
+      occurrenceStart
+      && (
+        Number(current.series_master_id || 0) > 0
+        || String(current.recurrence_pattern || "none").trim().toLowerCase() !== "none"
+      )
+      && scope === "occurrence"
+    );
+    const event = isRecurringOccurrence
+      ? await saveCalendarOccurrenceException(
+        Number(current.series_master_id || current.id),
+        occurrenceStart,
+        {
+          ...req.body,
+          employee_id: permissionTarget?.employee_id || req.user?.id
+        },
+        "detached"
+      )
+      : await updateCalendarEvent(seriesRoot?.id || req.params.id, {
+        ...req.body,
+        employee_id: permissionTarget?.employee_id || req.user?.id
+      });
+    return res.json({ event });
+  } catch (error) {
+    return res.status(400).json({ error: error.message || "Unable to update appointment." });
+  }
+});
+
+app.delete("/api/calendar/:id", authenticateRequest, async (req, res) => {
+  try {
+    const current = await getCalendarEventById(req.params.id);
+    if (!current) {
+      return res.status(404).json({ error: "Appointment not found." });
+    }
+    const scope = String(req.body?.scope || req.query?.scope || "series").trim().toLowerCase();
+    const occurrenceStart = req.body?.occurrence_start || req.query?.occurrence_start || null;
+    const seriesRoot = current.series_master_id && scope === "series"
+      ? await getCalendarEventById(current.series_master_id)
+      : null;
+    const permissionTarget = seriesRoot || current;
+    const isOwner = Number(permissionTarget?.employee_id || 0) === Number(req.user?.id || 0);
+    const isAdmin = String(req.user?.role || "").toLowerCase() === "admin";
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({ error: "You cannot delete this appointment." });
+    }
+    const isRecurringOccurrence = Boolean(
+      occurrenceStart
+      && (
+        Number(current.series_master_id || 0) > 0
+        || String(current.recurrence_pattern || "none").trim().toLowerCase() !== "none"
+      )
+      && scope === "occurrence"
+    );
+    if (isRecurringOccurrence) {
+      await saveCalendarOccurrenceException(
+        Number(current.series_master_id || current.id),
+        occurrenceStart,
+        {},
+        "skip"
+      );
+      return res.json({ ok: true, skipped: true });
+    }
+    await deleteCalendarEvent(seriesRoot?.id || req.params.id);
+    return res.json({ ok: true });
+  } catch (error) {
+    return res.status(400).json({ error: error.message || "Unable to delete appointment." });
+  }
+});
+
 app.post("/api/tasks", authenticateRequest, async (req, res) => {
   try {
     const task = await createTask({ ...req.body, created_by: req.user?.id });
@@ -1739,6 +2300,175 @@ app.get("/api/projects/all", authenticateRequest, requireAdminAccess, async (req
     return res.json({ projects });
   } catch (error) {
     return res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/admin/projects/company-backfill", authenticateRequest, requireAdminAccess, async (req, res) => {
+  try {
+    const settings = await getMailSettingsForUser(req.user.id);
+    const companyOptions = buildOutgoingCatalogOptions(
+      normalizeSubjectCatalog(settings?.outbound_subject_companies),
+      "generic"
+    );
+    if (!companyOptions.length) {
+      return res.status(400).json({ error: "عرّف قائمة الشركات أولًا من Settings > Compose قبل تشغيل الربط التلقائي." });
+    }
+
+    const scopedClientEntries = normalizeSubjectCatalog(settings?.outbound_subject_clients)
+      .map((item) => parseOutgoingCatalogEntry(item, "client"))
+      .filter(Boolean)
+      .map((item) => ({
+        ...item,
+        company: resolveOutgoingCompanyOptionByScope(item.companyScope, companyOptions)
+      }))
+      .filter((item) => item.company);
+
+    const projects = await getProjects();
+    const summary = {
+      total_projects: projects.length,
+      updated_count: 0,
+      already_linked_count: 0,
+      ambiguous_count: 0,
+      unmatched_count: 0,
+      updated_projects: [],
+      ambiguous_projects: [],
+      unmatched_projects: []
+    };
+
+    for (const project of projects) {
+      const currentCompany = resolveOutgoingCompanyOptionByScope(project.company_code || project.company_name || "", companyOptions);
+      if (currentCompany) {
+        const needsNormalization = String(project.company_name || "").trim() !== String(currentCompany.label || "").trim()
+          || String(project.company_code || "").trim().toUpperCase() !== String(currentCompany.code || "").trim().toUpperCase();
+        if (needsNormalization) {
+          const updatedProject = await updateProject(project.id, {
+            company_name: currentCompany.label,
+            company_code: currentCompany.code
+          });
+          summary.updated_count += 1;
+          summary.updated_projects.push({
+            id: updatedProject?.id || project.id,
+            project_code: updatedProject?.project_code || project.project_code,
+            project_name: updatedProject?.project_name || project.project_name,
+            company_name: currentCompany.label,
+            company_code: currentCompany.code,
+            reason: "normalized existing company mapping"
+          });
+        } else {
+          summary.already_linked_count += 1;
+        }
+        continue;
+      }
+
+      const candidates = collectProjectCompanyBackfillCandidates(project, companyOptions, scopedClientEntries);
+      if (candidates.length === 1) {
+        const selectedCandidate = candidates[0];
+        const updatedProject = await updateProject(project.id, {
+          company_name: selectedCandidate.company.label,
+          company_code: selectedCandidate.company.code
+        });
+        summary.updated_count += 1;
+        summary.updated_projects.push({
+          id: updatedProject?.id || project.id,
+          project_code: updatedProject?.project_code || project.project_code,
+          project_name: updatedProject?.project_name || project.project_name,
+          company_name: selectedCandidate.company.label,
+          company_code: selectedCandidate.company.code,
+          reason: selectedCandidate.reasons.join(" | ")
+        });
+      } else if (candidates.length > 1) {
+        summary.ambiguous_count += 1;
+        summary.ambiguous_projects.push({
+          id: project.id,
+          project_code: project.project_code,
+          project_name: project.project_name,
+          client_name: project.client_name || "",
+          candidates: candidates.map((item) => ({
+            company_name: item.company.label,
+            company_code: item.company.code,
+            reasons: item.reasons
+          }))
+        });
+      } else {
+        summary.unmatched_count += 1;
+        summary.unmatched_projects.push({
+          id: project.id,
+          project_code: project.project_code,
+          project_name: project.project_name,
+          client_name: project.client_name || ""
+        });
+      }
+    }
+
+    return res.json({ summary });
+  } catch (error) {
+    return res.status(400).json({ error: error.message || "Unable to run project company backfill." });
+  }
+});
+
+app.post("/api/admin/outbound-catalogs/company-backfill", authenticateRequest, requireAdminAccess, async (req, res) => {
+  try {
+    const settings = await getMailSettingsForUser(req.user.id);
+    const companyOptions = buildOutgoingCatalogOptions(
+      normalizeSubjectCatalog(settings?.outbound_subject_companies),
+      "generic"
+    );
+    if (!companyOptions.length) {
+      return res.status(400).json({ error: "عرّف قائمة الشركات أولًا من Settings > Compose قبل تشغيل backfill للمرجعيات." });
+    }
+
+    const projects = await getProjects();
+    const mappedProjects = projects
+      .map((project) => {
+        const directCompany = resolveOutgoingCompanyOptionByScope(project.company_code || project.company_name || "", companyOptions);
+        if (directCompany) {
+          return { ...project, company: directCompany };
+        }
+        const inferredCandidates = collectProjectCompanyBackfillCandidates(project, companyOptions, []);
+        if (inferredCandidates.length === 1) {
+          return { ...project, company: inferredCandidates[0].company };
+        }
+        return null;
+      })
+      .filter(Boolean);
+
+    const clientsBackfill = backfillCatalogEntriesByCompany(settings?.outbound_subject_clients, companyOptions, {
+      mode: "client",
+      mappedProjects
+    });
+    const quotationsBackfill = backfillCatalogEntriesByCompany(settings?.outbound_subject_quotations, companyOptions, {
+      mode: "generic",
+      mappedProjects
+    });
+    const studiesBackfill = backfillCatalogEntriesByCompany(settings?.outbound_subject_studies, companyOptions, {
+      mode: "generic",
+      mappedProjects
+    });
+    const adminSubjectsBackfill = backfillCatalogEntriesByCompany(settings?.outbound_subject_admin_subjects, companyOptions, {
+      mode: "generic",
+      mappedProjects
+    });
+
+    const updatedSettings = await updateMailSettingsForUser(req.user.id, {
+      outbound_subject_clients: clientsBackfill.values,
+      outbound_subject_quotations: quotationsBackfill.values,
+      outbound_subject_studies: studiesBackfill.values,
+      outbound_subject_admin_subjects: adminSubjectsBackfill.values
+    });
+
+    return res.json({
+      settings: updatedSettings,
+      summary: {
+        companies_count: companyOptions.length,
+        mapped_projects_count: mappedProjects.length,
+        clients: clientsBackfill.summary,
+        quotations: quotationsBackfill.summary,
+        studies: studiesBackfill.summary,
+        admin_subjects: adminSubjectsBackfill.summary
+      }
+    });
+  } catch (error) {
+    return res.status(400).json({ error: error.message || "Unable to run outbound catalogs company backfill." });
   }
 });
 
@@ -2724,9 +3454,17 @@ app.get("/api/admin/analytics", authenticateRequest, requireAdminAccess, async (
     return res.status(400).json({ error: error.message });
   }
 });
+
+app.get("/api/admin/calendar-analytics", authenticateRequest, requireAdminAccess, async (_req, res) => {
+  try {
+    const analytics = await getCalendarAdminAnalytics();
+    return res.json(analytics);
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
 // #endregion
 
-// #region admin-backups
 app.get("/api/admin/backups", authenticateRequest, requireAdminAccess, async (_req, res) => {
   try {
     return res.json({
